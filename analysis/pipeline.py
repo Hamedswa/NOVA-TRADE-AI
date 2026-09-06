@@ -2,13 +2,13 @@
 NOVA TRADE AI
 analysis/pipeline.py
 
-Pipeline principal :
+Pipeline :
 
 D1 + H4  -> tendance macro
-H1 + M15 -> structure / zones
+H1 + M15 -> structure
 M5       -> confirmation
-Score    -> qualité du setup
-RR       -> validation du trade
+Score    -> qualité
+RR       -> validation
 
 Aucune exécution réelle d'ordre.
 """
@@ -34,22 +34,53 @@ MINIMUM_RR = 2.0
 
 ATR_SL_MULTIPLIER = 1.5
 
-STRUCTURE_CANDLES = 100
 CONFIRMATION_CANDLES = 80
 
 
 # ============================================================
-# OUTILS
+# LECTURE UNIVERSELLE DES BOUGIES
 # ============================================================
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _candle_value(
+    candle: Any,
+    field: str,
+    default: float = 0.0,
+) -> float:
+    """
+    Compatible avec :
+    - Candle dataclass
+    - dictionnaire
+    - objet possédant l'attribut demandé
+    """
+
+    try:
+        if isinstance(candle, dict):
+            value = candle.get(field, default)
+        else:
+            value = getattr(candle, field, default)
+
+        return float(value)
+
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+
     try:
         return float(value)
+
     except (TypeError, ValueError):
         return default
 
 
-def _direction_text(direction: Direction) -> str:
+def _direction_text(
+    direction: Direction,
+) -> str:
+
     if direction == Direction.BUY:
         return "BUY"
 
@@ -64,10 +95,13 @@ def _direction_text(direction: Direction) -> str:
 # ============================================================
 
 def _find_swing_points(
-    candles: List[Dict[str, Any]],
+    candles: List[Any],
     left: int = SWING_LEFT,
     right: int = SWING_RIGHT,
-) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+) -> Tuple[
+    List[Tuple[int, float]],
+    List[Tuple[int, float]],
+]:
 
     swing_highs = []
     swing_lows = []
@@ -75,14 +109,19 @@ def _find_swing_points(
     if len(candles) < left + right + 1:
         return swing_highs, swing_lows
 
-    for i in range(left, len(candles) - right):
+    for i in range(
+        left,
+        len(candles) - right,
+    ):
 
-        current_high = _safe_float(
-            candles[i].get("high")
+        current_high = _candle_value(
+            candles[i],
+            "high",
         )
 
-        current_low = _safe_float(
-            candles[i].get("low")
+        current_low = _candle_value(
+            candles[i],
+            "low",
         )
 
         if current_high <= 0 or current_low <= 0:
@@ -93,18 +132,20 @@ def _find_swing_points(
 
         for j in range(
             i - left,
-            i + right + 1
+            i + right + 1,
         ):
 
             if j == i:
                 continue
 
-            other_high = _safe_float(
-                candles[j].get("high")
+            other_high = _candle_value(
+                candles[j],
+                "high",
             )
 
-            other_low = _safe_float(
-                candles[j].get("low")
+            other_low = _candle_value(
+                candles[j],
+                "low",
             )
 
             if current_high <= other_high:
@@ -131,7 +172,7 @@ def _find_swing_points(
 # ============================================================
 
 def _count_structure(
-    candles: List[Dict[str, Any]]
+    candles: List[Any],
 ) -> Dict[str, int]:
 
     highs, lows = _find_swing_points(candles)
@@ -172,7 +213,7 @@ def _count_structure(
 
 
 def determine_direction_from_candles(
-    candles: List[Dict[str, Any]]
+    candles: List[Any],
 ) -> Direction:
 
     if not candles:
@@ -189,7 +230,7 @@ def determine_direction_from_candles(
 
 
 def calculate_structure_strength(
-    candles: List[Dict[str, Any]]
+    candles: List[Any],
 ) -> float:
 
     structure = _count_structure(candles)
@@ -222,7 +263,7 @@ def calculate_structure_strength(
 # ============================================================
 
 def calculate_atr(
-    candles: List[Dict[str, Any]],
+    candles: List[Any],
     period: int = 14,
 ) -> float:
 
@@ -233,16 +274,19 @@ def calculate_atr(
 
     for i in range(1, len(candles)):
 
-        high = _safe_float(
-            candles[i].get("high")
+        high = _candle_value(
+            candles[i],
+            "high",
         )
 
-        low = _safe_float(
-            candles[i].get("low")
+        low = _candle_value(
+            candles[i],
+            "low",
         )
 
-        previous_close = _safe_float(
-            candles[i - 1].get("close")
+        previous_close = _candle_value(
+            candles[i - 1],
+            "close",
         )
 
         if (
@@ -274,7 +318,7 @@ def calculate_atr(
 # ============================================================
 
 def build_zone(
-    candles: List[Dict[str, Any]],
+    candles: List[Any],
     direction: Direction,
 ) -> Optional[Dict[str, float]]:
 
@@ -282,15 +326,15 @@ def build_zone(
         return None
 
     highs = [
-        _safe_float(candle.get("high"))
-        for candle in candles
-        if _safe_float(candle.get("high")) > 0
+        _candle_value(c, "high")
+        for c in candles
+        if _candle_value(c, "high") > 0
     ]
 
     lows = [
-        _safe_float(candle.get("low"))
-        for candle in candles
-        if _safe_float(candle.get("low")) > 0
+        _candle_value(c, "low")
+        for c in candles
+        if _candle_value(c, "low") > 0
     ]
 
     if not highs or not lows:
@@ -312,11 +356,11 @@ def build_zone(
 
 
 # ============================================================
-# M5 CONFIRMATION
+# CONFIRMATION M5
 # ============================================================
 
 def detect_m5_confirmation(
-    candles: List[Dict[str, Any]],
+    candles: List[Any],
     direction: Direction,
 ) -> Dict[str, Any]:
 
@@ -336,20 +380,18 @@ def detect_m5_confirmation(
     if len(candles) < 10:
         return result
 
-    recent = candles[
-        -CONFIRMATION_CANDLES:
-    ]
+    recent = candles[-CONFIRMATION_CANDLES:]
 
     highs = [
-        _safe_float(c.get("high"))
+        _candle_value(c, "high")
         for c in recent
-        if _safe_float(c.get("high")) > 0
+        if _candle_value(c, "high") > 0
     ]
 
     lows = [
-        _safe_float(c.get("low"))
+        _candle_value(c, "low")
         for c in recent
-        if _safe_float(c.get("low")) > 0
+        if _candle_value(c, "low") > 0
     ]
 
     if not highs or not lows:
@@ -357,20 +399,24 @@ def detect_m5_confirmation(
 
     last = recent[-1]
 
-    last_open = _safe_float(
-        last.get("open")
+    last_open = _candle_value(
+        last,
+        "open",
     )
 
-    last_high = _safe_float(
-        last.get("high")
+    last_high = _candle_value(
+        last,
+        "high",
     )
 
-    last_low = _safe_float(
-        last.get("low")
+    last_low = _candle_value(
+        last,
+        "low",
     )
 
-    last_close = _safe_float(
-        last.get("close")
+    last_close = _candle_value(
+        last,
+        "close",
     )
 
     if min(
@@ -464,7 +510,7 @@ def detect_m5_confirmation(
         )
 
     # ========================================================
-    # VALIDATION M5
+    # VALIDATION
     # ========================================================
 
     setup_a = (
@@ -486,11 +532,11 @@ def detect_m5_confirmation(
 
 
 # ============================================================
-# TRADE LEVELS
+# NIVEAUX DE TRADE
 # ============================================================
 
 def calculate_trade_levels(
-    candles: List[Dict[str, Any]],
+    candles: List[Any],
     direction: Direction,
 ) -> Dict[str, float]:
 
@@ -505,8 +551,9 @@ def calculate_trade_levels(
             "rr": 0.0,
         }
 
-    entry = _safe_float(
-        candles[-1].get("close")
+    entry = _candle_value(
+        candles[-1],
+        "close",
     )
 
     if entry <= 0:
@@ -526,12 +573,14 @@ def calculate_trade_levels(
 
         for candle in candles[-20:]:
 
-            high = _safe_float(
-                candle.get("high")
+            high = _candle_value(
+                candle,
+                "high",
             )
 
-            low = _safe_float(
-                candle.get("low")
+            low = _candle_value(
+                candle,
+                "low",
             )
 
             if high > low:
@@ -621,7 +670,7 @@ def calculate_trade_levels(
 
 
 # ============================================================
-# REJECT
+# REJET
 # ============================================================
 
 def _reject_result(
@@ -664,7 +713,9 @@ def _reject_result(
 # QUALITÉ
 # ============================================================
 
-def get_quality(score: float) -> str:
+def get_quality(
+    score: float,
+) -> str:
 
     if score >= 85:
         return "A+"
@@ -686,7 +737,7 @@ def get_quality(score: float) -> str:
 # ============================================================
 
 def analyze_market(
-    symbol: str
+    symbol: str,
 ) -> Dict[str, Any]:
 
     # ========================================================
@@ -736,6 +787,7 @@ def analyze_market(
         or h4 == Direction.NEUTRAL
         or d1 != h4
     ):
+
         return _reject_result(
             symbol=symbol,
             d1=d1,
@@ -942,7 +994,7 @@ def analyze_market(
         }
 
     # ========================================================
-    # RR
+    # RR INSUFFISANT
     # ========================================================
 
     if rr < MINIMUM_RR:
@@ -979,7 +1031,7 @@ def analyze_market(
         }
 
     # ========================================================
-    # SIGNAL ACCEPTÉ
+    # SIGNAL ACTIF
     # ========================================================
 
     return {
@@ -1019,18 +1071,18 @@ def analyze_market(
 
 
 # ============================================================
-# COMPATIBILITÉ ANCIENNES FONCTIONS
+# COMPATIBILITÉ
 # ============================================================
 
 def analyser_marche(
-    symbol: str
+    symbol: str,
 ) -> Dict[str, Any]:
 
     return analyze_market(symbol)
 
 
 def analyze(
-    symbol: str
+    symbol: str,
 ) -> Dict[str, Any]:
 
     return analyze_market(symbol)
