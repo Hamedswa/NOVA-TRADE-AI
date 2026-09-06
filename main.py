@@ -3,8 +3,10 @@ from config import (
     ALL_SYMBOLS,
 )
 
+from telegram_bot import run_bot
 
-def main():
+
+def print_banner():
 
     print()
     print("=" * 50)
@@ -27,18 +29,15 @@ def main():
     )
 
     print(
-        f"Tendance       : "
-        f"D1 + H4"
+        "Tendance       : D1 + H4"
     )
 
     print(
-        f"Zones          : "
-        f"H1 + M15"
+        "Zones          : H1 + M15"
     )
 
     print(
-        f"Confirmation    : "
-        f"M5"
+        "Confirmation   : M5"
     )
 
     print(
@@ -48,7 +47,9 @@ def main():
 
     print()
 
-    print("Marchés : FOREX + CRYPTO")
+    print(
+        "Marchés : FOREX + CRYPTO"
+    )
 
     print(
         f"Symboles configurés : "
@@ -56,6 +57,17 @@ def main():
     )
 
     print("=" * 50)
+
+
+def main():
+
+    print_banner()
+
+    print(
+        "Démarrage du bot Telegram..."
+    )
+
+    run_bot()
 
 
 if __name__ == "__main__":
