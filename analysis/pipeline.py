@@ -1,216 +1,199 @@
 """
 NOVA TRADE AI
-Pipeline principal d'analyse multi-timeframe.
+analysis/pipeline.py
 
-Architecture :
-    D1 + H4  -> tendance globale
-    H1 + M15 -> structure / contexte
-    M5       -> confirmation
-    Score    -> validation
-    RR       -> validation
+Pipeline principal :
 
-IMPORTANT :
-    Ce module ne passe aucun ordre réel.
-    Le filtre News est volontairement laissé de côté pour le moment.
+D1 + H4  -> tendance macro
+H1 + M15 -> structure / zones
+M5       -> confirmation
+Score    -> qualité du setup
+RR       -> validation du trade
+
+Aucune exécution réelle d'ordre.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
-from config import CONFIG
+from core.models import Direction
+
+from analysis.trend import detect_direction_from_structure
+
 from market_data import get_candles
+from scoring.score_engine import calculate_score
 
-from core.models import (
-    Direction,
-    Zone,
-    Confirmation,
-)
 
-from analysis.trend import (
-    detect_direction_from_structure,
-    build_trend_context,
-)
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-from analysis.zones import calculate_zone_quality
+SWING_LEFT = 2
+SWING_RIGHT = 2
 
-from analysis.confirmation import (
-    validate_m5_confirmation,
-)
+MINIMUM_RR = 2.0
 
-from scoring.score_engine import (
-    calculate_score,
-    should_send_signal,
-)
+# Distance minimale du SL basée sur l'ATR.
+# Cela évite les SL de quelques points/pips seulement.
+ATR_SL_MULTIPLIER = 1.5
 
-from risk.risk_manager import calculate_rr
+# Nombre de bougies utilisées pour rechercher la structure.
+STRUCTURE_CANDLES = 100
+
+# Nombre de bougies M5 utilisées pour la confirmation.
+CONFIRMATION_CANDLES = 80
 
 
 # ============================================================
 # OUTILS GÉNÉRAUX
 # ============================================================
 
-def clamp(
-    value: float,
-    minimum: float,
-    maximum: float,
-) -> float:
-    return max(
-        minimum,
-        min(maximum, value),
-    )
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_direction(value: Any) -> Direction:
+    if isinstance(value, Direction):
+        return value
+
+    text = str(value).upper().strip()
+
+    if text in ("BUY", "LONG"):
+        return Direction.BUY
+
+    if text in ("SELL", "SHORT"):
+        return Direction.SELL
+
+    return Direction.NEUTRAL
+
+
+def _direction_text(direction: Direction) -> str:
+    if direction == Direction.BUY:
+        return "BUY"
+
+    if direction == Direction.SELL:
+        return "SELL"
+
+    return "NEUTRAL"
 
 
 # ============================================================
-# STRUCTURE DE MARCHÉ
+# SWINGS
 # ============================================================
 
 def _find_swing_points(
-    candles,
-    left: int = 2,
-    right: int = 2,
-):
+    candles: List[Dict[str, Any]],
+    left: int = SWING_LEFT,
+    right: int = SWING_RIGHT,
+) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
     """
-    Détecte les sommets et creux locaux.
+    Détecte les Swing Highs et Swing Lows.
 
-    Un swing high est un sommet supérieur aux bougies
-    qui l'entourent.
-
-    Un swing low est un creux inférieur aux bougies
-    qui l'entourent.
+    Retourne :
+        swing_highs = [(index, prix), ...]
+        swing_lows  = [(index, prix), ...]
     """
 
-    swing_highs = []
-    swing_lows = []
+    swing_highs: List[Tuple[int, float]] = []
+    swing_lows: List[Tuple[int, float]] = []
 
     if len(candles) < left + right + 1:
         return swing_highs, swing_lows
 
-    for i in range(
-        left,
-        len(candles) - right,
-    ):
+    for i in range(left, len(candles) - right):
 
-        current = candles[i]
+        current_high = _safe_float(candles[i].get("high"))
+        current_low = _safe_float(candles[i].get("low"))
 
-        left_highs = [
-            candles[j].high
-            for j in range(
-                i - left,
-                i,
-            )
-        ]
+        if current_high <= 0 or current_low <= 0:
+            continue
 
-        right_highs = [
-            candles[j].high
-            for j in range(
-                i + 1,
-                i + right + 1,
-            )
-        ]
+        is_high = True
+        is_low = True
 
-        left_lows = [
-            candles[j].low
-            for j in range(
-                i - left,
-                i,
-            )
-        ]
+        for j in range(i - left, i + right + 1):
+            if j == i:
+                continue
 
-        right_lows = [
-            candles[j].low
-            for j in range(
-                i + 1,
-                i + right + 1,
-            )
-        ]
+            other_high = _safe_float(candles[j].get("high"))
+            other_low = _safe_float(candles[j].get("low"))
 
-        if (
-            current.high > max(left_highs)
-            and current.high > max(right_highs)
-        ):
-            swing_highs.append(current.high)
+            if current_high <= other_high:
+                is_high = False
 
-        if (
-            current.low < min(left_lows)
-            and current.low < min(right_lows)
-        ):
-            swing_lows.append(current.low)
+            if current_low >= other_low:
+                is_low = False
+
+        if is_high:
+            swing_highs.append((i, current_high))
+
+        if is_low:
+            swing_lows.append((i, current_low))
 
     return swing_highs, swing_lows
 
 
+# ============================================================
+# STRUCTURE
+# ============================================================
+
 def _count_structure(
-    candles,
-):
-    """
-    Compte les HH, HL, LH et LL.
+    candles: List[Dict[str, Any]]
+) -> Dict[str, int]:
 
-    On compare les derniers swings entre eux.
-    """
-
-    swing_highs, swing_lows = _find_swing_points(
-        candles
-    )
+    highs, lows = _find_swing_points(candles)
 
     higher_highs = 0
     lower_highs = 0
     higher_lows = 0
     lower_lows = 0
 
-    if len(swing_highs) >= 2:
+    # -------------------------
+    # Swing Highs
+    # -------------------------
 
-        for previous, current in zip(
-            swing_highs[:-1],
-            swing_highs[1:],
-        ):
+    for i in range(1, len(highs)):
+        previous = highs[i - 1][1]
+        current = highs[i][1]
 
-            if current > previous:
-                higher_highs += 1
+        if current > previous:
+            higher_highs += 1
+        elif current < previous:
+            lower_highs += 1
 
-            elif current < previous:
-                lower_highs += 1
+    # -------------------------
+    # Swing Lows
+    # -------------------------
 
-    if len(swing_lows) >= 2:
+    for i in range(1, len(lows)):
+        previous = lows[i - 1][1]
+        current = lows[i][1]
 
-        for previous, current in zip(
-            swing_lows[:-1],
-            swing_lows[1:],
-        ):
-
-            if current > previous:
-                higher_lows += 1
-
-            elif current < previous:
-                lower_lows += 1
+        if current > previous:
+            higher_lows += 1
+        elif current < previous:
+            lower_lows += 1
 
     return {
         "higher_highs": higher_highs,
-        "higher_lows": higher_lows,
         "lower_highs": lower_highs,
+        "higher_lows": higher_lows,
         "lower_lows": lower_lows,
-        "swing_highs": swing_highs,
-        "swing_lows": swing_lows,
     }
 
 
 def determine_direction_from_candles(
-    candles,
+    candles: List[Dict[str, Any]]
 ) -> Direction:
-    """
-    Détermine la direction à partir de la structure
-    HH / HL / LH / LL.
 
-    La décision est confiée à detect_direction_from_structure()
-    présente dans analysis.trend.
-    """
-
-    if len(candles) < 15:
+    if not candles:
         return Direction.NEUTRAL
 
-    structure = _count_structure(
-        candles
-    )
+    structure = _count_structure(candles)
 
     return detect_direction_from_structure(
         higher_highs=structure["higher_highs"],
@@ -221,22 +204,10 @@ def determine_direction_from_candles(
 
 
 def calculate_structure_strength(
-    candles,
-    direction: Direction,
+    candles: List[Dict[str, Any]]
 ) -> float:
-    """
-    Calcule une force structurelle de 0 à 100.
 
-    Plus les éléments HH/HL ou LH/LL sont nombreux et
-    cohérents, plus la force augmente.
-    """
-
-    if direction == Direction.NEUTRAL:
-        return 0.0
-
-    structure = _count_structure(
-        candles
-    )
+    structure = _count_structure(candles)
 
     bullish = (
         structure["higher_highs"]
@@ -253,858 +224,779 @@ def calculate_structure_strength(
     if total == 0:
         return 0.0
 
-    if direction == Direction.BUY:
-
-        favorable = bullish
-        unfavorable = bearish
-
-    else:
-
-        favorable = bearish
-        unfavorable = bullish
-
-    ratio = favorable / total
-
-    strength = 50.0 + (
-        ratio * 50.0
-    )
-
-    return clamp(
-        strength,
-        0.0,
-        100.0,
+    return round(
+        abs(bullish - bearish) / total * 100.0,
+        2,
     )
 
 
 # ============================================================
-# CONFIRMATION M5
+# ATR
 # ============================================================
 
-def detect_retest(
-    candles,
-    direction: Direction,
-) -> bool:
+def calculate_atr(
+    candles: List[Dict[str, Any]],
+    period: int = 14,
+) -> float:
 
-    if len(candles) < 6:
-        return False
+    if len(candles) < period + 1:
+        return 0.0
 
-    previous = candles[-2]
-    current = candles[-1]
+    true_ranges: List[float] = []
 
-    if direction == Direction.BUY:
+    for i in range(1, len(candles)):
 
-        return (
-            current.low <= previous.close
-            and current.close > current.open
+        high = _safe_float(candles[i].get("high"))
+        low = _safe_float(candles[i].get("low"))
+
+        previous_close = _safe_float(
+            candles[i - 1].get("close")
         )
 
-    if direction == Direction.SELL:
+        if high <= 0 or low <= 0 or previous_close <= 0:
+            continue
 
-        return (
-            current.high >= previous.close
-            and current.close < current.open
+        tr = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close),
         )
 
-    return False
+        true_ranges.append(tr)
 
+    if len(true_ranges) < period:
+        return 0.0
 
-def detect_rejection(
-    candles,
-    direction: Direction,
-) -> bool:
-
-    if not candles:
-        return False
-
-    candle = candles[-1]
-
-    body = abs(
-        candle.close - candle.open
-    )
-
-    if body <= 0:
-        return False
-
-    upper_wick = (
-        candle.high
-        - max(
-            candle.open,
-            candle.close,
-        )
-    )
-
-    lower_wick = (
-        min(
-            candle.open,
-            candle.close,
-        )
-        - candle.low
-    )
-
-    if direction == Direction.BUY:
-
-        return (
-            lower_wick >= body * 0.8
-        )
-
-    if direction == Direction.SELL:
-
-        return (
-            upper_wick >= body * 0.8
-        )
-
-    return False
-
-
-def detect_liquidity_sweep(
-    candles,
-    direction: Direction,
-) -> bool:
-
-    if len(candles) < 10:
-        return False
-
-    current = candles[-1]
-
-    reference = candles[-8:-1]
-
-    if direction == Direction.BUY:
-
-        liquidity_low = min(
-            candle.low
-            for candle in reference
-        )
-
-        return (
-            current.low < liquidity_low
-            and current.close > liquidity_low
-        )
-
-    if direction == Direction.SELL:
-
-        liquidity_high = max(
-            candle.high
-            for candle in reference
-        )
-
-        return (
-            current.high > liquidity_high
-            and current.close < liquidity_high
-        )
-
-    return False
-
-
-def detect_micro_bos(
-    candles,
-    direction: Direction,
-) -> bool:
-
-    if len(candles) < 6:
-        return False
-
-    current = candles[-1]
-
-    reference = candles[-4:-1]
-
-    if direction == Direction.BUY:
-
-        reference_high = max(
-            candle.high
-            for candle in reference
-        )
-
-        return (
-            current.close > reference_high
-        )
-
-    if direction == Direction.SELL:
-
-        reference_low = min(
-            candle.low
-            for candle in reference
-        )
-
-        return (
-            current.close < reference_low
-        )
-
-    return False
-
-
-def detect_candle_confirmation(
-    candles,
-    direction: Direction,
-) -> bool:
-
-    if not candles:
-        return False
-
-    candle = candles[-1]
-
-    if direction == Direction.BUY:
-        return candle.close > candle.open
-
-    if direction == Direction.SELL:
-        return candle.close < candle.open
-
-    return False
+    return sum(true_ranges[-period:]) / period
 
 
 # ============================================================
-# ZONE H1 + M15
+# ZONE
 # ============================================================
 
 def build_zone(
-    h1_candles,
-    m15_candles,
+    candles: List[Dict[str, Any]],
     direction: Direction,
-) -> Zone:
+) -> Optional[Dict[str, float]]:
 
-    h1_recent = h1_candles[-20:]
-    m15_recent = m15_candles[-20:]
+    if not candles:
+        return None
 
-    h1_low = min(
-        candle.low
-        for candle in h1_recent
-    )
+    highs = [
+        _safe_float(c.get("high"))
+        for c in candles
+        if _safe_float(c.get("high")) > 0
+    ]
 
-    h1_high = max(
-        candle.high
-        for candle in h1_recent
-    )
+    lows = [
+        _safe_float(c.get("low"))
+        for c in candles
+        if _safe_float(c.get("low")) > 0
+    ]
 
-    m15_low = min(
-        candle.low
-        for candle in m15_recent
-    )
+    if not highs or not lows:
+        return None
 
-    m15_high = max(
-        candle.high
-        for candle in m15_recent
-    )
+    zone_high = max(highs)
+    zone_low = min(lows)
 
-    # Intersection des zones H1/M15.
-    low = max(
-        h1_low,
-        m15_low,
-    )
+    if zone_high <= zone_low:
+        return None
 
-    high = min(
-        h1_high,
-        m15_high,
-    )
-
-    # Si aucune intersection propre,
-    # on utilise la zone M15.
-    if low >= high:
-
-        low = m15_low
-        high = m15_high
-
-    h1_structure = calculate_structure_strength(
-        h1_candles,
-        direction,
-    )
-
-    m15_structure = calculate_structure_strength(
-        m15_candles,
-        direction,
-    )
-
-    return Zone(
-        direction=direction,
-        timeframe="H1/M15",
-        low=low,
-        high=high,
-        h1_strength=clamp(
-            h1_structure,
-            0.0,
-            100.0,
-        ),
-        m15_strength=clamp(
-            m15_structure,
-            0.0,
-            100.0,
-        ),
-        kind="SMC_CONTEXT",
-        structure_confirmed=(
-            h1_structure >= 50.0
-            and m15_structure >= 50.0
-        ),
-        liquidity_nearby=True,
-        order_block=True,
-        fvg=True,
-    )
+    return {
+        "low": zone_low,
+        "high": zone_high,
+        "mid": (zone_low + zone_high) / 2.0,
+    }
 
 
 # ============================================================
-# NIVEAUX DE TRADE
+# M5 CONFIRMATION
 # ============================================================
 
-def calculate_trade_levels(
-    candles,
+def detect_m5_confirmation(
+    candles: List[Dict[str, Any]],
     direction: Direction,
-):
+) -> Dict[str, Any]:
+
+    result = {
+        "direction": direction,
+        "retest": False,
+        "rejection": False,
+        "liquidity_sweep": False,
+        "micro_bos": False,
+        "candle_confirmation": False,
+        "valid": False,
+    }
+
+    if direction == Direction.NEUTRAL:
+        return result
 
     if len(candles) < 10:
-        return None, None, None
+        return result
 
-    current = candles[-1]
+    recent = candles[-CONFIRMATION_CANDLES:]
 
-    entry = current.close
+    highs = [
+        _safe_float(c.get("high"))
+        for c in recent
+        if _safe_float(c.get("high")) > 0
+    ]
 
-    recent = candles[-10:]
+    lows = [
+        _safe_float(c.get("low"))
+        for c in recent
+        if _safe_float(c.get("low")) > 0
+    ]
+
+    if not highs or not lows:
+        return result
+
+    last = recent[-1]
+
+    last_open = _safe_float(last.get("open"))
+    last_high = _safe_float(last.get("high"))
+    last_low = _safe_float(last.get("low"))
+    last_close = _safe_float(last.get("close"))
+
+    if min(
+        last_open,
+        last_high,
+        last_low,
+        last_close,
+    ) <= 0:
+        return result
+
+    body = abs(last_close - last_open)
+    candle_range = last_high - last_low
+
+    if candle_range <= 0:
+        return result
+
+    upper_wick = last_high - max(last_open, last_close)
+    lower_wick = min(last_open, last_close) - last_low
+
+    # --------------------------------------------------------
+    # BUY
+    # --------------------------------------------------------
 
     if direction == Direction.BUY:
 
-        structural_low = min(
-            candle.low
-            for candle in recent
+        previous_high = max(highs[:-1])
+        previous_low = min(lows[:-1])
+
+        # Retest / retour dans une zone récente
+        result["retest"] = (
+            last_low <= previous_high
         )
 
-        risk = (
-            entry
-            - structural_low
+        # Rejection haussière
+        result["rejection"] = (
+            last_close > last_open
+            and lower_wick >= body * 0.5
         )
 
-        if risk <= 0:
-            return None, None, None
-
-        stop_loss = structural_low
-
-        take_profit = (
-            entry
-            + (
-                risk
-                * CONFIG.MINIMUM_RR
-            )
+        # Sweep de liquidité sous un low récent
+        result["liquidity_sweep"] = (
+            last_low < previous_low
+            and last_close > previous_low
         )
 
-        return (
-            entry,
-            stop_loss,
-            take_profit,
+        # Micro BOS haussier
+        result["micro_bos"] = (
+            last_close > previous_high
         )
 
-    if direction == Direction.SELL:
-
-        structural_high = max(
-            candle.high
-            for candle in recent
+        # Bougie haussière de confirmation
+        result["candle_confirmation"] = (
+            last_close > last_open
+            and body >= candle_range * 0.30
         )
 
-        risk = (
-            structural_high
-            - entry
+    # --------------------------------------------------------
+    # SELL
+    # --------------------------------------------------------
+
+    elif direction == Direction.SELL:
+
+        previous_high = max(highs[:-1])
+        previous_low = min(lows[:-1])
+
+        # Retest / retour dans une zone récente
+        result["retest"] = (
+            last_high >= previous_low
         )
 
-        if risk <= 0:
-            return None, None, None
-
-        stop_loss = structural_high
-
-        take_profit = (
-            entry
-            - (
-                risk
-                * CONFIG.MINIMUM_RR
-            )
+        # Rejection baissière
+        result["rejection"] = (
+            last_close < last_open
+            and upper_wick >= body * 0.5
         )
 
-        return (
-            entry,
-            stop_loss,
-            take_profit,
+        # Sweep de liquidité au-dessus d'un high récent
+        result["liquidity_sweep"] = (
+            last_high > previous_high
+            and last_close < previous_high
         )
 
-    return None, None, None
+        # Micro BOS baissier
+        result["micro_bos"] = (
+            last_close < previous_low
+        )
+
+        # Bougie baissière de confirmation
+        result["candle_confirmation"] = (
+            last_close < last_open
+            and body >= candle_range * 0.30
+        )
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+    #
+    # On ne demande plus systématiquement les 4 conditions.
+    #
+    # Une vraie confirmation M5 peut être :
+    #
+    # - micro BOS + candle confirmation
+    # OU
+    # - liquidity sweep + rejection + candle confirmation
+    #
+    # Cela évite de bloquer artificiellement le pipeline.
+    # --------------------------------------------------------
+
+    setup_a = (
+        result["micro_bos"]
+        and result["candle_confirmation"]
+    )
+
+    setup_b = (
+        result["liquidity_sweep"]
+        and result["rejection"]
+        and result["candle_confirmation"]
+    )
+
+    result["valid"] = setup_a or setup_b
+
+    return result
 
 
 # ============================================================
-# RÉPONSE STANDARD DE REJET
+# TRADE LEVELS
+# ============================================================
+
+def calculate_trade_levels(
+    candles: List[Dict[str, Any]],
+    direction: Direction,
+) -> Dict[str, float]:
+
+    if not candles or direction == Direction.NEUTRAL:
+        return {
+            "entry": 0.0,
+            "sl": 0.0,
+            "tp": 0.0,
+            "rr": 0.0,
+        }
+
+    last_close = _safe_float(
+        candles[-1].get("close")
+    )
+
+    if last_close <= 0:
+        return {
+            "entry": 0.0,
+            "sl": 0.0,
+            "tp": 0.0,
+            "rr": 0.0,
+        }
+
+    atr = calculate_atr(candles)
+
+    # --------------------------------------------------------
+    # Fallback si ATR indisponible
+    # --------------------------------------------------------
+
+    if atr <= 0:
+
+        ranges = []
+
+        for candle in candles[-20:]:
+            high = _safe_float(candle.get("high"))
+            low = _safe_float(candle.get("low"))
+
+            if high > low:
+                ranges.append(high - low)
+
+        if ranges:
+            atr = sum(ranges) / len(ranges)
+
+    if atr <= 0:
+        return {
+            "entry": last_close,
+            "sl": 0.0,
+            "tp": 0.0,
+            "rr": 0.0,
+        }
+
+    # --------------------------------------------------------
+    # Distance SL
+    # --------------------------------------------------------
+
+    sl_distance = atr * ATR_SL_MULTIPLIER
+
+    # --------------------------------------------------------
+    # BUY
+    # --------------------------------------------------------
+
+    if direction == Direction.BUY:
+
+        entry = last_close
+        sl = entry - sl_distance
+
+        risk = entry - sl
+
+        if risk <= 0:
+            return {
+                "entry": entry,
+                "sl": 0.0,
+                "tp": 0.0,
+                "rr": 0.0,
+            }
+
+        tp = entry + (risk * MINIMUM_RR)
+
+    # --------------------------------------------------------
+    # SELL
+    # --------------------------------------------------------
+
+    else:
+
+        entry = last_close
+        sl = entry + sl_distance
+
+        risk = sl - entry
+
+        if risk <= 0:
+            return {
+                "entry": entry,
+                "sl": 0.0,
+                "tp": 0.0,
+                "rr": 0.0,
+            }
+
+        tp = entry - (risk * MINIMUM_RR)
+
+    rr = (
+        abs(tp - entry)
+        / abs(entry - sl)
+        if abs(entry - sl) > 0
+        else 0.0
+    )
+
+    return {
+        "entry": round(entry, 8),
+        "sl": round(sl, 8),
+        "tp": round(tp, 8),
+        "rr": round(rr, 2),
+    }
+
+
+# ============================================================
+# REJECT RESULT
 # ============================================================
 
 def _reject_result(
     symbol: str,
-    d1: Direction,
-    h4: Direction,
-    h1: Direction,
-    m15: Direction,
     reason: str,
+    d1: Direction = Direction.NEUTRAL,
+    h4: Direction = Direction.NEUTRAL,
+    h1: Direction = Direction.NEUTRAL,
+    m15: Direction = Direction.NEUTRAL,
     score: float = 0.0,
-    entry=None,
-    stop_loss=None,
-    take_profit=None,
     rr: float = 0.0,
-    m5: str = "NOT CONFIRMED",
-):
+    m5_status: str = "NOT CONFIRMED",
+) -> Dict[str, Any]:
+
     return {
         "symbol": symbol,
-        "direction": (
-            "NO TRADE"
-            if score == 0
-            else (
-                d1.value
-                if d1 != Direction.NEUTRAL
-                else h4.value
-            )
-        ),
-        "score": round(
-            score,
-            2,
-        ),
-        "quality": (
-            "NO SIGNAL"
-            if score < 60
-            else "C"
-        ),
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "rr": round(
-            rr,
-            2,
-        ),
-        "d1": d1.value,
-        "h4": h4.value,
-        "h1": h1.value,
-        "m15": m15.value,
-        "m5": m5,
+        "direction": "NO TRADE",
+        "score": round(score, 2),
+        "quality": "NO SIGNAL",
+
+        "d1": _direction_text(d1),
+        "h4": _direction_text(h4),
+        "h1": _direction_text(h1),
+        "m15": _direction_text(m15),
+        "m5": m5_status,
+
+        "entry": 0.0,
+        "sl": 0.0,
+        "tp": 0.0,
+        "rr": round(rr, 2),
+
         "news_status": "NOT CHECKED",
+
         "status": "REJECT",
         "reason": reason,
     }
 
 
 # ============================================================
+# QUALITÉ
+# ============================================================
+
+def get_quality(score: float) -> str:
+
+    if score >= 85:
+        return "A+"
+
+    if score >= 80:
+        return "A"
+
+    if score >= 70:
+        return "B"
+
+    if score >= 60:
+        return "C"
+
+    return "D"
+
+
+# ============================================================
 # ANALYSE PRINCIPALE
 # ============================================================
 
-def analyze_market(
-    symbol: str,
-) -> dict[str, Any]:
+def analyze_market(symbol: str) -> Dict[str, Any]:
 
-    symbol = symbol.strip().upper()
+    # ========================================================
+    # 1 — D1
+    # ========================================================
 
-    # --------------------------------------------------------
-    # 1. DONNÉES MULTI-TIMEFRAME
-    # --------------------------------------------------------
-
-    d1 = get_candles(
+    d1_candles = get_candles(
         symbol,
         "D1",
-        outputsize=100,
+        limit=STRUCTURE_CANDLES,
     )
 
-    h4 = get_candles(
+    if not d1_candles:
+        raise RuntimeError(
+            f"Impossible de récupérer les données {symbol} D1."
+        )
+
+    d1 = determine_direction_from_candles(
+        d1_candles
+    )
+
+    # ========================================================
+    # 2 — H4
+    # ========================================================
+
+    h4_candles = get_candles(
         symbol,
         "H4",
-        outputsize=100,
+        limit=STRUCTURE_CANDLES,
     )
 
-    h1 = get_candles(
+    if not h4_candles:
+        raise RuntimeError(
+            f"Impossible de récupérer les données {symbol} H4."
+        )
+
+    h4 = determine_direction_from_candles(
+        h4_candles
+    )
+
+    # ========================================================
+    # D1 + H4
+    # ========================================================
+
+    if (
+        d1 == Direction.NEUTRAL
+        or h4 == Direction.NEUTRAL
+        or d1 != h4
+    ):
+        return _reject_result(
+            symbol=symbol,
+            d1=d1,
+            h4=h4,
+            reason=(
+                "D1 et H4 ne donnent pas une direction commune."
+            ),
+        )
+
+    global_direction = d1
+
+    # ========================================================
+    # 3 — H1
+    # ========================================================
+
+    h1_candles = get_candles(
         symbol,
         "H1",
-        outputsize=100,
+        limit=STRUCTURE_CANDLES,
     )
 
-    m15 = get_candles(
+    if not h1_candles:
+        raise RuntimeError(
+            f"Impossible de récupérer les données {symbol} H1."
+        )
+
+    h1 = determine_direction_from_candles(
+        h1_candles
+    )
+
+    # ========================================================
+    # 4 — M15
+    # ========================================================
+
+    m15_candles = get_candles(
         symbol,
         "M15",
-        outputsize=100,
+        limit=STRUCTURE_CANDLES,
     )
 
-    m5 = get_candles(
+    if not m15_candles:
+        raise RuntimeError(
+            f"Impossible de récupérer les données {symbol} M15."
+        )
+
+    m15 = determine_direction_from_candles(
+        m15_candles
+    )
+
+    # ========================================================
+    # H1 / M15
+    # ========================================================
+    #
+    # Ils doivent confirmer ou au minimum ne pas contredire
+    # directement la tendance macro.
+    # ========================================================
+
+    if h1 not in (
+        global_direction,
+        Direction.NEUTRAL,
+    ):
+        return _reject_result(
+            symbol=symbol,
+            d1=d1,
+            h4=h4,
+            h1=h1,
+            m15=m15,
+            reason=(
+                "H1 est opposé à la direction D1/H4."
+            ),
+        )
+
+    if m15 not in (
+        global_direction,
+        Direction.NEUTRAL,
+    ):
+        return _reject_result(
+            symbol=symbol,
+            d1=d1,
+            h4=h4,
+            h1=h1,
+            m15=m15,
+            reason=(
+                "M15 est opposé à la direction D1/H4."
+            ),
+        )
+
+    # ========================================================
+    # 5 — M5
+    # ========================================================
+
+    m5_candles = get_candles(
         symbol,
         "M5",
-        outputsize=100,
+        limit=CONFIRMATION_CANDLES,
     )
 
-    # --------------------------------------------------------
-    # 2. TENDANCE D1 + H4
-    # --------------------------------------------------------
-
-    d1_direction = (
-        determine_direction_from_candles(d1)
-    )
-
-    h4_direction = (
-        determine_direction_from_candles(h4)
-    )
-
-    d1_strength = (
-        calculate_structure_strength(
-            d1,
-            d1_direction,
-        )
-    )
-
-    h4_strength = (
-        calculate_structure_strength(
-            h4,
-            h4_direction,
-        )
-    )
-
-    trend = build_trend_context(
-        d1=d1_direction,
-        h4=h4_direction,
-        d1_strength=d1_strength,
-        h4_strength=h4_strength,
-    )
-
-    direction = trend.direction
-
-    # --------------------------------------------------------
-    # D1 + H4 NON ALIGNÉS
-    # --------------------------------------------------------
-
-    if direction == Direction.NEUTRAL:
-
+    if not m5_candles:
         return _reject_result(
             symbol=symbol,
-            d1=d1_direction,
-            h4=h4_direction,
-            h1=Direction.NEUTRAL,
-            m15=Direction.NEUTRAL,
-            reason=(
-                "D1 et H4 ne donnent pas "
-                "une direction commune."
-            ),
+            d1=d1,
+            h4=h4,
+            h1=h1,
+            m15=m15,
+            reason="Données M5 indisponibles.",
         )
 
-    # --------------------------------------------------------
-    # 3. STRUCTURE H1 + M15
-    # --------------------------------------------------------
-
-    h1_direction = (
-        determine_direction_from_candles(h1)
+    confirmation = detect_m5_confirmation(
+        m5_candles,
+        global_direction,
     )
 
-    m15_direction = (
-        determine_direction_from_candles(m15)
+    m5_status = (
+        "CONFIRMED"
+        if confirmation["valid"]
+        else "NOT CONFIRMED"
     )
 
-    # --------------------------------------------------------
-    # H1 / M15 CONTRE LA TENDANCE
-    # --------------------------------------------------------
+    # ========================================================
+    # Setup levels
+    # ========================================================
 
-    if (
-        h1_direction != Direction.NEUTRAL
-        and h1_direction != direction
-    ):
+    levels = calculate_trade_levels(
+        m5_candles,
+        global_direction,
+    )
 
-        return _reject_result(
-            symbol=symbol,
-            d1=d1_direction,
-            h4=h4_direction,
-            h1=h1_direction,
-            m15=m15_direction,
-            reason=(
-                "La structure H1 est opposée "
-                "à la tendance D1/H4."
-            ),
+    entry = levels["entry"]
+    sl = levels["sl"]
+    tp = levels["tp"]
+    rr = levels["rr"]
+
+    # ========================================================
+    # 6 — SCORE
+    # ========================================================
+
+    try:
+
+        score = calculate_score(
+            direction=global_direction,
+            d1=d1,
+            h4=h4,
+            h1=h1,
+            m15=m15,
+            m5_confirmation=confirmation,
+            rr=rr,
         )
 
-    if (
-        m15_direction != Direction.NEUTRAL
-        and m15_direction != direction
-    ):
+    except TypeError:
 
-        return _reject_result(
-            symbol=symbol,
-            d1=d1_direction,
-            h4=h4_direction,
-            h1=h1_direction,
-            m15=m15_direction,
-            reason=(
-                "La structure M15 est opposée "
-                "à la tendance D1/H4."
-            ),
-        )
+        try:
+            score = calculate_score(
+                direction=global_direction,
+                d1=d1,
+                h4=h4,
+                h1=h1,
+                m15=m15,
+                m5=confirmation,
+                rr=rr,
+            )
 
-    # --------------------------------------------------------
-    # 4. ZONE H1 + M15
-    # --------------------------------------------------------
+        except Exception:
+            score = 0.0
 
-    zone = build_zone(
-        h1_candles=h1,
-        m15_candles=m15,
-        direction=direction,
-    )
+    except Exception:
+        score = 0.0
 
-    zone_quality = calculate_zone_quality(
-        zone
-    )
+    score = _safe_float(score)
 
-    # --------------------------------------------------------
-    # 5. CONFIRMATION M5
-    # --------------------------------------------------------
+    # ========================================================
+    # 7 — VALIDATION FINALE
+    # ========================================================
 
-    retest = detect_retest(
-        m5,
-        direction,
-    )
-
-    rejection = detect_rejection(
-        m5,
-        direction,
-    )
-
-    liquidity_sweep = detect_liquidity_sweep(
-        m5,
-        direction,
-    )
-
-    micro_bos = detect_micro_bos(
-        m5,
-        direction,
-    )
-
-    candle_confirmation = (
-        detect_candle_confirmation(
-            m5,
-            direction,
-        )
-    )
-
-    confirmation = validate_m5_confirmation(
-        direction=direction,
-        retest=retest,
-        rejection=rejection,
-        liquidity_sweep=liquidity_sweep,
-        micro_bos=micro_bos,
-        candle_confirmation=candle_confirmation,
-    )
-
-    # --------------------------------------------------------
-    # 6. NIVEAUX ENTRY / SL / TP
-    # --------------------------------------------------------
-
-    entry, stop_loss, take_profit = (
-        calculate_trade_levels(
-            m5,
-            direction,
-        )
-    )
-
-    if entry is None:
-
-        return _reject_result(
-            symbol=symbol,
-            d1=d1_direction,
-            h4=h4_direction,
-            h1=h1_direction,
-            m15=m15_direction,
-            reason=(
-                "Impossible de construire "
-                "un niveau SL/TP cohérent."
-            ),
-            m5=(
-                "CONFIRMED"
-                if confirmation.valid
-                else "NOT CONFIRMED"
-            ),
-        )
-
-    # --------------------------------------------------------
-    # 7. RR
-    # --------------------------------------------------------
-
-    rr = calculate_rr(
-        entry,
-        stop_loss,
-        take_profit,
-    )
-
-    # --------------------------------------------------------
-    # 8. SCORE
-    # --------------------------------------------------------
-
-    score = calculate_score(
-        trend=trend,
-        zone=zone,
-        confirmation=confirmation,
-        rr=rr,
-        spread_ok=True,
-        session_ok=True,
-    )
-
-    score = clamp(
-        float(score),
-        0.0,
-        100.0,
-    )
-
-    # --------------------------------------------------------
-    # 9. QUALITÉ
-    # --------------------------------------------------------
-
-    if score >= 90:
-        quality = "A+"
-
-    elif score >= 80:
-        quality = "A"
-
-    elif score >= 70:
-        quality = "B"
-
-    elif score >= 60:
-        quality = "C"
-
-    else:
-        quality = "NO SIGNAL"
-
-    # --------------------------------------------------------
-    # 10. VALIDATION SCORE
-    # --------------------------------------------------------
-
-    valid_score = should_send_signal(
-        score,
-        CONFIG.SIGNAL_THRESHOLD,
-    )
-
-    if not valid_score:
+    if not confirmation["valid"]:
 
         return {
             "symbol": symbol,
-            "direction": direction.value,
-            "score": round(
-                score,
-                2,
-            ),
-            "quality": quality,
+            "direction": _direction_text(global_direction),
+            "score": round(score, 2),
+            "quality": get_quality(score),
+
+            "d1": _direction_text(d1),
+            "h4": _direction_text(h4),
+            "h1": _direction_text(h1),
+            "m15": _direction_text(m15),
+            "m5": m5_status,
+
             "entry": entry,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "rr": round(
-                rr,
-                2,
-            ),
-            "d1": d1_direction.value,
-            "h4": h4_direction.value,
-            "h1": h1_direction.value,
-            "m15": m15_direction.value,
-            "m5": (
-                "CONFIRMED"
-                if confirmation.valid
-                else "NOT CONFIRMED"
-            ),
+            "sl": sl,
+            "tp": tp,
+            "rr": rr,
+
             "news_status": "NOT CHECKED",
+
             "status": "REJECT",
-            "reason": (
-                f"Score insuffisant : "
-                f"{score:.2f}/100 "
-                f"(minimum "
-                f"{CONFIG.SIGNAL_THRESHOLD})."
-            ),
-        }
 
-    # --------------------------------------------------------
-    # 11. VALIDATION RR
-    # --------------------------------------------------------
-
-    if rr < CONFIG.MINIMUM_RR:
-
-        return {
-            "symbol": symbol,
-            "direction": direction.value,
-            "score": round(
-                score,
-                2,
-            ),
-            "quality": quality,
-            "entry": entry,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "rr": round(
-                rr,
-                2,
-            ),
-            "d1": d1_direction.value,
-            "h4": h4_direction.value,
-            "h1": h1_direction.value,
-            "m15": m15_direction.value,
-            "m5": (
-                "CONFIRMED"
-                if confirmation.valid
-                else "NOT CONFIRMED"
-            ),
-            "news_status": "NOT CHECKED",
-            "status": "REJECT",
-            "reason": (
-                f"RR insuffisant : "
-                f"{rr:.2f}. "
-                f"Minimum requis : "
-                f"{CONFIG.MINIMUM_RR:.2f}."
-            ),
-        }
-
-    # --------------------------------------------------------
-    # 12. VALIDATION M5
-    # --------------------------------------------------------
-
-    if not confirmation.valid:
-
-        return {
-            "symbol": symbol,
-            "direction": direction.value,
-            "score": round(
-                score,
-                2,
-            ),
-            "quality": quality,
-            "entry": entry,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "rr": round(
-                rr,
-                2,
-            ),
-            "d1": d1_direction.value,
-            "h4": h4_direction.value,
-            "h1": h1_direction.value,
-            "m15": m15_direction.value,
-            "m5": "NOT CONFIRMED",
-            "news_status": "NOT CHECKED",
-            "status": "REJECT",
             "reason": (
                 "La confirmation M5 complète "
                 "n'est pas validée."
             ),
         }
 
-    # --------------------------------------------------------
-    # 13. SIGNAL VALIDÉ
-    # --------------------------------------------------------
+    if rr < MINIMUM_RR:
+
+        return {
+            "symbol": symbol,
+            "direction": _direction_text(global_direction),
+            "score": round(score, 2),
+            "quality": get_quality(score),
+
+            "d1": _direction_text(d1),
+            "h4": _direction_text(h4),
+            "h1": _direction_text(h1),
+            "m15": _direction_text(m15),
+            "m5": m5_status,
+
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "rr": rr,
+
+            "news_status": "NOT CHECKED",
+
+            "status": "REJECT",
+
+            "reason": (
+                f"RR insuffisant : {rr:.2f}. "
+                f"Minimum requis : {MINIMUM_RR:.2f}."
+            ),
+        }
+
+    # ========================================================
+    # SIGNAL ACCEPTÉ
+    # ========================================================
 
     return {
         "symbol": symbol,
-        "direction": direction.value,
-        "score": round(
-            score,
-            2,
-        ),
-        "quality": quality,
+        "direction": _direction_text(global_direction),
+
+        "score": round(score, 2),
+        "quality": get_quality(score),
+
+        "d1": _direction_text(d1),
+        "h4": _direction_text(h4),
+        "h1": _direction_text(h1),
+        "m15": _direction_text(m15),
+        "m5": m5_status,
+
         "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "rr": round(
-            rr,
-            2,
-        ),
-        "d1": d1_direction.value,
-        "h4": h4_direction.value,
-        "h1": h1_direction.value,
-        "m15": m15_direction.value,
-        "m5": "CONFIRMED",
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+
         "news_status": "NOT CHECKED",
-        "status": "SIGNAL VALIDÉ",
+
+        "status": "ACTIVE",
+
         "reason": (
             "Tendance D1/H4 alignée, "
             "structure H1/M15 compatible, "
             "confirmation M5 validée "
             "et RR conforme."
         ),
+
+        "confirmation": confirmation,
     }
+
+
+# ============================================================
+# COMPATIBILITÉ
+# ============================================================
+
+def analyser_marche(symbol: str) -> Dict[str, Any]:
+    """
+    Alias français conservé pour compatibilité
+    avec d'éventuels anciens appels.
+    """
+    return analyze_market(symbol)
+
+
+def analyze(symbol: str) -> Dict[str, Any]:
+    """
+    Alias court.
+    """
+    return analyze_market(symbol)
