@@ -1,3 +1,12 @@
+"""
+NOVA TRADE AI
+signals/tracker.py
+
+Suivi des signaux actifs.
+"""
+
+from __future__ import annotations
+
 from datetime import datetime, timezone
 
 from config import CONFIG
@@ -8,9 +17,7 @@ from core.models import (
     SignalStatus,
 )
 
-from risk.risk_manager import (
-    calculate_be_price,
-)
+from risk.risk_manager import calculate_be_price
 
 
 class SignalTracker:
@@ -22,9 +29,9 @@ class SignalTracker:
             SignalState
         ] = {}
 
-    # ======================================
-    # ENREGISTRER
-    # ======================================
+    # ========================================================
+    # REGISTER
+    # ========================================================
 
     def register(
         self,
@@ -42,9 +49,9 @@ class SignalTracker:
 
         return state
 
-    # ======================================
-    # RÉCUPÉRER
-    # ======================================
+    # ========================================================
+    # GET
+    # ========================================================
 
     def get(
         self,
@@ -55,9 +62,34 @@ class SignalTracker:
             signal_id
         )
 
-    # ======================================
-    # TOUS LES SIGNAUX ACTIFS
-    # ======================================
+    # ========================================================
+    # FIND ACTIVE SIGNAL BY SYMBOL
+    # ========================================================
+
+    def find_active_by_symbol(
+        self,
+        symbol: str,
+    ) -> SignalState | None:
+
+        active_statuses = {
+            SignalStatus.ACTIVE,
+            SignalStatus.BE_RECOMMENDED,
+            SignalStatus.BE_ACTIVE,
+        }
+
+        for state in self._states.values():
+
+            if (
+                state.signal.symbol == symbol
+                and state.status in active_statuses
+            ):
+                return state
+
+        return None
+
+    # ========================================================
+    # ACTIVE SIGNALS
+    # ========================================================
 
     def active_signals(
         self,
@@ -72,13 +104,12 @@ class SignalTracker:
         return [
             state
             for state in self._states.values()
-            if state.status
-            in active_statuses
+            if state.status in active_statuses
         ]
 
-    # ======================================
-    # CALCUL R
-    # ======================================
+    # ========================================================
+    # R CALCULATION
+    # ========================================================
 
     @staticmethod
     def calculate_r(
@@ -101,9 +132,9 @@ class SignalTracker:
             signal.entry - price
         ) / risk
 
-    # ======================================
+    # ========================================================
     # UPDATE
-    # ======================================
+    # ========================================================
 
     def update(
         self,
@@ -112,6 +143,7 @@ class SignalTracker:
     ) -> SignalState:
 
         if signal_id not in self._states:
+
             raise KeyError(
                 f"Signal inconnu: {signal_id}"
             )
@@ -122,13 +154,11 @@ class SignalTracker:
 
         signal = state.signal
 
+        previous_status = state.status
+
         state.current_price = (
             current_price
         )
-
-        # ==============================
-        # R
-        # ==============================
 
         state.current_r = round(
             self.calculate_r(
@@ -148,9 +178,9 @@ class SignalTracker:
             state.current_r,
         )
 
-        # ==============================
+        # ----------------------------------------------------
         # PROGRESSION TP
-        # ==============================
+        # ----------------------------------------------------
 
         tp_distance = abs(
             signal.take_profit
@@ -159,7 +189,10 @@ class SignalTracker:
 
         if tp_distance > 0:
 
-            if signal.direction.value == "BUY":
+            if (
+                signal.direction.value
+                == "BUY"
+            ):
 
                 progress = (
                     current_price
@@ -184,9 +217,9 @@ class SignalTracker:
                 2,
             )
 
-        # ==============================
+        # ----------------------------------------------------
         # DISTANCES
-        # ==============================
+        # ----------------------------------------------------
 
         state.distance_to_sl = abs(
             current_price
@@ -198,11 +231,14 @@ class SignalTracker:
             - current_price
         )
 
-        # ==============================
-        # SL / TP
-        # ==============================
+        # ----------------------------------------------------
+        # TP / SL
+        # ----------------------------------------------------
 
-        if signal.direction.value == "BUY":
+        if (
+            signal.direction.value
+            == "BUY"
+        ):
 
             sl_hit = (
                 current_price
@@ -238,9 +274,9 @@ class SignalTracker:
                 SignalStatus.SL_HIT
             )
 
-        # ==============================
+        # ----------------------------------------------------
         # BREAK EVEN
-        # ==============================
+        # ----------------------------------------------------
 
         elif (
             state.current_r
@@ -255,14 +291,16 @@ class SignalTracker:
             )
 
         state.last_update = (
-            datetime.now(timezone.utc)
+            datetime.now(
+                timezone.utc
+            )
         )
 
         return state
 
-    # ======================================
-    # ACTIVER BE
-    # ======================================
+    # ========================================================
+    # ACTIVATE BREAK EVEN
+    # ========================================================
 
     def activate_be(
         self,
@@ -280,16 +318,20 @@ class SignalTracker:
             * signal.risk_distance
         )
 
-        state.be_price = (
-            calculate_be_price(
-                signal.entry,
-                signal.direction.value,
-                buffer,
-            )
+        state.be_price = calculate_be_price(
+            signal.entry,
+            signal.direction.value,
+            buffer,
         )
 
         state.status = (
             SignalStatus.BE_ACTIVE
+        )
+
+        state.last_update = (
+            datetime.now(
+                timezone.utc
+            )
         )
 
         return state
