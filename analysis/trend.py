@@ -4,26 +4,22 @@ analysis/trend.py
 
 Moteur de tendance globale.
 
-Hiérarchie :
-    D1  -> tendance principale
-    H4  -> confirmation de la tendance
+Nouvelle architecture :
+    H4  -> tendance principale
+    H1  -> structure / validation
+    M15 -> contexte / validation
+    M5  -> confirmation secondaire
 
-Règle :
-    D1 + H4 doivent être alignés pour obtenir
-    une direction globale valide.
+D1 a été supprimé de l'architecture.
 
-La validation H1 + M15 est effectuée plus bas
-dans le pipeline d'analyse.
+La validation finale H4 + H1 + M15
+est effectuée dans le pipeline.
 """
 
 from __future__ import annotations
 
 from core.models import Direction, TrendContext
 
-
-# ============================================================
-# DIRECTION STRUCTURE
-# ============================================================
 
 def detect_direction_from_structure(
     higher_highs: int,
@@ -32,16 +28,7 @@ def detect_direction_from_structure(
     lower_lows: int,
 ) -> Direction:
     """
-    Détermine la direction à partir de la structure du marché.
-
-    Structure haussière :
-        Higher Highs + Higher Lows
-
-    Structure baissière :
-        Lower Highs + Lower Lows
-
-    En cas d'égalité :
-        NEUTRAL
+    Détermine une direction à partir de la structure du marché.
     """
 
     bullish_points = (
@@ -63,27 +50,16 @@ def detect_direction_from_structure(
     return Direction.NEUTRAL
 
 
-# ============================================================
-# TREND CONTEXT
-# ============================================================
-
 def build_trend_context(
-    d1: Direction,
     h4: Direction,
-    d1_strength: float = 0.0,
     h4_strength: float = 0.0,
 ) -> TrendContext:
     """
-    Construit le contexte global D1 + H4.
+    Construit le contexte de tendance principal.
 
-    Les forces sont automatiquement limitées
-    entre 0 et 100.
+    H4 est désormais le seul timeframe
+    représenté dans TrendContext.
     """
-
-    d1_strength = max(
-        0.0,
-        min(100.0, float(d1_strength)),
-    )
 
     h4_strength = max(
         0.0,
@@ -91,75 +67,48 @@ def build_trend_context(
     )
 
     return TrendContext(
-        d1=d1,
         h4=h4,
-        d1_strength=d1_strength,
         h4_strength=h4_strength,
     )
 
-
-# ============================================================
-# GLOBAL TREND
-# ============================================================
 
 def get_trend_direction(
     context: TrendContext,
 ) -> Direction:
     """
-    Retourne la direction globale.
-
-    BUY  -> D1 BUY + H4 BUY
-    SELL -> D1 SELL + H4 SELL
-    NEUTRAL -> désalignement ou absence de tendance.
+    Retourne la direction principale H4.
     """
 
-    if context.d1 == Direction.BUY and context.h4 == Direction.BUY:
+    if context.h4 == Direction.BUY:
         return Direction.BUY
 
-    if context.d1 == Direction.SELL and context.h4 == Direction.SELL:
+    if context.h4 == Direction.SELL:
         return Direction.SELL
 
     return Direction.NEUTRAL
 
 
-# ============================================================
-# ALIGNMENT CHECK
-# ============================================================
-
 def is_trend_aligned(
     context: TrendContext,
 ) -> bool:
     """
-    Vérifie explicitement l'alignement D1 + H4.
+    Vérifie que H4 fournit une direction exploitable.
     """
 
-    return (
-        context.d1 != Direction.NEUTRAL
-        and context.h4 != Direction.NEUTRAL
-        and context.d1 == context.h4
-    )
+    return context.h4 != Direction.NEUTRAL
 
-
-# ============================================================
-# STRENGTH
-# ============================================================
 
 def get_trend_strength(
     context: TrendContext,
 ) -> float:
     """
-    Calcule la force globale D1 + H4.
-
-    Les deux timeframes ont le même poids.
+    Retourne la force H4.
     """
 
     if not is_trend_aligned(context):
         return 0.0
 
     return round(
-        (
-            context.d1_strength
-            + context.h4_strength
-        ) / 2.0,
+        context.h4_strength,
         2,
     )
