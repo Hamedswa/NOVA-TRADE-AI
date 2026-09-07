@@ -31,7 +31,7 @@ logger = logging.getLogger("NOVA_TRADE_AI")
 
 TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
-    ""
+    "",
 ).strip()
 
 
@@ -40,6 +40,7 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 # ============================================================
 
 def main_menu():
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -71,6 +72,7 @@ def main_menu():
 # ============================================================
 
 def market_menu():
+
     keyboard = []
     row = []
 
@@ -84,6 +86,7 @@ def market_menu():
         )
 
         if len(row) == 2:
+
             keyboard.append(row)
             row = []
 
@@ -103,18 +106,16 @@ def market_menu():
 
 
 # ============================================================
-# FORMATAGE DES VALEURS
+# FORMATAGE DES PRIX
 # ============================================================
 
 def format_price(value):
-    """
-    Formate proprement les prix.
-    """
 
     if value is None:
         return "N/A"
 
     try:
+
         value = float(value)
 
         if value <= 0:
@@ -122,34 +123,63 @@ def format_price(value):
 
         return f"{value:.5f}"
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
+
         return str(value)
 
 
+# ============================================================
+# FORMATAGE RR
+# ============================================================
+
 def format_rr(value):
-    """
-    Formate le RR sans provoquer d'erreur
-    si la valeur est None ou invalide.
-    """
 
     if value is None:
         return "0.00"
 
     try:
+
         return f"{float(value):.2f}"
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
+
         return "0.00"
 
 
 # ============================================================
-# FORMATAGE DU SIGNAL
+# FORMATAGE SCORE
 # ============================================================
 
-def format_analysis(result: dict) -> str:
+def format_score(value):
+
+    try:
+
+        return f"{float(value):.2f}"
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return "0.00"
+
+
+# ============================================================
+# FORMATAGE ANALYSE
+# ============================================================
+
+def format_analysis(
+    result: dict,
+) -> str:
 
     # --------------------------------------------------------
-    # INFORMATIONS PRINCIPALES
+    # PRINCIPAL
     # --------------------------------------------------------
 
     symbol = result.get(
@@ -183,7 +213,7 @@ def format_analysis(result: dict) -> str:
     )
 
     # --------------------------------------------------------
-    # NOUVELLE STRUCTURE DU PIPELINE
+    # DONNÉES
     # --------------------------------------------------------
 
     trend = result.get(
@@ -206,33 +236,46 @@ def format_analysis(result: dict) -> str:
         {},
     ) or {}
 
+    market = result.get(
+        "market",
+        {},
+    ) or {}
+
     # --------------------------------------------------------
     # MULTI-TIMEFRAME
+    #
+    # NO D1
     # --------------------------------------------------------
-
-    d1 = trend.get(
-        "D1",
-        "N/A",
-    )
 
     h4 = trend.get(
         "H4",
         "N/A",
     )
 
-    h1 = zones.get(
+    h1 = trend.get(
         "H1",
-        "N/A",
+        zones.get(
+            "H1",
+            "N/A",
+        ),
     )
 
-    m15 = zones.get(
+    m15 = trend.get(
         "M15",
-        "N/A",
+        zones.get(
+            "M15",
+            "N/A",
+        ),
     )
 
     m5 = confirmation.get(
         "M5",
         "N/A",
+    )
+
+    aligned = trend.get(
+        "aligned",
+        False,
     )
 
     # --------------------------------------------------------
@@ -269,14 +312,79 @@ def format_analysis(result: dict) -> str:
     )
 
     # --------------------------------------------------------
+    # MARCHÉ
+    # --------------------------------------------------------
+
+    market_open = market.get(
+        "open",
+        None,
+    )
+
+    closing_soon = market.get(
+        "closing_soon",
+        False,
+    )
+
+    # --------------------------------------------------------
     # SCORE
     # --------------------------------------------------------
 
-    try:
-        score_display = f"{float(score):.2f}"
+    score_display = format_score(
+        score
+    )
 
-    except (TypeError, ValueError):
-        score_display = "0.00"
+    # --------------------------------------------------------
+    # ALIGNEMENT
+    # --------------------------------------------------------
+
+    alignment_display = (
+        "✅ CONFIRMÉ"
+        if aligned
+        else "❌ NON CONFIRMÉ"
+    )
+
+    # --------------------------------------------------------
+    # M5
+    # --------------------------------------------------------
+
+    if m5 == "CONFIRMED":
+
+        m5_display = (
+            "✅ CONFIRMÉ"
+        )
+
+    elif m5 == "NOT CONFIRMED":
+
+        m5_display = (
+            "🟡 NON CONFIRMÉ "
+            "(non bloquant)"
+        )
+
+    else:
+
+        m5_display = str(m5)
+
+    # --------------------------------------------------------
+    # MARCHÉ
+    # --------------------------------------------------------
+
+    if market_open is True:
+
+        market_display = "🟢 OUVERT"
+
+    elif market_open is False:
+
+        market_display = "🔴 FERMÉ"
+
+    else:
+
+        market_display = "N/A"
+
+    if closing_soon:
+
+        market_display += (
+            " ⚠️ FERMETURE PROCHE"
+        )
 
     # --------------------------------------------------------
     # TEXTE FINAL
@@ -289,15 +397,20 @@ def format_analysis(result: dict) -> str:
         f"🎯 Direction : {direction}\n"
         f"📈 Score : {score_display}/100\n"
         f"🏷 Qualité : {quality}\n"
+        f"📌 Statut : {status}\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "📊 MULTI-TIMEFRAME\n"
+        "📊 VALIDATION PRINCIPALE\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"D1  : {d1}\n"
         f"H4  : {h4}\n"
         f"H1  : {h1}\n"
         f"M15 : {m15}\n"
-        f"M5  : {m5}\n"
+        f"Alignement : {alignment_display}\n"
+        "\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎯 CONFIRMATION SECONDAIRE\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"M5 : {m5_display}\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "💰 SETUP\n"
@@ -307,14 +420,22 @@ def format_analysis(result: dict) -> str:
         f"TP     : {format_price(take_profit)}\n"
         f"RR     : {format_rr(rr)}\n"
         "\n"
-        f"📰 News : {news}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🌐 MARCHÉ\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"État : {market_display}\n"
         "\n"
-        f"📌 Statut : {status}\n"
+        f"📰 News : {news}\n"
     )
 
     if reason:
+
         text += (
-            f"\n💡 {reason}"
+            "\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "💡 DÉCISION\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"{reason}\n"
         )
 
     return text
@@ -332,8 +453,10 @@ async def start(
     await update.message.reply_text(
         "🤖 NOVA TRADE AI\n\n"
         "Bot connecté et opérationnel.\n\n"
-        "Utilise les boutons ci-dessous "
-        "pour contrôler le bot.",
+        "Architecture actuelle :\n"
+        "H4 + H1 + M15 → validation principale\n"
+        "M5 → confirmation secondaire non bloquante\n\n"
+        "Utilise les boutons ci-dessous.",
         reply_markup=main_menu(),
     )
 
@@ -350,11 +473,13 @@ async def help_command(
     await update.message.reply_text(
         "❓ NOVA TRADE AI — AIDE\n\n"
         "🔎 Analyse : choisir un marché "
-        "puis lancer l'analyse.\n"
-        "📊 Statut : voir l'état du moteur.\n"
+        "puis lancer l'analyse.\n\n"
+        "📊 Statut : voir l'état du moteur.\n\n"
         "ℹ️ À propos : voir l'architecture.\n\n"
-        "Aucune commande n'est nécessaire : "
-        "tout peut être fait avec les boutons.",
+        "Règle principale :\n"
+        "H4 + H1 + M15 doivent être alignés.\n\n"
+        "M5 est une confirmation secondaire "
+        "et ne bloque pas un setup validé.",
         reply_markup=main_menu(),
     )
 
@@ -370,13 +495,15 @@ async def about(
 
     await update.message.reply_text(
         "ℹ️ NOVA TRADE AI\n\n"
-        "Architecture :\n"
-        "D1 + H4 → tendance\n"
-        "H1 + M15 → zones\n"
-        "M5 → confirmation\n"
-        "Score → validation\n"
+        "Architecture actuelle :\n\n"
+        "H4 → tendance globale\n"
+        "H1 → structure\n"
+        "M15 → contexte / zones\n"
+        "H4 + H1 + M15 → validation obligatoire\n"
+        "M5 → confirmation secondaire\n"
+        "Score → validation finale\n"
         "RR minimum → 2.0\n"
-        "Calendrier économique → filtre\n\n"
+        "News → non intégrées actuellement\n\n"
         f"Seuil signal : "
         f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
         f"Risque/trade : "
@@ -401,10 +528,13 @@ async def status(
         "🟢 Telegram : CONNECTÉ\n"
         "🟢 Moteur : ACTIF\n"
         "🟢 Données marché : DISPONIBLES\n"
-        "🟢 Analyse multi-timeframe : ACTIVE\n"
+        "🟢 H4 : ACTIF\n"
+        "🟢 H1 : ACTIF\n"
+        "🟢 M15 : ACTIF\n"
+        "🟡 M5 : CONFIRMATION NON BLOQUANTE\n"
         "🟢 Score : ACTIF\n"
         "🟢 RR : ACTIF\n"
-        "🟢 Filtre économique : ACTIF\n"
+        "🟡 News : NON INTÉGRÉES\n"
         "\n"
         f"Seuil : "
         f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
@@ -466,7 +596,11 @@ async def run_analysis_message(
 
     message = update.message
 
-    if message is None and update.callback_query:
+    if (
+        message is None
+        and update.callback_query
+    ):
+
         message = update.callback_query.message
 
     if message is None:
@@ -474,7 +608,7 @@ async def run_analysis_message(
 
     await message.reply_text(
         f"🔎 Analyse de {symbol}...\n\n"
-        "D1 → H4 → H1 → M15 → M5\n"
+        "H4 → H1 → M15 → M5\n"
         "⏳ Calcul des confluences..."
     )
 
@@ -529,7 +663,7 @@ async def run_analysis_message(
 
 
 # ============================================================
-# CALLBACKS DES BOUTONS
+# CALLBACKS
 # ============================================================
 
 async def button_handler(
@@ -583,10 +717,13 @@ async def button_handler(
             "🟢 Telegram : CONNECTÉ\n"
             "🟢 Moteur : ACTIF\n"
             "🟢 Données marché : OK\n"
-            "🟢 Multi-timeframe : ACTIF\n"
+            "🟢 H4 : ACTIF\n"
+            "🟢 H1 : ACTIF\n"
+            "🟢 M15 : ACTIF\n"
+            "🟡 M5 : NON BLOQUANT\n"
             "🟢 Score : ACTIF\n"
             "🟢 RR : ACTIF\n"
-            "🟢 Filtre news : ACTIF\n\n"
+            "🟡 News : NON INTÉGRÉES\n\n"
             f"Seuil : "
             f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
             f"RR minimum : "
@@ -608,12 +745,16 @@ async def button_handler(
 
         await query.edit_message_text(
             "ℹ️ NOVA TRADE AI\n\n"
-            "D1 + H4 → Tendance\n"
-            "H1 + M15 → Zones\n"
-            "M5 → Confirmation\n"
+            "H4 → Tendance globale\n"
+            "H1 → Structure\n"
+            "M15 → Contexte / zones\n"
+            "H4 + H1 + M15 → Validation\n"
+            "M5 → Confirmation secondaire\n"
             "Score → Validation\n"
             "RR → Validation\n"
-            "News → Filtre\n\n"
+            "News → Non intégrées\n\n"
+            "M5 ne peut pas bloquer un setup "
+            "H4/H1/M15 validé.\n\n"
             "Le bot analyse le marché mais "
             "n'exécute actuellement aucun ordre réel.",
             reply_markup=main_menu(),
@@ -631,19 +772,20 @@ async def button_handler(
             "❓ AIDE\n\n"
             "1️⃣ Appuie sur ANALYSER\n"
             "2️⃣ Choisis un marché\n"
-            "3️⃣ NOVA récupère les données\n"
-            "4️⃣ Le moteur analyse les timeframes\n"
+            "3️⃣ NOVA récupère H4/H1/M15/M5\n"
+            "4️⃣ H4/H1/M15 sont vérifiés\n"
             "5️⃣ Le score est calculé\n"
-            "6️⃣ Le RR et les news sont vérifiés\n"
-            "7️⃣ Le résultat est affiché\n\n"
-            "Aucune saisie manuelle n'est nécessaire.",
+            "6️⃣ Le RR est vérifié\n"
+            "7️⃣ M5 apporte une confirmation secondaire\n"
+            "8️⃣ Le résultat est affiché\n\n"
+            "M5 non confirmé ≠ rejet automatique.",
             reply_markup=main_menu(),
         )
 
         return
 
     # ========================================================
-    # ANALYSE D'UN MARCHÉ
+    # ANALYSE MARCHÉ
     # ========================================================
 
     if data.startswith("analyse:"):
@@ -664,7 +806,7 @@ async def button_handler(
 
         await query.edit_message_text(
             f"🔎 Analyse de {symbol}...\n\n"
-            "Récupération D1 / H4 / H1 / M15 / M5...\n"
+            "Récupération H4 / H1 / M15 / M5...\n"
             "⏳ Patiente quelques secondes."
         )
 
