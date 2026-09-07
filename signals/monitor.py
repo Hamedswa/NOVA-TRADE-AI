@@ -4,29 +4,23 @@ signals/monitor.py
 
 Surveillance automatique des signaux actifs.
 
-Flux :
-
-SignalTracker
-    ↓
-market_data.get_latest_price()
-    ↓
-tracker.update()
-    ↓
-TP / SL / BE / progression
-    ↓
-notification_callback
+Aucune exécution réelle d'ordre.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from typing import Callable
+from typing import Callable, Optional
 
-from config import CONFIG
 from core.models import SignalStatus
+
 from market_data import get_latest_price
+
 from signals.tracker import SignalTracker
+
+
+NotificationCallback = Callable[[str], None]
 
 
 class SignalMonitor:
@@ -34,381 +28,413 @@ class SignalMonitor:
     def __init__(
         self,
         tracker: SignalTracker,
-        notification_callback: Callable[[str], None] | None = None,
+        notification_callback: Optional[
+            NotificationCallback
+        ] = None,
         interval_seconds: int = 30,
     ):
+
         self.tracker = tracker
+
         self.notification_callback = (
             notification_callback
         )
 
         self.interval_seconds = max(
             10,
-            int(interval_seconds),
+            interval_seconds,
         )
 
         self._running = False
+
         self._thread: threading.Thread | None = None
 
-        self._last_notified_status: dict[
+        self._last_status: dict[
             str,
             SignalStatus,
         ] = {}
 
-        self._last_notified_r: dict[
+        self._last_milestone: dict[
             str,
             int,
         ] = {}
 
-    # ==========================================================
+        self._lock = threading.Lock()
+
+    # ========================================================
+    # CALLBACK
+    # ========================================================
+
+    def set_notification_callback(
+        self,
+        callback: NotificationCallback | None,
+    ) -> None:
+
+        self.notification_callback = callback
+
+    # ========================================================
+    # NOTIFY
+    # ========================================================
+
+    def _notify(
+        self,
+        message: str,
+    ) -> None:
+
+        callback = (
+            self.notification_callback
+        )
+
+        if callback is None:
+            return
+
+        try:
+            callback(message)
+
+        except Exception as exc:
+
+            print(
+                f"[MONITOR] "
+                f"Erreur notification : {exc}"
+            )
+
+    # ========================================================
     # START
-    # ==========================================================
+    # ========================================================
 
     def start(self) -> None:
 
-        if self._running:
-            return
+        with self._lock:
 
-        self._running = True
+            if self._running:
+                return
 
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="nova-signal-monitor",
-            daemon=True,
-        )
+            self._running = True
 
-        self._thread.start()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="nova-signal-monitor",
+                daemon=True,
+            )
+
+            self._thread.start()
 
         print(
-            "👁️ NOVA TRADE AI — "
-            f"surveillance active "
-            f"({self.interval_seconds}s)"
+            "[MONITOR] Surveillance "
+            "automatique démarrée."
         )
 
-    # ==========================================================
+    # ========================================================
     # STOP
-    # ==========================================================
+    # ========================================================
 
     def stop(self) -> None:
 
-        self._running = False
+        with self._lock:
+            self._running = False
 
         print(
-            "🛑 NOVA TRADE AI — "
-            "surveillance arrêtée"
+            "[MONITOR] Surveillance "
+            "automatique arrêtée."
         )
 
-    # ==========================================================
-    # BOUCLE
-    # ==========================================================
+    # ========================================================
+    # LOOP
+    # ========================================================
 
-    def _run_loop(self) -> None:
+    def _run(self) -> None:
 
         while self._running:
 
             try:
 
-                self.check_all_signals()
+                self.check_all()
 
             except Exception as exc:
 
                 print(
-                    "⚠️ Erreur globale surveillance : "
-                    f"{exc}"
+                    f"[MONITOR] "
+                    f"Erreur générale : {exc}"
                 )
 
             time.sleep(
                 self.interval_seconds
             )
 
-    # ==========================================================
-    # TOUS LES SIGNAUX
-    # ==========================================================
+    # ========================================================
+    # CHECK ALL
+    # ========================================================
 
-    def check_all_signals(self) -> None:
+    def check_all(self) -> None:
 
-        active_signals = (
+        active_states = (
             self.tracker.active_signals()
         )
 
-        if not active_signals:
+        if not active_states:
             return
 
-        # ------------------------------------------------------
-        # Un seul prix par symbole
-        # ------------------------------------------------------
+        # ----------------------------------------------------
+        # Un seul appel prix par symbole
+        # ----------------------------------------------------
 
         prices: dict[str, float] = {}
 
-        for state in active_signals:
+        symbols = {
+            state.signal.symbol
+            for state in active_states
+        }
 
-            symbol = state.signal.symbol
-
-            if symbol in prices:
-                continue
+        for symbol in symbols:
 
             try:
 
-                prices[symbol] = float(
-                    get_latest_price(symbol)
+                price = get_latest_price(
+                    symbol
                 )
+
+                if price > 0:
+                    prices[symbol] = price
 
             except Exception as exc:
 
                 print(
-                    f"⚠️ Prix indisponible "
-                    f"{symbol}: {exc}"
+                    f"[MONITOR] "
+                    f"{symbol} : prix indisponible "
+                    f"({exc})"
                 )
 
-        # ------------------------------------------------------
-        # Mise à jour des signaux
-        # ------------------------------------------------------
+        # ----------------------------------------------------
+        # UPDATE SIGNALS
+        # ----------------------------------------------------
 
-        for state in active_signals:
+        for state in active_states:
 
-            symbol = state.signal.symbol
+            signal = state.signal
+
+            symbol = signal.symbol
 
             if symbol not in prices:
                 continue
 
+            price = prices[symbol]
+
+            old_status = state.status
+
             try:
 
-                self.check_signal(
-                    state.signal.signal_id,
-                    prices[symbol],
+                updated = self.tracker.update(
+                    signal.signal_id,
+                    price,
                 )
 
             except Exception as exc:
 
                 print(
-                    "⚠️ Erreur signal "
-                    f"{state.signal.signal_id}: "
-                    f"{exc}"
+                    f"[MONITOR] "
+                    f"Update impossible "
+                    f"{signal.signal_id}: {exc}"
                 )
 
-    # ==========================================================
-    # SIGNAL INDIVIDUEL
-    # ==========================================================
+                continue
 
-    def check_signal(
-        self,
-        signal_id: str,
-        current_price: float,
-    ) -> None:
+            new_status = updated.status
 
-        state = self.tracker.get(
-            signal_id
-        )
+            # ------------------------------------------------
+            # STATUS CHANGE
+            # ------------------------------------------------
 
-        if state is None:
-            return
+            if (
+                old_status
+                != new_status
+            ):
 
-        old_status = state.status
+                self._last_status[
+                    signal.signal_id
+                ] = new_status
 
-        updated_state = (
-            self.tracker.update(
-                signal_id,
-                current_price,
+                self._handle_status_change(
+                    updated
+                )
+
+            # ------------------------------------------------
+            # R MILESTONES
+            # ------------------------------------------------
+
+            self._handle_r_milestone(
+                updated
             )
-        )
 
-        self._handle_update(
-            old_status,
-            updated_state,
-        )
+    # ========================================================
+    # STATUS CHANGE
+    # ========================================================
 
-    # ==========================================================
-    # TRAITEMENT
-    # ==========================================================
-
-    def _handle_update(
+    def _handle_status_change(
         self,
-        old_status: SignalStatus,
         state,
     ) -> None:
 
         signal = state.signal
-        status = state.status
-
-        # ------------------------------------------------------
-        # Changement de statut
-        # ------------------------------------------------------
-
-        last_status = (
-            self._last_notified_status.get(
-                signal.signal_id
-            )
-        )
 
         if (
-            status != old_status
-            and status != last_status
+            state.status
+            == SignalStatus.BE_RECOMMENDED
         ):
 
             self._notify(
-                self._build_status_message(
+                self._format_be_recommended(
                     state
                 )
             )
 
-            self._last_notified_status[
-                signal.signal_id
-            ] = status
+        elif (
+            state.status
+            == SignalStatus.TP_HIT
+        ):
 
-        # ------------------------------------------------------
-        # Paliers de R
-        # ------------------------------------------------------
-
-        self._check_r_milestone(
-            state
-        )
-
-        # ------------------------------------------------------
-        # Signal terminé
-        # ------------------------------------------------------
-
-        if status in {
-            SignalStatus.TP_HIT,
-            SignalStatus.SL_HIT,
-            SignalStatus.INVALIDATED,
-            SignalStatus.CLOSED,
-        }:
-
-            self._cleanup(
-                signal.signal_id
+            self._notify(
+                self._format_tp_hit(
+                    state
+                )
             )
 
-    # ==========================================================
-    # PALIERS R
-    # ==========================================================
+        elif (
+            state.status
+            == SignalStatus.SL_HIT
+        ):
 
-    def _check_r_milestone(
+            self._notify(
+                self._format_sl_hit(
+                    state
+                )
+            )
+
+    # ========================================================
+    # R MILESTONES
+    # ========================================================
+
+    def _handle_r_milestone(
         self,
         state,
     ) -> None:
 
-        signal_id = state.signal.signal_id
+        signal_id = (
+            state.signal.signal_id
+        )
 
         current_r = state.current_r
 
-        milestone = int(
-            current_r
+        milestones = (
+            1,
+            2,
+            3,
         )
 
-        if milestone <= 0:
+        reached = 0
+
+        for milestone in milestones:
+
+            if current_r >= milestone:
+                reached = milestone
+
+        if reached <= 0:
             return
 
-        previous = (
-            self._last_notified_r.get(
-                signal_id,
-                0,
-            )
+        previous = self._last_milestone.get(
+            signal_id,
+            0,
         )
 
-        if milestone <= previous:
+        if reached <= previous:
             return
 
-        self._last_notified_r[
+        self._last_milestone[
             signal_id
-        ] = milestone
+        ] = reached
 
         self._notify(
-            self._build_r_message(
+            self._format_r_milestone(
                 state,
-                milestone,
+                reached,
             )
         )
 
-    # ==========================================================
-    # MESSAGE STATUT
-    # ==========================================================
+    # ========================================================
+    # FORMAT BE
+    # ========================================================
 
     @staticmethod
-    def _build_status_message(
+    def _format_be_recommended(
         state,
     ) -> str:
 
         signal = state.signal
 
-        symbol = signal.symbol
-        direction = signal.direction.value
-        price = state.current_price
-        current_r = state.current_r
-
-        if state.status == SignalStatus.BE_RECOMMENDED:
-
-            return (
-                "🛡️ NOVA TRADE AI\n\n"
-                "BREAK-EVEN RECOMMANDÉ\n\n"
-                f"📌 Marché : {symbol}\n"
-                f"🎯 Direction : {direction}\n"
-                f"💰 Prix : {price}\n"
-                f"📈 R actuel : +{current_r:.2f}R\n\n"
-                "⚠️ Le niveau de protection "
-                "peut être déplacé au BE."
-            )
-
-        if state.status == SignalStatus.TP_HIT:
-
-            return (
-                "🎯 NOVA TRADE AI\n\n"
-                "TAKE PROFIT ATTEINT ✅\n\n"
-                f"📌 Marché : {symbol}\n"
-                f"🎯 Direction : {direction}\n"
-                f"💰 Prix : {price}\n"
-                f"📈 Résultat : +{current_r:.2f}R\n\n"
-                "🏁 Signal terminé."
-            )
-
-        if state.status == SignalStatus.SL_HIT:
-
-            return (
-                "🔴 NOVA TRADE AI\n\n"
-                "STOP LOSS ATTEINT\n\n"
-                f"📌 Marché : {symbol}\n"
-                f"🎯 Direction : {direction}\n"
-                f"💰 Prix : {price}\n"
-                f"📉 Résultat : {current_r:.2f}R\n\n"
-                "🏁 Signal terminé."
-            )
-
-        if state.status == SignalStatus.INVALIDATED:
-
-            return (
-                "⚠️ NOVA TRADE AI\n\n"
-                "SIGNAL INVALIDÉ\n\n"
-                f"📌 Marché : {symbol}\n"
-                f"🎯 Direction : {direction}\n"
-                f"💰 Prix : {price}\n\n"
-                "Le setup n'est plus valide."
-            )
-
-        if state.status == SignalStatus.CLOSED:
-
-            return (
-                "🏁 NOVA TRADE AI\n\n"
-                "SIGNAL CLÔTURÉ\n\n"
-                f"📌 Marché : {symbol}\n"
-                f"🎯 Direction : {direction}\n"
-                f"💰 Prix : {price}\n"
-                f"📊 R final : {current_r:.2f}R"
-            )
-
         return (
-            "📊 NOVA TRADE AI\n\n"
-            "MISE À JOUR DU SIGNAL\n\n"
-            f"📌 Marché : {symbol}\n"
-            f"🎯 Direction : {direction}\n"
-            f"💰 Prix : {price}\n"
-            f"📈 R : {current_r:.2f}R"
+            "🟡 NOVA TRADE AI — BREAK EVEN\n\n"
+            f"📌 {signal.symbol}\n"
+            f"🎯 {signal.direction.value}\n"
+            f"📈 Score : {signal.score:.2f}/100\n\n"
+            f"💰 Prix actuel : "
+            f"{state.current_price:.6f}\n"
+            f"📊 R : {state.current_r:.2f}R\n"
+            f"📈 Progression TP : "
+            f"{state.progress_to_tp_percent:.1f}%\n\n"
+            "⚠️ Break Even recommandé."
         )
 
-    # ==========================================================
-    # MESSAGE PROGRESSION
-    # ==========================================================
+    # ========================================================
+    # FORMAT TP
+    # ========================================================
 
     @staticmethod
-    def _build_r_message(
+    def _format_tp_hit(
+        state,
+    ) -> str:
+
+        signal = state.signal
+
+        return (
+            "🟢 NOVA TRADE AI — TP ATTEINT\n\n"
+            f"📌 {signal.symbol}\n"
+            f"🎯 {signal.direction.value}\n\n"
+            f"💰 Prix : "
+            f"{state.current_price:.6f}\n"
+            f"📊 R final : "
+            f"{state.current_r:.2f}R\n"
+            f"🏆 Meilleur R : "
+            f"{state.best_r:.2f}R\n\n"
+            "✅ Take Profit atteint."
+        )
+
+    # ========================================================
+    # FORMAT SL
+    # ========================================================
+
+    @staticmethod
+    def _format_sl_hit(
+        state,
+    ) -> str:
+
+        signal = state.signal
+
+        return (
+            "🔴 NOVA TRADE AI — STOP LOSS\n\n"
+            f"📌 {signal.symbol}\n"
+            f"🎯 {signal.direction.value}\n\n"
+            f"💰 Prix : "
+            f"{state.current_price:.6f}\n"
+            f"📊 R final : "
+            f"{state.current_r:.2f}R\n\n"
+            "❌ Stop Loss atteint."
+        )
+
+    # ========================================================
+    # FORMAT R
+    # ========================================================
+
+    @staticmethod
+    def _format_r_milestone(
         state,
         milestone: int,
     ) -> str:
@@ -416,62 +442,16 @@ class SignalMonitor:
         signal = state.signal
 
         return (
-            "📈 NOVA TRADE AI\n\n"
-            "PROGRESSION DU SIGNAL\n\n"
-            f"📌 Marché : {signal.symbol}\n"
-            f"🎯 Direction : "
-            f"{signal.direction.value}\n"
-            f"💰 Prix : {state.current_price}\n\n"
-            f"🚀 Progression : +{milestone}R\n"
-            f"📊 TP atteint : "
-            f"{state.progress_to_tp_percent:.2f}%"
-        )
-
-    # ==========================================================
-    # NOTIFICATION
-    # ==========================================================
-
-    def _notify(
-        self,
-        message: str,
-    ) -> None:
-
-        if self.notification_callback is None:
-
-            print()
-            print(message)
-            print()
-
-            return
-
-        try:
-
-            self.notification_callback(
-                message
-            )
-
-        except Exception as exc:
-
-            print(
-                "⚠️ Erreur notification Telegram : "
-                f"{exc}"
-            )
-
-    # ==========================================================
-    # NETTOYAGE
-    # ==========================================================
-
-    def _cleanup(
-        self,
-        signal_id: str,
-    ) -> None:
-
-        self._last_notified_status.pop(
-            signal_id,
-            None,
-        )
-
-        self._last_notified_r.pop(
-            signal_id,
-            None,
+            "📊 NOVA TRADE AI — PROGRESSION\n\n"
+            f"📌 {signal.symbol}\n"
+            f"🎯 {signal.direction.value}\n\n"
+            f"💰 Prix : "
+            f"{state.current_price:.6f}\n"
+            f"📈 R actuel : "
+            f"{state.current_r:.2f}R\n"
+            f"🏆 Meilleur R : "
+            f"{state.best_r:.2f}R\n"
+            f"🎯 TP : "
+            f"{state.progress_to_tp_percent:.1f}%\n\n"
+            f"✅ Niveau +{milestone}R atteint."
         )
