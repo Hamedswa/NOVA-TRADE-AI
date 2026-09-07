@@ -4,7 +4,7 @@ analysis/pipeline.py
 
 PIPELINE MULTI-TIMEFRAME
 
-D1 + H4
+H4
     ↓
 TENDANCE GLOBALE
 
@@ -12,7 +12,7 @@ H1 + M15
     ↓
 VALIDATION STRUCTURE / SETUP
 
-D1 + H4 + H1 + M15
+H4 + H1 + M15
     ↓
 ALIGNEMENT PRINCIPAL OBLIGATOIRE
 
@@ -38,7 +38,7 @@ Aucune exécution réelle d'ordre.
 
 IMPORTANT :
 M5 ne bloque jamais un setup lorsque
-D1/H4/H1/M15 sont parfaitement alignés.
+H4/H1/M15 sont parfaitement alignés.
 
 News économiques non intégrées pour le moment.
 """
@@ -147,19 +147,6 @@ def _lows(
         _candle_value(
             candle,
             "low",
-        )
-        for candle in candles
-    ]
-
-
-def _closes(
-    candles: List[Any],
-) -> List[float]:
-
-    return [
-        _candle_value(
-            candle,
-            "close",
         )
         for candle in candles
     ]
@@ -372,14 +359,20 @@ def calculate_structure_strength(
 # ============================================================
 
 def is_primary_alignment_valid(
-    d1: Direction,
     h4: Direction,
     h1: Direction,
     m15: Direction,
 ) -> bool:
+    """
+    Validation principale NOVA TRADE AI.
+
+    H4 + H1 + M15 doivent être
+    parfaitement alignés.
+
+    D1 n'est plus utilisé.
+    """
 
     directions = (
-        d1,
         h4,
         h1,
         m15,
@@ -392,28 +385,29 @@ def is_primary_alignment_valid(
         return False
 
     return (
-        d1 == h4
-        and h4 == h1
+        h4 == h1
         and h1 == m15
     )
 
 
 def determine_primary_direction(
-    d1: Direction,
     h4: Direction,
     h1: Direction,
     m15: Direction,
 ) -> Direction:
+    """
+    Retourne la direction principale
+    uniquement si H4/H1/M15 sont alignés.
+    """
 
     if not is_primary_alignment_valid(
-        d1,
-        h4,
-        h1,
-        m15,
+        h4=h4,
+        h1=h1,
+        m15=m15,
     ):
         return Direction.NEUTRAL
 
-    return d1
+    return h4
 
 
 # ============================================================
@@ -421,23 +415,17 @@ def determine_primary_direction(
 # ============================================================
 
 def build_multitimeframe_context(
-    d1_direction: Direction,
     h4_direction: Direction,
     h1_direction: Direction,
     m15_direction: Direction,
-    d1_strength: float,
     h4_strength: float,
     h1_strength: float,
     m15_strength: float,
 ) -> TrendContext:
     """
-    TrendContext reste volontairement limité à D1/H4.
+    TrendContext représente maintenant H4 uniquement.
 
-    H1/M15 sont conservés séparément dans le pipeline
-    car le modèle TrendContext actuel représente la tendance
-    globale D1 + H4.
-
-    L'alignement D1/H4/H1/M15 est validé séparément.
+    H1 et M15 sont validés séparément dans le pipeline.
     """
 
     _ = (
@@ -448,15 +436,7 @@ def build_multitimeframe_context(
     )
 
     return TrendContext(
-        d1=d1_direction,
         h4=h4_direction,
-        d1_strength=max(
-            0.0,
-            min(
-                100.0,
-                float(d1_strength),
-            ),
-        ),
         h4_strength=max(
             0.0,
             min(
@@ -612,9 +592,7 @@ def build_zone(
         high=zone_high,
         h1_strength=h1_strength,
         m15_strength=m15_strength,
-        structure_confirmed=(
-            structure_confirmed
-        ),
+        structure_confirmed=structure_confirmed,
         liquidity_nearby=True,
         order_block=False,
         fvg=False,
@@ -1250,7 +1228,7 @@ def determine_status(
         return (
             "REJECT",
             (
-                "D1/H4/H1/M15 ne sont pas "
+                "H4/H1/M15 ne sont pas "
                 "parfaitement alignés."
             ),
         )
@@ -1303,7 +1281,7 @@ def determine_status(
         return (
             "ACTIVE",
             (
-                "Setup D1/H4/H1/M15 validé "
+                "Setup H4/H1/M15 validé "
                 "avec confirmation M5."
             ),
         )
@@ -1311,7 +1289,7 @@ def determine_status(
     return (
         "ACTIVE",
         (
-            "Setup D1/H4/H1/M15 validé. "
+            "Setup H4/H1/M15 validé. "
             "M5 non confirmé mais non bloquant."
         ),
     )
@@ -1328,11 +1306,6 @@ def analyze_market(
     # ========================================================
     # 1. DONNÉES MULTI-TIMEFRAME
     # ========================================================
-
-    d1 = get_candles(
-        symbol,
-        "D1",
-    )
 
     h4 = get_candles(
         symbol,
@@ -1353,11 +1326,6 @@ def analyze_market(
         symbol,
         "M5",
     )
-
-    if not d1:
-        raise RuntimeError(
-            f"Aucune donnée D1 pour {symbol}."
-        )
 
     if not h4:
         raise RuntimeError(
@@ -1380,82 +1348,78 @@ def analyze_market(
         )
 
     # ========================================================
-    # 2. D1
+    # 2. H4
     # ========================================================
 
-    d1_direction = determine_direction_from_candles(d1)
+    h4_direction = determine_direction_from_candles(
+        h4
+    )
 
-    d1_strength = calculate_structure_strength(d1)
-
-    # ========================================================
-    # 3. H4
-    # ========================================================
-
-    h4_direction = determine_direction_from_candles(h4)
-
-    h4_strength = calculate_structure_strength(h4)
+    h4_strength = calculate_structure_strength(
+        h4
+    )
 
     # ========================================================
-    # 4. H1
+    # 3. H1
     # ========================================================
 
-    h1_direction = determine_direction_from_candles(h1)
+    h1_direction = determine_direction_from_candles(
+        h1
+    )
 
-    h1_strength = calculate_structure_strength(h1)
-
-    # ========================================================
-    # 5. M15
-    # ========================================================
-
-    m15_direction = determine_direction_from_candles(m15)
-
-    m15_strength = calculate_structure_strength(m15)
+    h1_strength = calculate_structure_strength(
+        h1
+    )
 
     # ========================================================
-    # 6. CONTEXTE GLOBAL
-    #
-    # TrendContext = D1 + H4
-    #
-    # H1/M15 restent disponibles séparément.
+    # 4. M15
+    # ========================================================
+
+    m15_direction = determine_direction_from_candles(
+        m15
+    )
+
+    m15_strength = calculate_structure_strength(
+        m15
+    )
+
+    # ========================================================
+    # 5. CONTEXTE GLOBAL
     # ========================================================
 
     trend = build_multitimeframe_context(
-        d1_direction=d1_direction,
         h4_direction=h4_direction,
         h1_direction=h1_direction,
         m15_direction=m15_direction,
-        d1_strength=d1_strength,
         h4_strength=h4_strength,
         h1_strength=h1_strength,
         m15_strength=m15_strength,
     )
 
     # ========================================================
-    # 7. ALIGNEMENT PRINCIPAL
+    # 6. ALIGNEMENT PRINCIPAL
     #
-    # D1 = H4 = H1 = M15
+    # H4 = H1 = M15
     # ========================================================
 
     setup_aligned = is_primary_alignment_valid(
-        d1=d1_direction,
         h4=h4_direction,
         h1=h1_direction,
         m15=m15_direction,
     )
 
     # ========================================================
-    # 8. DIRECTION PRINCIPALE
+    # 7. DIRECTION PRINCIPALE
     # ========================================================
 
     direction = determine_primary_direction(
-        d1=d1_direction,
         h4=h4_direction,
         h1=h1_direction,
         m15=m15_direction,
     )
 
     # ========================================================
-    # 9. ZONE H1/M15
+    # 8. ZONE H1/M15
     # ========================================================
 
     zone = build_zone(
@@ -1466,7 +1430,7 @@ def analyze_market(
     )
 
     # ========================================================
-    # 10. M5
+    # 9. M5
     #
     # Confirmation secondaire uniquement.
     # ========================================================
@@ -1481,7 +1445,7 @@ def analyze_market(
     )
 
     # ========================================================
-    # 11. SL / TP / RR
+    # 10. SL / TP / RR
     # ========================================================
 
     (
@@ -1495,7 +1459,7 @@ def analyze_market(
     )
 
     # ========================================================
-    # 12. SCORE
+    # 11. SCORE
     # ========================================================
 
     if direction == Direction.NEUTRAL:
@@ -1518,10 +1482,12 @@ def analyze_market(
         2,
     )
 
-    quality = score_label(score)
+    quality = score_label(
+        score
+    )
 
     # ========================================================
-    # 13. HORAIRES
+    # 12. HORAIRES
     # ========================================================
 
     market_open = is_market_open(
@@ -1535,7 +1501,7 @@ def analyze_market(
     )
 
     # ========================================================
-    # 14. STATUS
+    # 13. STATUS
     # ========================================================
 
     status, reason = determine_status(
@@ -1549,12 +1515,9 @@ def analyze_market(
     )
 
     # ========================================================
-    # 15. CRÉATION DU SIGNAL
+    # 14. CRÉATION DU SIGNAL
     #
-    # IMPORTANT :
-    #
-    # On transmet explicitement D1/H4/H1/M15
-    # au signal_engine.
+    # H4/H1/M15 sont transmis explicitement.
     #
     # M5 reste NON BLOQUANT.
     # ========================================================
@@ -1579,8 +1542,6 @@ def analyze_market(
             spread_ok=True,
             session_ok=True,
 
-            # SOURCE DE VÉRITÉ
-            d1_direction=d1_direction,
             h4_direction=h4_direction,
             h1_direction=h1_direction,
             m15_direction=m15_direction,
@@ -1596,7 +1557,7 @@ def analyze_market(
             )
 
     # ========================================================
-    # 16. RESULTAT
+    # 15. RESULTAT
     # ========================================================
 
     return {
@@ -1628,9 +1589,6 @@ def analyze_market(
 
         "trend": {
 
-            "D1":
-                d1_direction.value,
-
             "H4":
                 h4_direction.value,
 
@@ -1639,9 +1597,6 @@ def analyze_market(
 
             "M15":
                 m15_direction.value,
-
-            "D1_strength":
-                d1_strength,
 
             "H4_strength":
                 h4_strength,
