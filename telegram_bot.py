@@ -228,6 +228,129 @@ def format_score(value):
 
 
 # ============================================================
+# FORMATAGE NEWS ÉCONOMIQUES
+# ============================================================
+
+def format_news(news) -> str:
+    """
+    Normalise tous les formats possibles du filtre économique.
+
+    Formats acceptés :
+
+    {
+        "blocked": False,
+        "status": "CLEAR",
+        "checked": True
+    }
+
+    ou ancien format texte :
+
+    "NOT CHECKED"
+    """
+
+    # --------------------------------------------------------
+    # Nouveau format dictionnaire
+    # --------------------------------------------------------
+
+    if isinstance(news, dict):
+
+        blocked = bool(
+            news.get(
+                "blocked",
+                False,
+            )
+        )
+
+        status = str(
+            news.get(
+                "status",
+                "",
+            )
+        ).strip().upper()
+
+        checked = news.get(
+            "checked",
+            False,
+        )
+
+        # News HIGH IMPACT détectée
+        if blocked:
+
+            return (
+                "🔴 BLOQUÉE\n"
+                "⚠️ NEWS HIGH IMPACT À PROXIMITÉ"
+            )
+
+        # Aucune news dangereuse
+        if status == "CLEAR":
+
+            return (
+                "🟢 AUCUNE NEWS HIGH IMPACT"
+            )
+
+        # Filtre désactivé
+        if status == "DISABLED":
+
+            return (
+                "⚪ FILTRE NEWS DÉSACTIVÉ"
+            )
+
+        # Données vérifiées mais statut différent
+        if checked:
+
+            if status:
+                return f"🟡 {status}"
+
+            return "🟡 VÉRIFICATION EFFECTUÉE"
+
+        return "🟡 NON VÉRIFIÉE"
+
+    # --------------------------------------------------------
+    # Ancien format texte
+    # --------------------------------------------------------
+
+    if isinstance(news, str):
+
+        normalized = news.strip().upper()
+
+        if normalized in {
+            "",
+            "NOT CHECKED",
+            "NOT_CHECKED",
+        }:
+
+            return "🟡 NON VÉRIFIÉE"
+
+        if normalized in {
+            "CLEAR",
+            "NO NEWS",
+            "NO HIGH IMPACT NEWS",
+        }:
+
+            return (
+                "🟢 AUCUNE NEWS HIGH IMPACT"
+            )
+
+        if normalized in {
+            "BLOCKED",
+            "HIGH IMPACT",
+        }:
+
+            return (
+                "🔴 BLOQUÉE\n"
+                "⚠️ NEWS HIGH IMPACT À PROXIMITÉ"
+            )
+
+        return str(news)
+
+    # --------------------------------------------------------
+    # Valeur inconnue
+    # --------------------------------------------------------
+
+    return "🟡 STATUT NEWS INCONNU"
+
+
+# ============================================================
 # FORMATAGE ANALYSE
 # ============================================================
 
@@ -341,10 +464,22 @@ def format_analysis(
         0.0,
     )
 
+    # ========================================================
+    # NEWS
+    # ========================================================
+
     news = result.get(
         "news",
-        "NOT CHECKED",
+        None,
     )
+
+    news_display = format_news(
+        news
+    )
+
+    # ========================================================
+    # MARCHÉ
+    # ========================================================
 
     market_open = market.get(
         "open",
@@ -366,6 +501,10 @@ def format_analysis(
         else "❌ NON CONFIRMÉ"
     )
 
+    # ========================================================
+    # M5
+    # ========================================================
+
     if m5 == "CONFIRMED":
 
         m5_display = "✅ CONFIRMÉ"
@@ -380,6 +519,10 @@ def format_analysis(
     else:
 
         m5_display = str(m5)
+
+    # ========================================================
+    # MARCHÉ
+    # ========================================================
 
     if market_open is True:
 
@@ -398,6 +541,10 @@ def format_analysis(
         market_display += (
             " ⚠️ FERMETURE PROCHE"
         )
+
+    # ========================================================
+    # MESSAGE
+    # ========================================================
 
     text = (
         "🤖 NOVA TRADE AI\n"
@@ -434,8 +581,15 @@ def format_analysis(
         "━━━━━━━━━━━━━━━━━━\n"
         f"État : {market_display}\n"
         "\n"
-        f"📰 News : {news}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📰 NEWS ÉCONOMIQUES\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"{news_display}\n"
     )
+
+    # ========================================================
+    # DÉCISION
+    # ========================================================
 
     if reason:
 
@@ -516,14 +670,27 @@ def is_valid_automatic_signal(
         )
     ).upper()
 
+    # --------------------------------------------------------
+    # Direction
+    # --------------------------------------------------------
+
     if direction not in {
         "BUY",
         "SELL",
     }:
         return False
 
+    # --------------------------------------------------------
+    # Statut
+    # --------------------------------------------------------
+
     if status != "ACTIVE":
         return False
+
+    # --------------------------------------------------------
+    # ALIGNEMENT PRINCIPAL
+    # H4 + H1 + M15
+    # --------------------------------------------------------
 
     if not (
         h4 == h1 == m15
@@ -533,6 +700,10 @@ def is_valid_automatic_signal(
         }
     ):
         return False
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
 
     try:
 
@@ -546,6 +717,10 @@ def is_valid_automatic_signal(
 
         return False
 
+    # --------------------------------------------------------
+    # RR
+    # --------------------------------------------------------
+
     try:
 
         if float(rr) < CONFIG.MINIMUM_RR:
@@ -557,6 +732,10 @@ def is_valid_automatic_signal(
     ):
 
         return False
+
+    # --------------------------------------------------------
+    # M5 volontairement NON BLOQUANT
+    # --------------------------------------------------------
 
     return True
 
