@@ -1,5 +1,7 @@
 import os
+import asyncio
 import logging
+from datetime import datetime, timezone
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -33,6 +35,63 @@ TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN",
     "",
 ).strip()
+
+
+# ============================================================
+# CANAL TELEGRAM
+# ============================================================
+
+TELEGRAM_CHANNEL_ID = os.getenv(
+    "TELEGRAM_CHANNEL_ID",
+    "",
+).strip()
+
+
+# ============================================================
+# SURVEILLANCE AUTOMATIQUE
+# ============================================================
+
+AUTO_SIGNAL_ENABLED = os.getenv(
+    "AUTO_SIGNAL_ENABLED",
+    "true",
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+SCAN_INTERVAL_SECONDS = int(
+    os.getenv(
+        "SCAN_INTERVAL_SECONDS",
+        "900",
+    )
+)
+
+
+# Temps minimum avant de renvoyer le même type
+# de signal pour un même marché.
+SIGNAL_COOLDOWN_SECONDS = int(
+    os.getenv(
+        "SIGNAL_COOLDOWN_SECONDS",
+        "14400",
+    )
+)
+
+
+# ============================================================
+# MÉMOIRE ANTI-DOUBLON
+# ============================================================
+
+last_sent_signals = {}
+
+
+# ============================================================
+# TÂCHE DU SCANNER
+# ============================================================
+
+scanner_task = None
 
 
 # ============================================================
@@ -106,7 +165,7 @@ def market_menu():
 
 
 # ============================================================
-# FORMATAGE DES PRIX
+# FORMATAGE PRIX
 # ============================================================
 
 def format_price(value):
@@ -178,10 +237,6 @@ def format_analysis(
     result: dict,
 ) -> str:
 
-    # --------------------------------------------------------
-    # PRINCIPAL
-    # --------------------------------------------------------
-
     symbol = result.get(
         "symbol",
         "N/A",
@@ -212,10 +267,6 @@ def format_analysis(
         "",
     )
 
-    # --------------------------------------------------------
-    # DONNÉES
-    # --------------------------------------------------------
-
     trend = result.get(
         "trend",
         {},
@@ -240,12 +291,6 @@ def format_analysis(
         "market",
         {},
     ) or {}
-
-    # --------------------------------------------------------
-    # MULTI-TIMEFRAME
-    #
-    # NO D1
-    # --------------------------------------------------------
 
     h4 = trend.get(
         "H4",
@@ -278,10 +323,6 @@ def format_analysis(
         False,
     )
 
-    # --------------------------------------------------------
-    # SETUP
-    # --------------------------------------------------------
-
     entry = trade.get(
         "entry",
         None,
@@ -302,18 +343,10 @@ def format_analysis(
         0.0,
     )
 
-    # --------------------------------------------------------
-    # NEWS
-    # --------------------------------------------------------
-
     news = result.get(
         "news",
         "NOT CHECKED",
     )
-
-    # --------------------------------------------------------
-    # MARCHÉ
-    # --------------------------------------------------------
 
     market_open = market.get(
         "open",
@@ -325,17 +358,9 @@ def format_analysis(
         False,
     )
 
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
     score_display = format_score(
         score
     )
-
-    # --------------------------------------------------------
-    # ALIGNEMENT
-    # --------------------------------------------------------
 
     alignment_display = (
         "✅ CONFIRMÉ"
@@ -343,15 +368,9 @@ def format_analysis(
         else "❌ NON CONFIRMÉ"
     )
 
-    # --------------------------------------------------------
-    # M5
-    # --------------------------------------------------------
-
     if m5 == "CONFIRMED":
 
-        m5_display = (
-            "✅ CONFIRMÉ"
-        )
+        m5_display = "✅ CONFIRMÉ"
 
     elif m5 == "NOT CONFIRMED":
 
@@ -363,10 +382,6 @@ def format_analysis(
     else:
 
         m5_display = str(m5)
-
-    # --------------------------------------------------------
-    # MARCHÉ
-    # --------------------------------------------------------
 
     if market_open is True:
 
@@ -385,10 +400,6 @@ def format_analysis(
         market_display += (
             " ⚠️ FERMETURE PROCHE"
         )
-
-    # --------------------------------------------------------
-    # TEXTE FINAL
-    # --------------------------------------------------------
 
     text = (
         "🤖 NOVA TRADE AI\n"
@@ -442,6 +453,542 @@ def format_analysis(
 
 
 # ============================================================
+# VÉRIFICATION SIGNAL VALIDE
+# ============================================================
+
+def is_valid_automatic_signal(
+    result: dict,
+) -> bool:
+
+    if not isinstance(result, dict):
+        return False
+
+    status = str(
+        result.get(
+            "status",
+            "",
+        )
+    ).upper()
+
+    direction = str(
+        result.get(
+            "direction",
+            "",
+        )
+    ).upper()
+
+    score = result.get(
+        "score",
+        0,
+    )
+
+    trade = result.get(
+        "trade",
+        {},
+    ) or {}
+
+    rr = trade.get(
+        "rr",
+        0,
+    )
+
+    trend = result.get(
+        "trend",
+        {},
+    ) or {}
+
+    h4 = str(
+        trend.get(
+            "H4",
+            "",
+        )
+    ).upper()
+
+    h1 = str(
+        trend.get(
+            "H1",
+            "",
+        )
+    ).upper()
+
+    m15 = str(
+        trend.get(
+            "M15",
+            "",
+        )
+    ).upper()
+
+    # --------------------------------------------------------
+    # DIRECTION
+    # --------------------------------------------------------
+
+    if direction not in {
+        "BUY",
+        "SELL",
+    }:
+        return False
+
+    # --------------------------------------------------------
+    # STATUT
+    # --------------------------------------------------------
+
+    if status != "ACTIVE":
+        return False
+
+    # --------------------------------------------------------
+    # ALIGNEMENT H4 / H1 / M15
+    # --------------------------------------------------------
+
+    if not (
+        h4 == h1 == m15
+        and h4 in {
+            "BUY",
+            "SELL",
+        }
+    ):
+        return False
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
+    try:
+
+        if float(score) < CONFIG.SIGNAL_THRESHOLD:
+            return False
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return False
+
+    # --------------------------------------------------------
+    # RR
+    # --------------------------------------------------------
+
+    try:
+
+        if float(rr) < CONFIG.MINIMUM_RR:
+            return False
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return False
+
+    return True
+
+
+# ============================================================
+# CLÉ UNIQUE DU SIGNAL
+# ============================================================
+
+def build_signal_key(
+    result: dict,
+) -> str:
+
+    symbol = result.get(
+        "symbol",
+        "",
+    )
+
+    direction = result.get(
+        "direction",
+        "",
+    )
+
+    trade = result.get(
+        "trade",
+        {},
+    ) or {}
+
+    entry = trade.get(
+        "entry",
+        "",
+    )
+
+    sl = trade.get(
+        "sl",
+        "",
+    )
+
+    tp = trade.get(
+        "tp",
+        "",
+    )
+
+    return (
+        f"{symbol}|"
+        f"{direction}|"
+        f"{entry}|"
+        f"{sl}|"
+        f"{tp}"
+    )
+
+
+# ============================================================
+# ANTI-DOUBLON
+# ============================================================
+
+def signal_is_on_cooldown(
+    result: dict,
+) -> bool:
+
+    symbol = result.get(
+        "symbol",
+        "UNKNOWN",
+    )
+
+    direction = result.get(
+        "direction",
+        "UNKNOWN",
+    )
+
+    key = (
+        f"{symbol}|"
+        f"{direction}"
+    )
+
+    last_time = last_sent_signals.get(
+        key
+    )
+
+    if last_time is None:
+        return False
+
+    elapsed = (
+        datetime.now(timezone.utc)
+        - last_time
+    ).total_seconds()
+
+    return (
+        elapsed
+        < SIGNAL_COOLDOWN_SECONDS
+    )
+
+
+# ============================================================
+# ENREGISTRER SIGNAL ENVOYÉ
+# ============================================================
+
+def mark_signal_as_sent(
+    result: dict,
+):
+
+    symbol = result.get(
+        "symbol",
+        "UNKNOWN",
+    )
+
+    direction = result.get(
+        "direction",
+        "UNKNOWN",
+    )
+
+    key = (
+        f"{symbol}|"
+        f"{direction}"
+    )
+
+    last_sent_signals[key] = (
+        datetime.now(timezone.utc)
+    )
+
+
+# ============================================================
+# ENVOI AU CANAL
+# ============================================================
+
+async def send_signal_to_channel(
+    application: Application,
+    result: dict,
+) -> bool:
+
+    if not TELEGRAM_CHANNEL_ID:
+
+        logger.warning(
+            "TELEGRAM_CHANNEL_ID non configuré. "
+            "Signal non envoyé au canal."
+        )
+
+        return False
+
+    if not is_valid_automatic_signal(
+        result
+    ):
+
+        return False
+
+    if signal_is_on_cooldown(
+        result
+    ):
+
+        logger.info(
+            "Signal ignoré : cooldown actif pour %s %s",
+            result.get("symbol"),
+            result.get("direction"),
+        )
+
+        return False
+
+    text = format_analysis(
+        result
+    )
+
+    text = (
+        "🚨 SIGNAL AUTOMATIQUE\n\n"
+        + text
+    )
+
+    try:
+
+        await application.bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            text=text,
+        )
+
+        mark_signal_as_sent(
+            result
+        )
+
+        logger.info(
+            "SIGNAL ENVOYÉ AU CANAL : %s %s",
+            result.get("symbol"),
+            result.get("direction"),
+        )
+
+        return True
+
+    except Exception as exc:
+
+        logger.exception(
+            "Erreur envoi canal Telegram : %s",
+            exc,
+        )
+
+        return False
+
+
+# ============================================================
+# ANALYSE AUTOMATIQUE D'UN MARCHÉ
+# ============================================================
+
+async def scan_symbol(
+    application: Application,
+    symbol: str,
+):
+
+    try:
+
+        logger.info(
+            "Scan automatique : %s",
+            symbol,
+        )
+
+        result = await asyncio.to_thread(
+            analyze_market,
+            symbol,
+        )
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+
+            logger.warning(
+                "Résultat invalide pour %s",
+                symbol,
+            )
+
+            return
+
+        if is_valid_automatic_signal(
+            result
+        ):
+
+            logger.info(
+                "SETUP VALIDÉ : %s %s | "
+                "Score=%s | RR=%s",
+                symbol,
+                result.get("direction"),
+                result.get("score"),
+                (
+                    result.get(
+                        "trade",
+                        {},
+                    ) or {}
+                ).get(
+                    "rr",
+                    0,
+                ),
+            )
+
+            await send_signal_to_channel(
+                application,
+                result,
+            )
+
+        else:
+
+            logger.info(
+                "Pas de signal automatique : %s | "
+                "direction=%s | status=%s | score=%s",
+                symbol,
+                result.get("direction"),
+                result.get("status"),
+                result.get("score"),
+            )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Erreur scan automatique %s : %s",
+            symbol,
+            exc,
+        )
+
+
+# ============================================================
+# BOUCLE DE SURVEILLANCE
+# ============================================================
+
+async def automatic_scan_loop(
+    application: Application,
+):
+
+    logger.info(
+        "Scanner automatique démarré."
+    )
+
+    logger.info(
+        "Intervalle de scan : %s secondes",
+        SCAN_INTERVAL_SECONDS,
+    )
+
+    while True:
+
+        try:
+
+            if not AUTO_SIGNAL_ENABLED:
+
+                logger.info(
+                    "AUTO_SIGNAL_ENABLED=false. "
+                    "Scanner en pause."
+                )
+
+            elif not TELEGRAM_CHANNEL_ID:
+
+                logger.warning(
+                    "TELEGRAM_CHANNEL_ID absent. "
+                    "Scanner actif mais aucun canal configuré."
+                )
+
+            else:
+
+                logger.info(
+                    "========== NOUVEAU SCAN =========="
+                )
+
+                for symbol in ALL_SYMBOLS:
+
+                    await scan_symbol(
+                        application,
+                        symbol,
+                    )
+
+                    # Petite pause pour éviter
+                    # de surcharger les APIs.
+                    await asyncio.sleep(2)
+
+                logger.info(
+                    "========== SCAN TERMINÉ =========="
+                )
+
+        except asyncio.CancelledError:
+
+            logger.info(
+                "Scanner automatique arrêté."
+            )
+
+            raise
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur boucle scanner : %s",
+                exc,
+            )
+
+        await asyncio.sleep(
+            SCAN_INTERVAL_SECONDS
+        )
+
+
+# ============================================================
+# INITIALISATION APPLICATION
+# ============================================================
+
+async def post_init(
+    application: Application,
+):
+
+    global scanner_task
+
+    if scanner_task is not None:
+
+        logger.warning(
+            "Scanner déjà démarré."
+        )
+
+        return
+
+    scanner_task = application.create_task(
+        automatic_scan_loop(
+            application
+        ),
+        name="nova_trade_auto_scanner",
+    )
+
+    logger.info(
+        "Tâche scanner créée."
+    )
+
+
+# ============================================================
+# ARRÊT APPLICATION
+# ============================================================
+
+async def post_shutdown(
+    application: Application,
+):
+
+    global scanner_task
+
+    if scanner_task is None:
+        return
+
+    logger.info(
+        "Arrêt du scanner automatique..."
+    )
+
+    scanner_task.cancel()
+
+    try:
+
+        await scanner_task
+
+    except asyncio.CancelledError:
+
+        pass
+
+    scanner_task = None
+
+
+# ============================================================
 # /START
 # ============================================================
 
@@ -453,10 +1000,14 @@ async def start(
     await update.message.reply_text(
         "🤖 NOVA TRADE AI\n\n"
         "Bot connecté et opérationnel.\n\n"
-        "Architecture actuelle :\n"
+        "Architecture :\n"
         "H4 + H1 + M15 → validation principale\n"
-        "M5 → confirmation secondaire non bloquante\n\n"
-        "Utilise les boutons ci-dessous.",
+        "M5 → confirmation secondaire non bloquante\n"
+        "Score ≥ 60 → validation\n"
+        "RR ≥ 2 → validation\n"
+        "News HIGH → filtre de sécurité\n\n"
+        "Les setups validés peuvent être "
+        "envoyés automatiquement au canal.",
         reply_markup=main_menu(),
     )
 
@@ -476,10 +1027,12 @@ async def help_command(
         "puis lancer l'analyse.\n\n"
         "📊 Statut : voir l'état du moteur.\n\n"
         "ℹ️ À propos : voir l'architecture.\n\n"
-        "Règle principale :\n"
-        "H4 + H1 + M15 doivent être alignés.\n\n"
-        "M5 est une confirmation secondaire "
-        "et ne bloque pas un setup validé.",
+        "Surveillance automatique :\n"
+        "H4 + H1 + M15 doivent être alignés.\n"
+        "Score ≥ 60.\n"
+        "RR ≥ 2.\n"
+        "M5 est non bloquant.\n"
+        "Les news économiques servent de filtre.",
         reply_markup=main_menu(),
     )
 
@@ -493,9 +1046,21 @@ async def about(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    channel_status = (
+        "CONFIGURÉ"
+        if TELEGRAM_CHANNEL_ID
+        else "NON CONFIGURÉ"
+    )
+
+    auto_status = (
+        "ACTIVÉ"
+        if AUTO_SIGNAL_ENABLED
+        else "DÉSACTIVÉ"
+    )
+
     await update.message.reply_text(
         "ℹ️ NOVA TRADE AI\n\n"
-        "Architecture actuelle :\n\n"
+        "Architecture :\n\n"
         "H4 → tendance globale\n"
         "H1 → structure\n"
         "M15 → contexte / zones\n"
@@ -503,13 +1068,19 @@ async def about(
         "M5 → confirmation secondaire\n"
         "Score → validation finale\n"
         "RR minimum → 2.0\n"
-        "News → non intégrées actuellement\n\n"
+        "News → filtre de sécurité\n\n"
         f"Seuil signal : "
         f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
         f"Risque/trade : "
         f"{CONFIG.DEFAULT_RISK_PERCENT}%\n"
         f"Auto-exécution : "
-        f"{CONFIG.AUTO_EXECUTION_ENABLED}",
+        f"{CONFIG.AUTO_EXECUTION_ENABLED}\n\n"
+        f"Scanner automatique : "
+        f"{auto_status}\n"
+        f"Canal Telegram : "
+        f"{channel_status}\n"
+        f"Intervalle scan : "
+        f"{SCAN_INTERVAL_SECONDS}s",
         reply_markup=main_menu(),
     )
 
@@ -523,6 +1094,18 @@ async def status(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    channel_status = (
+        "🟢 CONFIGURÉ"
+        if TELEGRAM_CHANNEL_ID
+        else "🔴 NON CONFIGURÉ"
+    )
+
+    auto_status = (
+        "🟢 ACTIVÉ"
+        if AUTO_SIGNAL_ENABLED
+        else "🔴 DÉSACTIVÉ"
+    )
+
     await update.message.reply_text(
         "📊 NOVA TRADE AI — STATUT\n\n"
         "🟢 Telegram : CONNECTÉ\n"
@@ -534,7 +1117,9 @@ async def status(
         "🟡 M5 : CONFIRMATION NON BLOQUANTE\n"
         "🟢 Score : ACTIF\n"
         "🟢 RR : ACTIF\n"
-        "🟡 News : NON INTÉGRÉES\n"
+        "🟢 News : FILTRE DE SÉCURITÉ\n"
+        f"{auto_status} Scanner automatique\n"
+        f"{channel_status} Canal Telegram\n"
         "\n"
         f"Seuil : "
         f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
@@ -544,6 +1129,8 @@ async def status(
         f"{CONFIG.DEFAULT_RISK_PERCENT}%\n"
         f"Symboles : "
         f"{len(ALL_SYMBOLS)}\n"
+        f"Intervalle scan : "
+        f"{SCAN_INTERVAL_SECONDS}s\n"
         f"Exécution automatique : "
         f"{CONFIG.AUTO_EXECUTION_ENABLED}",
         reply_markup=main_menu(),
@@ -614,8 +1201,9 @@ async def run_analysis_message(
 
     try:
 
-        result = analyze_market(
-            symbol
+        result = await asyncio.to_thread(
+            analyze_market,
+            symbol,
         )
 
         text = format_analysis(
@@ -712,6 +1300,12 @@ async def button_handler(
 
     if data == "menu_status":
 
+        channel_status = (
+            "🟢 CONFIGURÉ"
+            if TELEGRAM_CHANNEL_ID
+            else "🔴 NON CONFIGURÉ"
+        )
+
         await query.edit_message_text(
             "📊 NOVA TRADE AI — STATUT\n\n"
             "🟢 Telegram : CONNECTÉ\n"
@@ -723,15 +1317,16 @@ async def button_handler(
             "🟡 M5 : NON BLOQUANT\n"
             "🟢 Score : ACTIF\n"
             "🟢 RR : ACTIF\n"
-            "🟡 News : NON INTÉGRÉES\n\n"
+            "🟢 News : FILTRE DE SÉCURITÉ\n"
+            f"🟢 Scanner : "
+            f"{'ACTIF' if AUTO_SIGNAL_ENABLED else 'ARRÊTÉ'}\n"
+            f"{channel_status} Canal\n\n"
             f"Seuil : "
             f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
             f"RR minimum : "
             f"{CONFIG.MINIMUM_RR}\n"
-            f"Risque : "
-            f"{CONFIG.DEFAULT_RISK_PERCENT}%\n"
-            f"Auto-exécution : "
-            f"{CONFIG.AUTO_EXECUTION_ENABLED}",
+            f"Intervalle : "
+            f"{SCAN_INTERVAL_SECONDS}s",
             reply_markup=main_menu(),
         )
 
@@ -752,11 +1347,12 @@ async def button_handler(
             "M5 → Confirmation secondaire\n"
             "Score → Validation\n"
             "RR → Validation\n"
-            "News → Non intégrées\n\n"
-            "M5 ne peut pas bloquer un setup "
-            "H4/H1/M15 validé.\n\n"
-            "Le bot analyse le marché mais "
-            "n'exécute actuellement aucun ordre réel.",
+            "News → Filtre de sécurité\n\n"
+            "M5 non confirmé ≠ rejet automatique.\n\n"
+            "Le bot analyse automatiquement les marchés "
+            "et peut publier les setups validés "
+            "dans le canal Telegram.\n\n"
+            "Aucun ordre réel n'est exécuté.",
             reply_markup=main_menu(),
         )
 
@@ -777,7 +1373,9 @@ async def button_handler(
             "5️⃣ Le score est calculé\n"
             "6️⃣ Le RR est vérifié\n"
             "7️⃣ M5 apporte une confirmation secondaire\n"
-            "8️⃣ Le résultat est affiché\n\n"
+            "8️⃣ Les news servent de filtre\n"
+            "9️⃣ Les setups validés peuvent être "
+            "envoyés automatiquement\n\n"
             "M5 non confirmé ≠ rejet automatique.",
             reply_markup=main_menu(),
         )
@@ -812,8 +1410,9 @@ async def button_handler(
 
         try:
 
-            result = analyze_market(
-                symbol
+            result = await asyncio.to_thread(
+                analyze_market,
+                symbol,
             )
 
             text = format_analysis(
@@ -880,6 +1479,8 @@ def create_application() -> Application:
     application = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
@@ -945,6 +1546,22 @@ def run_bot():
 
     logger.info(
         "NOVA TRADE AI Telegram démarrage..."
+    )
+
+    logger.info(
+        "Scanner automatique : %s",
+        "ACTIVÉ"
+        if AUTO_SIGNAL_ENABLED
+        else "DÉSACTIVÉ",
+    )
+
+    logger.info(
+        "Canal Telegram : %s",
+        (
+            "CONFIGURÉ"
+            if TELEGRAM_CHANNEL_ID
+            else "NON CONFIGURÉ"
+        ),
     )
 
     application.run_polling(
