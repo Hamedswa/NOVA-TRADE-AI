@@ -2,20 +2,37 @@
 NOVA TRADE AI
 signals/signal_engine.py
 
-Moteur de création et validation des signaux.
+MOTEUR DE CRÉATION ET VALIDATION DES SIGNAUX
 
 Architecture principale :
-    D1 + H4 + H1 + M15
-        = VALIDATION OBLIGATOIRE
 
-M5 :
-    Confirmation d'entrée secondaire.
-    NON BLOQUANTE.
+    H4
+      ↓
+    TENDANCE GLOBALE
+
+    H1
+      ↓
+    STRUCTURE
+
+    M15
+      ↓
+    CONTEXTE / ZONE
+
+    H4 + H1 + M15
+      ↓
+    ALIGNEMENT PRINCIPAL OBLIGATOIRE
+
+    M5
+      ↓
+    CONFIRMATION SECONDAIRE
+      ↓
+    NON BLOQUANTE
 
 Conditions finales :
-    - D1/H4/H1/M15 parfaitement alignés
+
+    - H4/H1/M15 parfaitement alignés
     - Zone cohérente
-    - Niveaux valides
+    - Entry / SL / TP valides
     - RR >= minimum
     - Score >= seuil
 
@@ -46,12 +63,14 @@ from scoring.score_engine import (
 
 
 # ============================================================
-# MARKET TYPE
+# TYPE DE MARCHÉ
 # ============================================================
 
-def detect_market_type(symbol: str) -> MarketType:
+def detect_market_type(
+    symbol: str,
+) -> MarketType:
     """
-    Détermine le type de marché à partir du symbole.
+    Détermine le type de marché.
     """
 
     crypto_symbols = {
@@ -69,25 +88,20 @@ def detect_market_type(symbol: str) -> MarketType:
 
 
 # ============================================================
-# M5 CONFIRMATION
+# VALIDATION M5
 # ============================================================
 
 def is_confirmation_valid(
     confirmation: Confirmation,
 ) -> bool:
     """
-    Vérifie si la confirmation M5 est de qualité.
+    Détermine si la confirmation M5 est forte.
 
-    Cette fonction est INFORMATIVE.
+    IMPORTANT :
+    Cette fonction est informative.
 
-    Elle ne bloque JAMAIS un signal lorsque
-    D1/H4/H1/M15 sont parfaitement alignés.
-
-    Confirmations acceptées :
-
-    1. Micro BOS + bougie
-    2. Liquidity Sweep + rejet + bougie
-    3. Retest + rejet + bougie
+    M5 NE BLOQUE PAS la création du signal
+    lorsque H4/H1/M15 sont parfaitement alignés.
     """
 
     if (
@@ -114,11 +128,10 @@ def is_confirmation_valid(
 
 
 # ============================================================
-# PRIMARY ALIGNMENT
+# VALIDATION ALIGNEMENT PRINCIPAL
 # ============================================================
 
 def is_primary_alignment_valid(
-    d1_direction: Direction,
     h4_direction: Direction,
     h1_direction: Direction,
     m15_direction: Direction,
@@ -126,17 +139,19 @@ def is_primary_alignment_valid(
     """
     Validation principale NOVA TRADE AI.
 
-    Les quatre timeframes doivent être parfaitement alignés :
+    H4 + H1 + M15 doivent être :
 
-        D1 = H4 = H1 = M15
+        BUY + BUY + BUY
 
-    M5 n'intervient PAS.
+    ou :
 
-    Retourne True uniquement pour BUY ou SELL.
+        SELL + SELL + SELL
+
+    Toute présence de NEUTRAL invalide
+    l'alignement principal.
     """
 
     directions = (
-        d1_direction,
         h4_direction,
         h1_direction,
         m15_direction,
@@ -149,43 +164,37 @@ def is_primary_alignment_valid(
         return False
 
     return (
-        d1_direction == h4_direction
-        and h4_direction == h1_direction
+        h4_direction == h1_direction
         and h1_direction == m15_direction
     )
 
 
 # ============================================================
-# PRIMARY DIRECTION
+# DIRECTION PRINCIPALE
 # ============================================================
 
 def get_primary_direction(
-    d1_direction: Direction,
     h4_direction: Direction,
     h1_direction: Direction,
     m15_direction: Direction,
 ) -> Direction:
     """
-    Retourne la direction principale uniquement si
-    D1/H4/H1/M15 sont parfaitement alignés.
-
-    Sinon :
-        NEUTRAL
+    Retourne la direction principale uniquement
+    lorsque H4/H1/M15 sont parfaitement alignés.
     """
 
     if not is_primary_alignment_valid(
-        d1_direction=d1_direction,
         h4_direction=h4_direction,
         h1_direction=h1_direction,
         m15_direction=m15_direction,
     ):
         return Direction.NEUTRAL
 
-    return d1_direction
+    return h4_direction
 
 
 # ============================================================
-# BUILD SIGNAL
+# CONSTRUCTION DU SIGNAL
 # ============================================================
 
 def build_signal(
@@ -198,47 +207,23 @@ def build_signal(
     take_profit: float,
     spread_ok: bool = True,
     session_ok: bool = True,
-    d1_direction: Direction | None = None,
+
+    # ========================================================
+    # NOUVELLE ARCHITECTURE
+    # ========================================================
+
     h4_direction: Direction | None = None,
     h1_direction: Direction | None = None,
     m15_direction: Direction | None = None,
 ) -> Signal | None:
     """
-    Construit un signal NOVA TRADE AI.
+    Construit un signal validé.
 
-    ============================================================
-    VALIDATION PRINCIPALE
-    ============================================================
+    H4 + H1 + M15 :
+        OBLIGATOIRES
 
-    D1 + H4 + H1 + M15 doivent être parfaitement alignés.
-
-    ============================================================
-    M5
-    ============================================================
-
-    M5 est une confirmation secondaire.
-
-    Il peut :
-        - confirmer l'entrée
-        - améliorer le score
-        - apporter une meilleure qualité d'entrée
-
-    Il ne peut PAS :
-        - annuler un setup valide
-        - bloquer la création du Signal
-
-    ============================================================
-    CONDITIONS FINALES
-    ============================================================
-
-    - Direction valide
-    - Alignement D1/H4/H1/M15
-    - Zone cohérente
-    - Entrée valide
-    - Stop Loss valide
-    - Take Profit valide
-    - RR >= CONFIG.MINIMUM_RR
-    - Score >= CONFIG.SIGNAL_THRESHOLD
+    M5 :
+        NON BLOQUANT
     """
 
     # ========================================================
@@ -247,87 +232,82 @@ def build_signal(
 
     primary_direction = trend.direction
 
-    # --------------------------------------------------------
-    # Si les quatre directions sont disponibles,
-    # elles deviennent la source de vérité.
-    # --------------------------------------------------------
+    # ========================================================
+    # 2. VALIDATION EXPLICITE H4/H1/M15
+    # ========================================================
 
     if all(
         direction is not None
         for direction in (
-            d1_direction,
             h4_direction,
             h1_direction,
             m15_direction,
         )
     ):
+
         primary_direction = get_primary_direction(
-            d1_direction=d1_direction,
             h4_direction=h4_direction,
             h1_direction=h1_direction,
             m15_direction=m15_direction,
         )
 
-    # --------------------------------------------------------
-    # Direction obligatoire
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. AUCUNE DIRECTION
+    # ========================================================
 
     if primary_direction == Direction.NEUTRAL:
         return None
 
     # ========================================================
-    # 2. ZONE
+    # 4. VÉRIFICATION ZONE
     # ========================================================
 
     if zone.direction != primary_direction:
         return None
 
     # ========================================================
-    # 3. CONFIRMATION M5
+    # 5. M5
+    #
+    # NON BLOQUANT
     # ========================================================
-
-    # IMPORTANT :
-    #
-    # M5 NE DOIT PAS ÊTRE BLOQUANT.
-    #
-    # Une confirmation M5 NEUTRAL est donc autorisée.
-    #
-    # Une confirmation opposée est également traitée
-    # comme une absence de confirmation et ne peut pas
-    # annuler la validation principale D1/H4/H1/M15.
-    #
-    # Le score_engine utilise les éléments M5 comme bonus.
 
     m5_confirmed = (
         confirmation.direction == primary_direction
-        and is_confirmation_valid(confirmation)
+        and is_confirmation_valid(
+            confirmation
+        )
     )
 
-    # Variable volontairement conservée pour permettre
-    # une exploitation future dans les logs/qualités.
+    # Variable conservée volontairement
+    # pour information / logs futurs.
     _ = m5_confirmed
 
     # ========================================================
-    # 4. LEVELS
+    # 6. VALIDATION ENTRY
     # ========================================================
 
     if entry <= 0:
         return None
 
+    # ========================================================
+    # 7. VALIDATION STOP LOSS
+    # ========================================================
+
     if stop_loss <= 0:
         return None
+
+    # ========================================================
+    # 8. VALIDATION TAKE PROFIT
+    # ========================================================
 
     if take_profit <= 0:
         return None
 
     # ========================================================
-    # 5. COHÉRENCE DES NIVEAUX
+    # 9. COHÉRENCE DES NIVEAUX BUY
     # ========================================================
 
     if primary_direction == Direction.BUY:
-
-        # BUY :
-        # SL < ENTRY < TP
 
         if stop_loss >= entry:
             return None
@@ -335,10 +315,11 @@ def build_signal(
         if take_profit <= entry:
             return None
 
-    elif primary_direction == Direction.SELL:
+    # ========================================================
+    # 10. COHÉRENCE DES NIVEAUX SELL
+    # ========================================================
 
-        # SELL :
-        # TP < ENTRY < SL
+    elif primary_direction == Direction.SELL:
 
         if stop_loss <= entry:
             return None
@@ -347,10 +328,11 @@ def build_signal(
             return None
 
     else:
+
         return None
 
     # ========================================================
-    # 6. RISK / REWARD
+    # 11. CALCUL RR
     # ========================================================
 
     rr = calculate_rr(
@@ -359,11 +341,15 @@ def build_signal(
         take_profit,
     )
 
+    # ========================================================
+    # 12. RR MINIMUM
+    # ========================================================
+
     if rr < CONFIG.MINIMUM_RR:
         return None
 
     # ========================================================
-    # 7. SCORE
+    # 13. CALCUL DU SCORE
     # ========================================================
 
     score = calculate_score(
@@ -376,7 +362,7 @@ def build_signal(
     )
 
     # ========================================================
-    # 8. SEUIL DU SIGNAL
+    # 14. SEUIL DE SCORE
     # ========================================================
 
     if not should_send_signal(
@@ -386,7 +372,7 @@ def build_signal(
         return None
 
     # ========================================================
-    # 9. SIGNAL ID
+    # 15. ID DU SIGNAL
     # ========================================================
 
     signal_id = (
@@ -395,19 +381,27 @@ def build_signal(
     )
 
     # ========================================================
-    # 10. CRÉATION DU SIGNAL
+    # 16. CRÉATION SIGNAL
     # ========================================================
 
     return Signal(
         signal_id=signal_id,
         symbol=symbol,
-        market_type=detect_market_type(symbol),
+        market_type=detect_market_type(
+            symbol
+        ),
         direction=primary_direction,
-        score=round(score, 2),
+        score=round(
+            score,
+            2,
+        ),
         entry=entry,
         stop_loss=stop_loss,
         take_profit=take_profit,
-        rr=round(rr, 2),
+        rr=round(
+            rr,
+            2,
+        ),
         risk_percent=CONFIG.DEFAULT_RISK_PERCENT,
         zone=zone,
         confirmation=confirmation,
