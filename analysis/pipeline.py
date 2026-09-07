@@ -21,9 +21,11 @@ SCORE
 RR / SL / TP
     ↓
 DECISION
+    ↓
+SIGNAL
 
-Aucune exécution réelle d'ordre.
-News économiques non intégrées pour le moment.
+Aucune execution reelle d'ordre.
+News economiques non integrees pour le moment.
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.models import (
-    Candle,
     Confirmation,
     Direction,
     TrendContext,
@@ -50,6 +51,8 @@ from scoring.score_engine import (
     score_label,
     should_send_signal,
 )
+
+from signals.signal_engine import build_signal
 
 
 # ============================================================
@@ -86,6 +89,7 @@ def _candle_value(
 
     if isinstance(candle, dict):
         value = candle.get(field, default)
+
     else:
         value = getattr(
             candle,
@@ -95,6 +99,7 @@ def _candle_value(
 
     try:
         return float(value)
+
     except (TypeError, ValueError):
         return float(default)
 
@@ -154,7 +159,7 @@ def detect_swing_highs(
     ):
         return []
 
-    swings = []
+    swings: List[float] = []
 
     for i in range(
         lookback,
@@ -175,6 +180,7 @@ def detect_swing_highs(
             current >= max(left)
             and current >= max(right)
         ):
+
             swings.append(current)
 
     return swings
@@ -196,7 +202,7 @@ def detect_swing_lows(
     ):
         return []
 
-    swings = []
+    swings: List[float] = []
 
     for i in range(
         lookback,
@@ -217,6 +223,7 @@ def detect_swing_lows(
             current <= min(left)
             and current <= min(right)
         ):
+
             swings.append(current)
 
     return swings
@@ -252,9 +259,11 @@ def _count_structure(
         ):
 
             if current > previous:
+
                 higher_highs += 1
 
             elif current < previous:
+
                 lower_highs += 1
 
     if len(lows) >= 2:
@@ -265,9 +274,11 @@ def _count_structure(
         ):
 
             if current > previous:
+
                 higher_lows += 1
 
             elif current < previous:
+
                 lower_lows += 1
 
     return (
@@ -363,7 +374,7 @@ def calculate_atr(
     ):
         return 0.0
 
-    true_ranges = []
+    true_ranges: List[float] = []
 
     for i in range(
         1,
@@ -371,7 +382,10 @@ def calculate_atr(
     ):
 
         current = candles[i]
-        previous = candles[i - 1]
+
+        previous = candles[
+            i - 1
+        ]
 
         high = _candle_value(
             current,
@@ -518,6 +532,7 @@ def detect_candle_confirmation(
         return False
 
     previous = candles[-2]
+
     current = candles[-1]
 
     previous_open = _candle_value(
@@ -578,7 +593,10 @@ def detect_candle_confirmation(
         / current_range
     )
 
+    # ========================================================
     # BUY
+    # ========================================================
+
     if direction == Direction.BUY:
 
         bullish = (
@@ -611,7 +629,10 @@ def detect_candle_confirmation(
             )
         )
 
+    # ========================================================
     # SELL
+    # ========================================================
+
     if direction == Direction.SELL:
 
         bearish = (
@@ -742,9 +763,10 @@ def detect_liquidity_sweep(
         "close",
     )
 
-    # BUY :
-    # prise de liquidité sous les lows
-    # puis clôture au-dessus
+    # ========================================================
+    # BUY
+    # ========================================================
+
     if direction == Direction.BUY:
 
         return (
@@ -754,9 +776,10 @@ def detect_liquidity_sweep(
             > previous_low
         )
 
-    # SELL :
-    # prise de liquidité au-dessus des highs
-    # puis clôture en-dessous
+    # ========================================================
+    # SELL
+    # ========================================================
+
     if direction == Direction.SELL:
 
         return (
@@ -830,6 +853,10 @@ def detect_rejection(
         - low
     )
 
+    # ========================================================
+    # BUY
+    # ========================================================
+
     if direction == Direction.BUY:
 
         return (
@@ -837,6 +864,10 @@ def detect_rejection(
             and lower_wick
             >= candle_range * 0.30
         )
+
+    # ========================================================
+    # SELL
+    # ========================================================
 
     if direction == Direction.SELL:
 
@@ -861,7 +892,10 @@ def detect_retest(
     if len(candles) < 4:
         return False
 
-    previous = candles[-4:-1]
+    previous = candles[
+        -4:-1
+    ]
+
     current = candles[-1]
 
     previous_high = max(
@@ -887,7 +921,10 @@ def detect_retest(
         "close",
     )
 
+    # ========================================================
     # BUY
+    # ========================================================
+
     if direction == Direction.BUY:
 
         return (
@@ -897,7 +934,10 @@ def detect_retest(
             >= previous_low
         )
 
+    # ========================================================
     # SELL
+    # ========================================================
+
     if direction == Direction.SELL:
 
         return (
@@ -911,7 +951,7 @@ def detect_retest(
 
 
 # ============================================================
-# BUILD CONFIRMATION
+# BUILD M5 CONFIRMATION
 # ============================================================
 
 def build_m5_confirmation(
@@ -940,9 +980,11 @@ def build_m5_confirmation(
         direction,
     )
 
-    liquidity_sweep = detect_liquidity_sweep(
-        candles,
-        direction,
+    liquidity_sweep = (
+        detect_liquidity_sweep(
+            candles,
+            direction,
+        )
     )
 
     micro_bos = detect_micro_bos(
@@ -963,38 +1005,56 @@ def build_m5_confirmation(
         rejection=rejection,
         liquidity_sweep=liquidity_sweep,
         micro_bos=micro_bos,
-        candle_confirmation=candle_confirmation,
+        candle_confirmation=(
+            candle_confirmation
+        ),
     )
 
+
+# ============================================================
+# VALIDATION M5
+# ============================================================
 
 def confirmation_valid(
     confirmation: Confirmation,
 ) -> bool:
 
-    # Confirmation 1 :
+    # ========================================================
+    # CONFIRMATION 1
     # Micro BOS + bougie
+    # ========================================================
+
     if (
         confirmation.micro_bos
         and confirmation.candle_confirmation
     ):
+
         return True
 
-    # Confirmation 2 :
+    # ========================================================
+    # CONFIRMATION 2
     # Sweep + rejet + bougie
+    # ========================================================
+
     if (
         confirmation.liquidity_sweep
         and confirmation.rejection
         and confirmation.candle_confirmation
     ):
+
         return True
 
-    # Confirmation 3 :
+    # ========================================================
+    # CONFIRMATION 3
     # Retest + rejet + bougie
+    # ========================================================
+
     if (
         confirmation.retest
         and confirmation.rejection
         and confirmation.candle_confirmation
     ):
+
         return True
 
     return False
@@ -1056,6 +1116,10 @@ def calculate_trade_levels(
         * SL_ATR_MULTIPLIER
     )
 
+    # ========================================================
+    # BUY
+    # ========================================================
+
     if direction == Direction.BUY:
 
         sl = (
@@ -1067,6 +1131,10 @@ def calculate_trade_levels(
             entry
             + risk_distance * MIN_RR
         )
+
+    # ========================================================
+    # SELL
+    # ========================================================
 
     elif direction == Direction.SELL:
 
@@ -1089,14 +1157,20 @@ def calculate_trade_levels(
             0.0,
         )
 
+    # ========================================================
+    # RR
+    # ========================================================
+
     if direction == Direction.BUY:
 
         risk = entry - sl
+
         reward = tp - entry
 
     else:
 
         risk = sl - entry
+
         reward = entry - tp
 
     if risk <= 0:
@@ -1154,8 +1228,10 @@ def determine_status(
 
         return (
             "REJECT",
-            "La confirmation M5 complète "
-            "n'est pas validée.",
+            (
+                "La confirmation M5 complète "
+                "n'est pas validée."
+            ),
         )
 
     if not should_send_signal(
@@ -1215,26 +1291,31 @@ def analyze_market(
     )
 
     if not d1:
+
         raise RuntimeError(
             f"Aucune donnée D1 pour {symbol}."
         )
 
     if not h4:
+
         raise RuntimeError(
             f"Aucune donnée H4 pour {symbol}."
         )
 
     if not h1:
+
         raise RuntimeError(
             f"Aucune donnée H1 pour {symbol}."
         )
 
     if not m15:
+
         raise RuntimeError(
             f"Aucune donnée M15 pour {symbol}."
         )
 
     if not m5:
+
         raise RuntimeError(
             f"Aucune donnée M5 pour {symbol}."
         )
@@ -1367,9 +1448,9 @@ def analyze_market(
 
     else:
 
-        # IMPORTANT :
-        # Le score est calculé même lorsque M5
-        # n'est pas confirmé.
+        # Le score reste calculé même si M5
+        # n'est pas encore confirmé.
+
         score = calculate_score(
             trend=trend,
             zone=zone,
@@ -1428,7 +1509,51 @@ def analyze_market(
         )
 
     # ========================================================
-    # 9. RESULTAT
+    # 9. CRÉATION DU SIGNAL
+    # ========================================================
+
+    signal = None
+
+    if (
+        status == "ACTIVE"
+        and trend_aligned
+        and h1_confirms
+        and m15_confirms
+        and m5_valid
+        and sl is not None
+        and tp is not None
+        and rr >= MIN_RR
+        and score >= SIGNAL_THRESHOLD
+    ):
+
+        signal = build_signal(
+            symbol=symbol,
+            trend=trend,
+            zone=zone,
+            confirmation=confirmation,
+            entry=entry,
+            stop_loss=sl,
+            take_profit=tp,
+            spread_ok=True,
+            session_ok=True,
+        )
+
+        # Sécurité supplémentaire :
+        # si build_signal refuse le setup,
+        # aucun signal n'est créé.
+
+        if signal is None:
+
+            status = "REJECT"
+
+            reason = (
+                "Le setup a échoué "
+                "à la validation finale "
+                "du moteur de signal."
+            )
+
+    # ========================================================
+    # 10. RESULTAT
     # ========================================================
 
     return {
@@ -1444,6 +1569,11 @@ def analyze_market(
         "status": status,
 
         "reason": reason,
+
+        # Objet Signal.
+        # None lorsque le setup n'est pas ACTIVE.
+
+        "signal": signal,
 
         "trend": {
 
@@ -1536,7 +1666,7 @@ def analyze_market(
 
 
 # ============================================================
-# COMPATIBILITÉ ANCIEN SYSTÈME
+# COMPATIBILITE ANCIEN SYSTEME
 # ============================================================
 
 def analyser_marche(
