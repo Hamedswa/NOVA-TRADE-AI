@@ -38,11 +38,11 @@ TELEGRAM_BOT_TOKEN = os.getenv(
 
 
 # ============================================================
-# CANAL TELEGRAM
+# TELEGRAM CHAT / CHANNEL
 # ============================================================
 
-TELEGRAM_CHANNEL_ID = os.getenv(
-    "TELEGRAM_CHANNEL_ID",
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
     "",
 ).strip()
 
@@ -70,8 +70,6 @@ SCAN_INTERVAL_SECONDS = int(
 )
 
 
-# Temps minimum avant de renvoyer le même type
-# de signal pour un même marché.
 SIGNAL_COOLDOWN_SECONDS = int(
     os.getenv(
         "SIGNAL_COOLDOWN_SECONDS",
@@ -453,7 +451,7 @@ def format_analysis(
 
 
 # ============================================================
-# VÉRIFICATION SIGNAL VALIDE
+# VALIDATION SIGNAL AUTOMATIQUE
 # ============================================================
 
 def is_valid_automatic_signal(
@@ -518,26 +516,14 @@ def is_valid_automatic_signal(
         )
     ).upper()
 
-    # --------------------------------------------------------
-    # DIRECTION
-    # --------------------------------------------------------
-
     if direction not in {
         "BUY",
         "SELL",
     }:
         return False
 
-    # --------------------------------------------------------
-    # STATUT
-    # --------------------------------------------------------
-
     if status != "ACTIVE":
         return False
-
-    # --------------------------------------------------------
-    # ALIGNEMENT H4 / H1 / M15
-    # --------------------------------------------------------
 
     if not (
         h4 == h1 == m15
@@ -547,10 +533,6 @@ def is_valid_automatic_signal(
         }
     ):
         return False
-
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
 
     try:
 
@@ -563,10 +545,6 @@ def is_valid_automatic_signal(
     ):
 
         return False
-
-    # --------------------------------------------------------
-    # RR
-    # --------------------------------------------------------
 
     try:
 
@@ -581,53 +559,6 @@ def is_valid_automatic_signal(
         return False
 
     return True
-
-
-# ============================================================
-# CLÉ UNIQUE DU SIGNAL
-# ============================================================
-
-def build_signal_key(
-    result: dict,
-) -> str:
-
-    symbol = result.get(
-        "symbol",
-        "",
-    )
-
-    direction = result.get(
-        "direction",
-        "",
-    )
-
-    trade = result.get(
-        "trade",
-        {},
-    ) or {}
-
-    entry = trade.get(
-        "entry",
-        "",
-    )
-
-    sl = trade.get(
-        "sl",
-        "",
-    )
-
-    tp = trade.get(
-        "tp",
-        "",
-    )
-
-    return (
-        f"{symbol}|"
-        f"{direction}|"
-        f"{entry}|"
-        f"{sl}|"
-        f"{tp}"
-    )
 
 
 # ============================================================
@@ -672,7 +603,7 @@ def signal_is_on_cooldown(
 
 
 # ============================================================
-# ENREGISTRER SIGNAL ENVOYÉ
+# ENREGISTREMENT SIGNAL ENVOYÉ
 # ============================================================
 
 def mark_signal_as_sent(
@@ -700,7 +631,7 @@ def mark_signal_as_sent(
 
 
 # ============================================================
-# ENVOI AU CANAL
+# ENVOI AU CANAL / CHAT
 # ============================================================
 
 async def send_signal_to_channel(
@@ -708,11 +639,11 @@ async def send_signal_to_channel(
     result: dict,
 ) -> bool:
 
-    if not TELEGRAM_CHANNEL_ID:
+    if not TELEGRAM_CHAT_ID:
 
         logger.warning(
-            "TELEGRAM_CHANNEL_ID non configuré. "
-            "Signal non envoyé au canal."
+            "TELEGRAM_CHAT_ID non configurée. "
+            "Signal non envoyé."
         )
 
         return False
@@ -728,7 +659,8 @@ async def send_signal_to_channel(
     ):
 
         logger.info(
-            "Signal ignoré : cooldown actif pour %s %s",
+            "Signal ignoré : cooldown actif "
+            "pour %s %s",
             result.get("symbol"),
             result.get("direction"),
         )
@@ -747,7 +679,7 @@ async def send_signal_to_channel(
     try:
 
         await application.bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
+            chat_id=TELEGRAM_CHAT_ID,
             text=text,
         )
 
@@ -756,7 +688,7 @@ async def send_signal_to_channel(
         )
 
         logger.info(
-            "SIGNAL ENVOYÉ AU CANAL : %s %s",
+            "SIGNAL ENVOYÉ : %s %s",
             result.get("symbol"),
             result.get("direction"),
         )
@@ -766,7 +698,7 @@ async def send_signal_to_channel(
     except Exception as exc:
 
         logger.exception(
-            "Erreur envoi canal Telegram : %s",
+            "Erreur envoi Telegram : %s",
             exc,
         )
 
@@ -774,7 +706,7 @@ async def send_signal_to_channel(
 
 
 # ============================================================
-# ANALYSE AUTOMATIQUE D'UN MARCHÉ
+# SCAN D'UN MARCHÉ
 # ============================================================
 
 async def scan_symbol(
@@ -810,18 +742,25 @@ async def scan_symbol(
             result
         ):
 
+            trade = (
+                result.get(
+                    "trade",
+                    {},
+                )
+                or {}
+            )
+
             logger.info(
                 "SETUP VALIDÉ : %s %s | "
                 "Score=%s | RR=%s",
                 symbol,
-                result.get("direction"),
-                result.get("score"),
-                (
-                    result.get(
-                        "trade",
-                        {},
-                    ) or {}
-                ).get(
+                result.get(
+                    "direction"
+                ),
+                result.get(
+                    "score"
+                ),
+                trade.get(
                     "rr",
                     0,
                 ),
@@ -835,18 +774,24 @@ async def scan_symbol(
         else:
 
             logger.info(
-                "Pas de signal automatique : %s | "
+                "Pas de signal : %s | "
                 "direction=%s | status=%s | score=%s",
                 symbol,
-                result.get("direction"),
-                result.get("status"),
-                result.get("score"),
+                result.get(
+                    "direction"
+                ),
+                result.get(
+                    "status"
+                ),
+                result.get(
+                    "score"
+                ),
             )
 
     except Exception as exc:
 
         logger.exception(
-            "Erreur scan automatique %s : %s",
+            "Erreur scan %s : %s",
             symbol,
             exc,
         )
@@ -865,7 +810,7 @@ async def automatic_scan_loop(
     )
 
     logger.info(
-        "Intervalle de scan : %s secondes",
+        "Intervalle : %s secondes",
         SCAN_INTERVAL_SECONDS,
     )
 
@@ -880,11 +825,11 @@ async def automatic_scan_loop(
                     "Scanner en pause."
                 )
 
-            elif not TELEGRAM_CHANNEL_ID:
+            elif not TELEGRAM_CHAT_ID:
 
                 logger.warning(
-                    "TELEGRAM_CHANNEL_ID absent. "
-                    "Scanner actif mais aucun canal configuré."
+                    "TELEGRAM_CHAT_ID absente. "
+                    "Impossible d'envoyer les signaux."
                 )
 
             else:
@@ -900,8 +845,6 @@ async def automatic_scan_loop(
                         symbol,
                     )
 
-                    # Petite pause pour éviter
-                    # de surcharger les APIs.
                     await asyncio.sleep(2)
 
                 logger.info(
@@ -929,7 +872,7 @@ async def automatic_scan_loop(
 
 
 # ============================================================
-# INITIALISATION APPLICATION
+# INITIALISATION
 # ============================================================
 
 async def post_init(
@@ -939,10 +882,6 @@ async def post_init(
     global scanner_task
 
     if scanner_task is not None:
-
-        logger.warning(
-            "Scanner déjà démarré."
-        )
 
         return
 
@@ -954,12 +893,12 @@ async def post_init(
     )
 
     logger.info(
-        "Tâche scanner créée."
+        "Scanner automatique lancé."
     )
 
 
 # ============================================================
-# ARRÊT APPLICATION
+# ARRÊT
 # ============================================================
 
 async def post_shutdown(
@@ -972,7 +911,7 @@ async def post_shutdown(
         return
 
     logger.info(
-        "Arrêt du scanner automatique..."
+        "Arrêt du scanner..."
     )
 
     scanner_task.cancel()
@@ -1000,14 +939,13 @@ async def start(
     await update.message.reply_text(
         "🤖 NOVA TRADE AI\n\n"
         "Bot connecté et opérationnel.\n\n"
-        "Architecture :\n"
         "H4 + H1 + M15 → validation principale\n"
         "M5 → confirmation secondaire non bloquante\n"
         "Score ≥ 60 → validation\n"
         "RR ≥ 2 → validation\n"
         "News HIGH → filtre de sécurité\n\n"
         "Les setups validés peuvent être "
-        "envoyés automatiquement au canal.",
+        "envoyés automatiquement.",
         reply_markup=main_menu(),
     )
 
@@ -1023,10 +961,9 @@ async def help_command(
 
     await update.message.reply_text(
         "❓ NOVA TRADE AI — AIDE\n\n"
-        "🔎 Analyse : choisir un marché "
-        "puis lancer l'analyse.\n\n"
-        "📊 Statut : voir l'état du moteur.\n\n"
-        "ℹ️ À propos : voir l'architecture.\n\n"
+        "🔎 Analyse : choisir un marché.\n\n"
+        "📊 Statut : état du moteur.\n\n"
+        "ℹ️ À propos : architecture.\n\n"
         "Surveillance automatique :\n"
         "H4 + H1 + M15 doivent être alignés.\n"
         "Score ≥ 60.\n"
@@ -1048,7 +985,7 @@ async def about(
 
     channel_status = (
         "CONFIGURÉ"
-        if TELEGRAM_CHANNEL_ID
+        if TELEGRAM_CHAT_ID
         else "NON CONFIGURÉ"
     )
 
@@ -1060,7 +997,6 @@ async def about(
 
     await update.message.reply_text(
         "ℹ️ NOVA TRADE AI\n\n"
-        "Architecture :\n\n"
         "H4 → tendance globale\n"
         "H1 → structure\n"
         "M15 → contexte / zones\n"
@@ -1096,7 +1032,7 @@ async def status(
 
     channel_status = (
         "🟢 CONFIGURÉ"
-        if TELEGRAM_CHANNEL_ID
+        if TELEGRAM_CHAT_ID
         else "🔴 NON CONFIGURÉ"
     )
 
@@ -1119,7 +1055,7 @@ async def status(
         "🟢 RR : ACTIF\n"
         "🟢 News : FILTRE DE SÉCURITÉ\n"
         f"{auto_status} Scanner automatique\n"
-        f"{channel_status} Canal Telegram\n"
+        f"{channel_status} Telegram\n"
         "\n"
         f"Seuil : "
         f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
@@ -1129,7 +1065,7 @@ async def status(
         f"{CONFIG.DEFAULT_RISK_PERCENT}%\n"
         f"Symboles : "
         f"{len(ALL_SYMBOLS)}\n"
-        f"Intervalle scan : "
+        f"Intervalle : "
         f"{SCAN_INTERVAL_SECONDS}s\n"
         f"Exécution automatique : "
         f"{CONFIG.AUTO_EXECUTION_ENABLED}",
@@ -1173,7 +1109,7 @@ async def analyse(
 
 
 # ============================================================
-# ANALYSE DEPUIS UN BOUTON
+# ANALYSE MANUELLE
 # ============================================================
 
 async def run_analysis_message(
@@ -1265,10 +1201,6 @@ async def button_handler(
 
     data = query.data or ""
 
-    # ========================================================
-    # MENU PRINCIPAL
-    # ========================================================
-
     if data == "menu_main":
 
         await query.edit_message_text(
@@ -1279,38 +1211,22 @@ async def button_handler(
 
         return
 
-    # ========================================================
-    # MENU ANALYSE
-    # ========================================================
-
     if data == "menu_analyse":
 
         await query.edit_message_text(
             "🔎 CHOISIS LE MARCHÉ\n\n"
-            "Appuie simplement sur le marché "
-            "que tu veux analyser.",
+            "Sélectionne le marché à analyser.",
             reply_markup=market_menu(),
         )
 
         return
 
-    # ========================================================
-    # STATUS
-    # ========================================================
-
     if data == "menu_status":
-
-        channel_status = (
-            "🟢 CONFIGURÉ"
-            if TELEGRAM_CHANNEL_ID
-            else "🔴 NON CONFIGURÉ"
-        )
 
         await query.edit_message_text(
             "📊 NOVA TRADE AI — STATUT\n\n"
             "🟢 Telegram : CONNECTÉ\n"
             "🟢 Moteur : ACTIF\n"
-            "🟢 Données marché : OK\n"
             "🟢 H4 : ACTIF\n"
             "🟢 H1 : ACTIF\n"
             "🟢 M15 : ACTIF\n"
@@ -1320,7 +1236,8 @@ async def button_handler(
             "🟢 News : FILTRE DE SÉCURITÉ\n"
             f"🟢 Scanner : "
             f"{'ACTIF' if AUTO_SIGNAL_ENABLED else 'ARRÊTÉ'}\n"
-            f"{channel_status} Canal\n\n"
+            f"Canal : "
+            f"{'CONFIGURÉ' if TELEGRAM_CHAT_ID else 'NON CONFIGURÉ'}\n\n"
             f"Seuil : "
             f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
             f"RR minimum : "
@@ -1331,10 +1248,6 @@ async def button_handler(
         )
 
         return
-
-    # ========================================================
-    # ABOUT
-    # ========================================================
 
     if data == "menu_about":
 
@@ -1349,42 +1262,32 @@ async def button_handler(
             "RR → Validation\n"
             "News → Filtre de sécurité\n\n"
             "M5 non confirmé ≠ rejet automatique.\n\n"
-            "Le bot analyse automatiquement les marchés "
-            "et peut publier les setups validés "
-            "dans le canal Telegram.\n\n"
+            "Les setups validés peuvent être "
+            "publiés automatiquement.\n\n"
             "Aucun ordre réel n'est exécuté.",
             reply_markup=main_menu(),
         )
 
         return
 
-    # ========================================================
-    # HELP
-    # ========================================================
-
     if data == "menu_help":
 
         await query.edit_message_text(
             "❓ AIDE\n\n"
-            "1️⃣ Appuie sur ANALYSER\n"
-            "2️⃣ Choisis un marché\n"
-            "3️⃣ NOVA récupère H4/H1/M15/M5\n"
-            "4️⃣ H4/H1/M15 sont vérifiés\n"
-            "5️⃣ Le score est calculé\n"
-            "6️⃣ Le RR est vérifié\n"
-            "7️⃣ M5 apporte une confirmation secondaire\n"
-            "8️⃣ Les news servent de filtre\n"
-            "9️⃣ Les setups validés peuvent être "
-            "envoyés automatiquement\n\n"
+            "1️⃣ ANALYSER\n"
+            "2️⃣ Choisir un marché\n"
+            "3️⃣ H4 / H1 / M15 / M5\n"
+            "4️⃣ Validation H4/H1/M15\n"
+            "5️⃣ Calcul du score\n"
+            "6️⃣ Vérification RR\n"
+            "7️⃣ M5 secondaire\n"
+            "8️⃣ Filtre économique\n"
+            "9️⃣ Publication automatique\n\n"
             "M5 non confirmé ≠ rejet automatique.",
             reply_markup=main_menu(),
         )
 
         return
-
-    # ========================================================
-    # ANALYSE MARCHÉ
-    # ========================================================
 
     if data.startswith("analyse:"):
 
@@ -1464,7 +1367,7 @@ async def button_handler(
 
 
 # ============================================================
-# APPLICATION
+# CRÉATION APPLICATION
 # ============================================================
 
 def create_application() -> Application:
@@ -1483,10 +1386,6 @@ def create_application() -> Application:
         .post_shutdown(post_shutdown)
         .build()
     )
-
-    # --------------------------------------------------------
-    # COMMANDES
-    # --------------------------------------------------------
 
     application.add_handler(
         CommandHandler(
@@ -1523,10 +1422,6 @@ def create_application() -> Application:
         )
     )
 
-    # --------------------------------------------------------
-    # CALLBACKS
-    # --------------------------------------------------------
-
     application.add_handler(
         CallbackQueryHandler(
             button_handler
@@ -1550,17 +1445,19 @@ def run_bot():
 
     logger.info(
         "Scanner automatique : %s",
-        "ACTIVÉ"
-        if AUTO_SIGNAL_ENABLED
-        else "DÉSACTIVÉ",
+        (
+            "ACTIVÉ"
+            if AUTO_SIGNAL_ENABLED
+            else "DÉSACTIVÉ"
+        ),
     )
 
     logger.info(
-        "Canal Telegram : %s",
+        "TELEGRAM_CHAT_ID : %s",
         (
             "CONFIGURÉ"
-            if TELEGRAM_CHANNEL_ID
-            else "NON CONFIGURÉ"
+            if TELEGRAM_CHAT_ID
+            else "ABSENT"
         ),
     )
 
