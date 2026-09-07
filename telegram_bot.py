@@ -14,6 +14,9 @@ from telegram.ext import (
 from config import CONFIG, ALL_SYMBOLS
 from analysis.pipeline import analyze_market
 
+from signals.tracker import SignalTracker
+from signals.monitor import SignalMonitor
+
 
 # ============================================================
 # LOGGING
@@ -90,6 +93,72 @@ last_sent_signals = {}
 # ============================================================
 
 scanner_task = None
+
+
+# ============================================================
+# TRACKER DES SIGNAUX
+# ============================================================
+
+signal_tracker = SignalTracker()
+
+
+# ============================================================
+# APPLICATION TELEGRAM COURANTE
+# ============================================================
+
+telegram_application = None
+
+
+# ============================================================
+# MONITEUR DES SIGNAUX
+# ============================================================
+
+async def send_monitor_notification(
+    message: str,
+):
+    """
+    Envoie une notification générée par le SignalMonitor.
+    """
+
+    global telegram_application
+
+    if telegram_application is None:
+
+        logger.warning(
+            "Application Telegram indisponible "
+            "pour notification du tracker."
+        )
+
+        return
+
+    if not TELEGRAM_CHAT_ID:
+
+        logger.warning(
+            "TELEGRAM_CHAT_ID absente. "
+            "Notification tracker non envoyée."
+        )
+
+        return
+
+    try:
+
+        await telegram_application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=message,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Erreur notification SignalMonitor : %s",
+            exc,
+        )
+
+
+signal_monitor = SignalMonitor(
+    tracker=signal_tracker,
+    telegram_sender=send_monitor_notification,
+)
 
 
 # ============================================================
@@ -234,18 +303,6 @@ def format_score(value):
 def format_news(news) -> str:
     """
     Normalise tous les formats possibles du filtre économique.
-
-    Formats acceptés :
-
-    {
-        "blocked": False,
-        "status": "CLEAR",
-        "checked": True
-    }
-
-    ou ancien format texte :
-
-    "NOT CHECKED"
     """
 
     # --------------------------------------------------------
@@ -273,7 +330,6 @@ def format_news(news) -> str:
             False,
         )
 
-        # News HIGH IMPACT détectée
         if blocked:
 
             return (
@@ -281,21 +337,18 @@ def format_news(news) -> str:
                 "⚠️ NEWS HIGH IMPACT À PROXIMITÉ"
             )
 
-        # Aucune news dangereuse
         if status == "CLEAR":
 
             return (
                 "🟢 AUCUNE NEWS HIGH IMPACT"
             )
 
-        # Filtre désactivé
         if status == "DISABLED":
 
             return (
                 "⚪ FILTRE NEWS DÉSACTIVÉ"
             )
 
-        # Données vérifiées mais statut différent
         if checked:
 
             if status:
@@ -342,10 +395,6 @@ def format_news(news) -> str:
             )
 
         return str(news)
-
-    # --------------------------------------------------------
-    # Valeur inconnue
-    # --------------------------------------------------------
 
     return "🟡 STATUT NEWS INCONNU"
 
@@ -689,7 +738,6 @@ def is_valid_automatic_signal(
 
     # --------------------------------------------------------
     # ALIGNEMENT PRINCIPAL
-    # H4 + H1 + M15
     # --------------------------------------------------------
 
     if not (
@@ -734,7 +782,7 @@ def is_valid_automatic_signal(
         return False
 
     # --------------------------------------------------------
-    # M5 volontairement NON BLOQUANT
+    # M5 NON BLOQUANT
     # --------------------------------------------------------
 
     return True
@@ -846,6 +894,29 @@ async def send_signal_to_channel(
 
         return False
 
+    # ========================================================
+    # RÉCUPÉRATION DU SIGNAL EXACT
+    # ========================================================
+
+    signal = result.get(
+        "signal"
+    )
+
+    if signal is None:
+
+        logger.error(
+            "Signal validé mais objet Signal absent "
+            "du résultat pour %s %s.",
+            result.get("symbol"),
+            result.get("direction"),
+        )
+
+        return False
+
+    # ========================================================
+    # FORMATAGE
+    # ========================================================
+
     text = format_analysis(
         result
     )
@@ -857,19 +928,37 @@ async def send_signal_to_channel(
 
     try:
 
+        # ----------------------------------------------------
+        # 1. PUBLICATION TELEGRAM
+        # ----------------------------------------------------
+
         await application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=text,
         )
 
+        # ----------------------------------------------------
+        # 2. MARQUAGE ENVOYÉ
+        # ----------------------------------------------------
+
         mark_signal_as_sent(
             result
         )
 
+        # ----------------------------------------------------
+        # 3. ENREGISTREMENT TRACKER
+        # ----------------------------------------------------
+
+        signal_monitor.register(
+            signal
+        )
+
         logger.info(
-            "SIGNAL ENVOYÉ : %s %s",
+            "SIGNAL ENVOYÉ ET ENREGISTRÉ : "
+            "%s %s | ID=%s",
             result.get("symbol"),
             result.get("direction"),
+            signal.signal_id,
         )
 
         return True
@@ -1059,6 +1148,27 @@ async def post_init(
 ):
 
     global scanner_task
+    global telegram_application
+
+    # --------------------------------------------------------
+    # Référence application Telegram
+    # --------------------------------------------------------
+
+    telegram_application = application
+
+    # --------------------------------------------------------
+    # Démarrage du Signal Monitor
+    # --------------------------------------------------------
+
+    signal_monitor.start()
+
+    logger.info(
+        "Signal Monitor démarré."
+    )
+
+    # --------------------------------------------------------
+    # Démarrage scanner automatique
+    # --------------------------------------------------------
 
     if scanner_task is not None:
 
@@ -1085,25 +1195,50 @@ async def post_shutdown(
 ):
 
     global scanner_task
+    global telegram_application
 
-    if scanner_task is None:
-        return
+    # --------------------------------------------------------
+    # Arrêt du scanner
+    # --------------------------------------------------------
 
-    logger.info(
-        "Arrêt du scanner..."
-    )
+    if scanner_task is not None:
 
-    scanner_task.cancel()
+        logger.info(
+            "Arrêt du scanner..."
+        )
+
+        scanner_task.cancel()
+
+        try:
+
+            await scanner_task
+
+        except asyncio.CancelledError:
+
+            pass
+
+        scanner_task = None
+
+    # --------------------------------------------------------
+    # Arrêt du Signal Monitor
+    # --------------------------------------------------------
 
     try:
 
-        await scanner_task
+        await signal_monitor.stop()
 
-    except asyncio.CancelledError:
+    except Exception as exc:
 
-        pass
+        logger.exception(
+            "Erreur arrêt Signal Monitor : %s",
+            exc,
+        )
 
-    scanner_task = None
+    telegram_application = None
+
+    logger.info(
+        "NOVA TRADE AI arrêté."
+    )
 
 
 # ============================================================
@@ -1123,6 +1258,12 @@ async def start(
         "Score ≥ 60 → validation\n"
         "RR ≥ 2 → validation\n"
         "News HIGH → filtre de sécurité\n\n"
+        "📡 Les signaux envoyés sont désormais "
+        "automatiquement suivis.\n\n"
+        "📈 Progression en R\n"
+        "🛡️ Break-Even\n"
+        "🎯 TP\n"
+        "🛑 SL\n\n"
         "Les setups validés peuvent être "
         "envoyés automatiquement.",
         reply_markup=main_menu(),
@@ -1148,7 +1289,12 @@ async def help_command(
         "Score ≥ 60.\n"
         "RR ≥ 2.\n"
         "M5 est non bloquant.\n"
-        "Les news économiques servent de filtre.",
+        "Les news économiques servent de filtre.\n\n"
+        "📡 Chaque signal automatique envoyé "
+        "est enregistré dans le tracker.\n\n"
+        "Le prix est ensuite surveillé "
+        "automatiquement."
+        ,
         reply_markup=main_menu(),
     )
 
@@ -1184,6 +1330,11 @@ async def about(
         "Score → validation finale\n"
         "RR minimum → 2.0\n"
         "News → filtre de sécurité\n\n"
+        "📡 Signal Tracker → ACTIF\n"
+        "📡 Signal Monitor → ACTIF\n"
+        "📈 Suivi R → ACTIF\n"
+        "🛡️ Break-Even → ACTIF\n"
+        "🎯 TP / 🛑 SL → ACTIFS\n\n"
         f"Seuil signal : "
         f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
         f"Risque/trade : "
@@ -1195,7 +1346,9 @@ async def about(
         f"Canal Telegram : "
         f"{channel_status}\n"
         f"Intervalle scan : "
-        f"{SCAN_INTERVAL_SECONDS}s",
+        f"{SCAN_INTERVAL_SECONDS}s\n"
+        f"Intervalle suivi : "
+        f"{CONFIG.TRACKING_INTERVAL_SECONDS}s",
         reply_markup=main_menu(),
     )
 
@@ -1221,6 +1374,10 @@ async def status(
         else "🔴 DÉSACTIVÉ"
     )
 
+    active_count = len(
+        signal_tracker.active_signals()
+    )
+
     await update.message.reply_text(
         "📊 NOVA TRADE AI — STATUT\n\n"
         "🟢 Telegram : CONNECTÉ\n"
@@ -1233,6 +1390,10 @@ async def status(
         "🟢 Score : ACTIF\n"
         "🟢 RR : ACTIF\n"
         "🟢 News : FILTRE DE SÉCURITÉ\n"
+        "🟢 Signal Tracker : ACTIF\n"
+        "🟢 Signal Monitor : ACTIF\n"
+        f"📡 Signaux actuellement suivis : "
+        f"{active_count}\n"
         f"{auto_status} Scanner automatique\n"
         f"{channel_status} Telegram\n"
         "\n"
@@ -1244,8 +1405,10 @@ async def status(
         f"{CONFIG.DEFAULT_RISK_PERCENT}%\n"
         f"Symboles : "
         f"{len(ALL_SYMBOLS)}\n"
-        f"Intervalle : "
+        f"Intervalle scan : "
         f"{SCAN_INTERVAL_SECONDS}s\n"
+        f"Intervalle suivi : "
+        f"{CONFIG.TRACKING_INTERVAL_SECONDS}s\n"
         f"Exécution automatique : "
         f"{CONFIG.AUTO_EXECUTION_ENABLED}",
         reply_markup=main_menu(),
@@ -1402,6 +1565,10 @@ async def button_handler(
 
     if data == "menu_status":
 
+        active_count = len(
+            signal_tracker.active_signals()
+        )
+
         await query.edit_message_text(
             "📊 NOVA TRADE AI — STATUT\n\n"
             "🟢 Telegram : CONNECTÉ\n"
@@ -1413,6 +1580,9 @@ async def button_handler(
             "🟢 Score : ACTIF\n"
             "🟢 RR : ACTIF\n"
             "🟢 News : FILTRE DE SÉCURITÉ\n"
+            "🟢 Signal Tracker : ACTIF\n"
+            "🟢 Signal Monitor : ACTIF\n"
+            f"📡 Signaux suivis : {active_count}\n"
             f"🟢 Scanner : "
             f"{'ACTIF' if AUTO_SIGNAL_ENABLED else 'ARRÊTÉ'}\n"
             f"Canal : "
@@ -1421,8 +1591,10 @@ async def button_handler(
             f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
             f"RR minimum : "
             f"{CONFIG.MINIMUM_RR}\n"
-            f"Intervalle : "
-            f"{SCAN_INTERVAL_SECONDS}s",
+            f"Intervalle scan : "
+            f"{SCAN_INTERVAL_SECONDS}s\n"
+            f"Intervalle suivi : "
+            f"{CONFIG.TRACKING_INTERVAL_SECONDS}s",
             reply_markup=main_menu(),
         )
 
@@ -1440,6 +1612,11 @@ async def button_handler(
             "Score → Validation\n"
             "RR → Validation\n"
             "News → Filtre de sécurité\n\n"
+            "📡 Signal Tracker → ACTIF\n"
+            "📡 Signal Monitor → ACTIF\n"
+            "📈 Suivi de progression → ACTIF\n"
+            "🛡️ Break-Even → ACTIF\n"
+            "🎯 TP / 🛑 SL → ACTIFS\n\n"
             "M5 non confirmé ≠ rejet automatique.\n\n"
             "Les setups validés peuvent être "
             "publiés automatiquement.\n\n"
@@ -1461,7 +1638,13 @@ async def button_handler(
             "6️⃣ Vérification RR\n"
             "7️⃣ M5 secondaire\n"
             "8️⃣ Filtre économique\n"
-            "9️⃣ Publication automatique\n\n"
+            "9️⃣ Publication automatique\n"
+            "🔟 Suivi automatique du signal\n\n"
+            "Le tracker surveille :\n"
+            "📈 +R\n"
+            "🛡️ Break-Even\n"
+            "🎯 TP\n"
+            "🛑 SL\n\n"
             "M5 non confirmé ≠ rejet automatique.",
             reply_markup=main_menu(),
         )
@@ -1629,6 +1812,19 @@ def run_bot():
             if AUTO_SIGNAL_ENABLED
             else "DÉSACTIVÉ"
         ),
+    )
+
+    logger.info(
+        "Signal Tracker : ACTIF"
+    )
+
+    logger.info(
+        "Signal Monitor : ACTIF"
+    )
+
+    logger.info(
+        "Intervalle suivi : %s secondes",
+        CONFIG.TRACKING_INTERVAL_SECONDS,
     )
 
     logger.info(
