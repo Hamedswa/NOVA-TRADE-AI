@@ -12,19 +12,32 @@ H1 + M15
     ↓
 STRUCTURE / ZONE
 
+D1 + H4 + H1 + M15
+    ↓
+VALIDATION PRINCIPALE DU SETUP
+
 M5
     ↓
-CONFIRMATION
+CONFIRMATION SECONDAIRE
+    ↓
+NON BLOQUANTE
 
 SCORE
     ↓
 RR / SL / TP
+    ↓
+HORAIRES DU MARCHÉ
     ↓
 DECISION
     ↓
 SIGNAL
 
 Aucune execution reelle d'ordre.
+
+IMPORTANT :
+M5 ne bloque plus un setup lorsque D1/H4/H1/M15
+sont parfaitement alignés.
+
 News economiques non integrees pour le moment.
 """
 
@@ -45,6 +58,11 @@ from analysis.trend import (
 )
 
 from market_data import get_candles
+
+from market_hours import (
+    is_market_open,
+    is_market_closing_soon,
+)
 
 from scoring.score_engine import (
     calculate_score,
@@ -88,7 +106,10 @@ def _candle_value(
         return float(default)
 
     if isinstance(candle, dict):
-        value = candle.get(field, default)
+        value = candle.get(
+            field,
+            default,
+        )
 
     else:
         value = getattr(
@@ -337,7 +358,10 @@ def calculate_structure_strength(
         + lower_lows
     )
 
-    total = bullish + bearish
+    total = (
+        bullish
+        + bearish
+    )
 
     if total == 0:
         return 0.0
@@ -1013,16 +1037,24 @@ def build_m5_confirmation(
 
 # ============================================================
 # VALIDATION M5
+#
+# M5 reste une confirmation technique.
+#
+# IMPORTANT :
+# Cette fonction NE décide PLUS si le setup global
+# doit être envoyé.
+#
+# Elle sert uniquement à savoir si M5 est confirmé.
 # ============================================================
 
 def confirmation_valid(
     confirmation: Confirmation,
 ) -> bool:
 
-    # ========================================================
-    # CONFIRMATION 1
+    # --------------------------------------------------------
+    # Confirmation 1 :
     # Micro BOS + bougie
-    # ========================================================
+    # --------------------------------------------------------
 
     if (
         confirmation.micro_bos
@@ -1031,10 +1063,10 @@ def confirmation_valid(
 
         return True
 
-    # ========================================================
-    # CONFIRMATION 2
+    # --------------------------------------------------------
+    # Confirmation 2 :
     # Sweep + rejet + bougie
-    # ========================================================
+    # --------------------------------------------------------
 
     if (
         confirmation.liquidity_sweep
@@ -1044,10 +1076,10 @@ def confirmation_valid(
 
         return True
 
-    # ========================================================
-    # CONFIRMATION 3
+    # --------------------------------------------------------
+    # Confirmation 3 :
     # Retest + rejet + bougie
-    # ========================================================
+    # --------------------------------------------------------
 
     if (
         confirmation.retest
@@ -1201,7 +1233,14 @@ def determine_status(
     score: float,
     confirmation: Confirmation,
     rr: float,
+    setup_aligned: bool = False,
+    market_open: bool = True,
+    market_closing_soon: bool = False,
 ) -> Tuple[str, str]:
+
+    # --------------------------------------------------------
+    # DIRECTION
+    # --------------------------------------------------------
 
     if direction == Direction.NEUTRAL:
 
@@ -1209,6 +1248,47 @@ def determine_status(
             "REJECT",
             "Aucune direction valide.",
         )
+
+    # --------------------------------------------------------
+    # ALIGNEMENT PRINCIPAL
+    #
+    # D1 + H4 + H1 + M15
+    # --------------------------------------------------------
+
+    if not setup_aligned:
+
+        return (
+            "REJECT",
+            (
+                "D1/H4/H1/M15 ne sont pas "
+                "parfaitement alignés."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # MARCHÉ
+    # --------------------------------------------------------
+
+    if not market_open:
+
+        return (
+            "REJECT",
+            "Marché fermé. Aucun nouveau signal.",
+        )
+
+    if market_closing_soon:
+
+        return (
+            "REJECT",
+            (
+                "Marché proche de la fermeture. "
+                "Nouveau signal bloqué."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # RR
+    # --------------------------------------------------------
 
     if rr < MIN_RR:
 
@@ -1222,17 +1302,9 @@ def determine_status(
             ),
         )
 
-    if not confirmation_valid(
-        confirmation
-    ):
-
-        return (
-            "REJECT",
-            (
-                "La confirmation M5 complète "
-                "n'est pas validée."
-            ),
-        )
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
 
     if not should_send_signal(
         score,
@@ -1247,9 +1319,30 @@ def determine_status(
             ),
         )
 
+    # --------------------------------------------------------
+    # M5
+    #
+    # M5 N'EST PLUS BLOQUANT.
+    # --------------------------------------------------------
+
+    if confirmation_valid(
+        confirmation
+    ):
+
+        return (
+            "ACTIVE",
+            (
+                "Setup D1/H4/H1/M15 validé "
+                "avec confirmation M5."
+            ),
+        )
+
     return (
         "ACTIVE",
-        "Setup multi-timeframe validé.",
+        (
+            "Setup D1/H4/H1/M15 validé. "
+            "M5 non confirmé mais non bloquant."
+        ),
     )
 
 
@@ -1448,9 +1541,6 @@ def analyze_market(
 
     else:
 
-        # Le score reste calculé même si M5
-        # n'est pas encore confirmé.
-
         score = calculate_score(
             trend=trend,
             zone=zone,
@@ -1470,56 +1560,84 @@ def analyze_market(
     )
 
     # ========================================================
-    # 8. STATUS
+    # 8. ALIGNEMENT PRINCIPAL
+    #
+    # LES 4 TIMEFRAMES DOIVENT ÊTRE ALIGNÉS.
+    #
+    # D1 = H4 = H1 = M15
     # ========================================================
 
-    if not trend_aligned:
-
-        status = "REJECT"
-
-        reason = (
-            "D1 et H4 ne sont pas alignés."
-        )
-
-    elif not h1_confirms:
-
-        status = "REJECT"
-
-        reason = (
-            "H1 ne confirme pas "
-            "D1/H4."
-        )
-
-    elif not m15_confirms:
-
-        status = "REJECT"
-
-        reason = (
-            "M15 ne confirme pas "
-            "D1/H4."
-        )
-
-    else:
-
-        status, reason = determine_status(
-            direction=direction,
-            score=score,
-            confirmation=confirmation,
-            rr=rr,
-        )
+    setup_aligned = (
+        d1_direction
+        != Direction.NEUTRAL
+        and h4_direction
+        != Direction.NEUTRAL
+        and h1_direction
+        != Direction.NEUTRAL
+        and m15_direction
+        != Direction.NEUTRAL
+        and d1_direction
+        == h4_direction
+        and h4_direction
+        == h1_direction
+        and h1_direction
+        == m15_direction
+    )
 
     # ========================================================
-    # 9. CRÉATION DU SIGNAL
+    # 9. HORAIRES DU MARCHÉ
+    # ========================================================
+
+    market_open = is_market_open(
+        symbol
+    )
+
+    market_closing_soon = (
+        is_market_closing_soon(
+            symbol
+        )
+        if market_open
+        else False
+    )
+
+    # ========================================================
+    # 10. STATUS
+    # ========================================================
+
+    status, reason = determine_status(
+        direction=direction,
+        score=score,
+        confirmation=confirmation,
+        rr=rr,
+        setup_aligned=setup_aligned,
+        market_open=market_open,
+        market_closing_soon=market_closing_soon,
+    )
+
+    # ========================================================
+    # 11. CRÉATION DU SIGNAL
+    #
+    # IMPORTANT :
+    # M5 N'EST PAS REQUIS ICI.
+    #
+    # Le signal peut être créé lorsque :
+    #
+    # D1 = H4 = H1 = M15
+    # Score >= 60
+    # RR >= 2
+    # Marché ouvert
+    # Pas de fermeture imminente
+    #
+    # M5 peut être CONFIRMED ou NOT CONFIRMED.
     # ========================================================
 
     signal = None
 
     if (
         status == "ACTIVE"
-        and trend_aligned
-        and h1_confirms
-        and m15_confirms
-        and m5_valid
+        and setup_aligned
+        and market_open
+        and not market_closing_soon
         and sl is not None
         and tp is not None
         and rr >= MIN_RR
@@ -1538,10 +1656,6 @@ def analyze_market(
             session_ok=True,
         )
 
-        # Sécurité supplémentaire :
-        # si build_signal refuse le setup,
-        # aucun signal n'est créé.
-
         if signal is None:
 
             status = "REJECT"
@@ -1553,7 +1667,7 @@ def analyze_market(
             )
 
     # ========================================================
-    # 10. RESULTAT
+    # 12. RESULTAT
     # ========================================================
 
     return {
@@ -1570,10 +1684,11 @@ def analyze_market(
 
         "reason": reason,
 
-        # Objet Signal.
-        # None lorsque le setup n'est pas ACTIVE.
-
         "signal": signal,
+
+        # ====================================================
+        # TENDANCE
+        # ====================================================
 
         "trend": {
 
@@ -1593,6 +1708,10 @@ def analyze_market(
                 trend_aligned,
         },
 
+        # ====================================================
+        # ZONES
+        # ====================================================
+
         "zones": {
 
             "H1":
@@ -1609,7 +1728,14 @@ def analyze_market(
 
             "structure_confirmed":
                 zone.structure_confirmed,
+
+            "setup_aligned":
+                setup_aligned,
         },
+
+        # ====================================================
+        # M5
+        # ====================================================
 
         "confirmation": {
 
@@ -1637,7 +1763,14 @@ def analyze_market(
 
             "valid":
                 m5_valid,
+
+            "blocking":
+                False,
         },
+
+        # ====================================================
+        # TRADE
+        # ====================================================
 
         "trade": {
 
@@ -1654,8 +1787,40 @@ def analyze_market(
                 rr,
         },
 
+        # ====================================================
+        # MARCHÉ
+        # ====================================================
+
+        "market": {
+
+            "open":
+                market_open,
+
+            "closing_soon":
+                market_closing_soon,
+
+            "status":
+                (
+                    "CLOSING_SOON"
+                    if market_closing_soon
+                    else (
+                        "OPEN"
+                        if market_open
+                        else "CLOSED"
+                    )
+                ),
+        },
+
+        # ====================================================
+        # NEWS
+        # ====================================================
+
         "news":
             "NOT CHECKED",
+
+        # ====================================================
+        # EXECUTION
+        # ====================================================
 
         "execution": {
 
