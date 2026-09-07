@@ -30,22 +30,40 @@ SCORE
     ↓
 HORAIRES DU MARCHÉ
     ↓
+NEWS ÉCONOMIQUES
+    ↓
 DECISION
     ↓
 SIGNAL
 
 Aucune exécution réelle d'ordre.
 
-IMPORTANT :
-M5 ne bloque jamais un setup lorsque
-H4/H1/M15 sont parfaitement alignés.
+RÈGLES PRINCIPALES :
 
-News économiques non intégrées pour le moment.
+1. H4 + H1 + M15 doivent être parfaitement alignés.
+2. D1 n'est plus utilisé.
+3. M5 est une confirmation secondaire.
+4. M5 ne peut jamais rejeter un setup H4/H1/M15 valide.
+5. Score minimum : 60.
+6. RR minimum : 2.0.
+7. Le marché doit être ouvert.
+8. Le marché ne doit pas être proche de la fermeture.
+9. Une annonce économique HIGH IMPACT dans la fenêtre
+   de protection bloque la création d'un nouveau signal.
+10. Aucune exécution réelle d'ordre.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import time
+
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 from core.models import (
     Confirmation,
@@ -73,6 +91,11 @@ from scoring.score_engine import (
 
 from signals.signal_engine import build_signal
 
+from economic_calendar import (
+    economic_filter,
+    update_economic_calendar,
+)
+
 
 # ============================================================
 # CONFIGURATION
@@ -90,6 +113,105 @@ MIN_RR = 2.0
 
 SIGNAL_THRESHOLD = 60.0
 
+# Rafraîchissement du calendrier économique.
+#
+# Important :
+# Le scanner peut analyser plusieurs symboles à la suite.
+# On évite donc de faire une requête Finnhub pour chaque symbole.
+NEWS_REFRESH_SECONDS = 60.0
+
+_last_news_refresh = 0.0
+
+
+# ============================================================
+# CALENDRIER ÉCONOMIQUE
+# ============================================================
+
+def _refresh_news_calendar() -> None:
+    """
+    Rafraîchit le calendrier économique avec un cache court.
+
+    Le scanner peut analyser plusieurs marchés consécutivement.
+    Le calendrier n'est donc pas interrogé inutilement pour
+    chaque symbole.
+    """
+
+    global _last_news_refresh
+
+    now = time.monotonic()
+
+    if (
+        now - _last_news_refresh
+        < NEWS_REFRESH_SECONDS
+    ):
+        return
+
+    try:
+
+        update_economic_calendar()
+
+        _last_news_refresh = now
+
+    except Exception:
+        """
+        Le module economic_calendar possède déjà sa propre
+        gestion des erreurs et son cache.
+
+        On ne fait pas tomber toute l'analyse si le calendrier
+        rencontre momentanément un problème.
+        """
+
+        _last_news_refresh = now
+
+
+def _check_economic_news(
+    symbol: str,
+) -> Tuple[bool, str]:
+    """
+    Vérifie si une annonce HIGH IMPACT bloque le nouveau signal.
+
+    Retourne :
+
+        (True, raison)
+            => entrée bloquée
+
+        (False, statut)
+            => entrée autorisée
+    """
+
+    try:
+
+        _refresh_news_calendar()
+
+        blocked, reason = economic_filter(
+            symbol
+        )
+
+        if blocked:
+
+            return (
+                True,
+                str(reason),
+            )
+
+        return (
+            False,
+            "CLEAR",
+        )
+
+    except Exception as exc:
+
+        # Le filtre économique ne doit pas provoquer
+        # un crash complet du pipeline.
+        #
+        # Le module economic_calendar conserve déjà son
+        # dernier cache valide en cas d'erreur API.
+
+        return (
+            False,
+            f"UNAVAILABLE: {exc}",
+        )
+
 
 # ============================================================
 # OUTILS CANDLES
@@ -105,11 +227,14 @@ def _candle_value(
         return float(default)
 
     if isinstance(candle, dict):
+
         value = candle.get(
             field,
             default,
         )
+
     else:
+
         value = getattr(
             candle,
             field,
@@ -117,12 +242,14 @@ def _candle_value(
         )
 
     try:
+
         return float(value)
 
     except (
         TypeError,
         ValueError,
     ):
+
         return float(default)
 
 
@@ -189,7 +316,10 @@ def detect_swing_highs(
             current >= max(left)
             and current >= max(right)
         ):
-            swings.append(current)
+
+            swings.append(
+                current
+            )
 
     return swings
 
@@ -231,7 +361,10 @@ def detect_swing_lows(
             current <= min(left)
             and current <= min(right)
         ):
-            swings.append(current)
+
+            swings.append(
+                current
+            )
 
     return swings
 
@@ -244,9 +377,13 @@ def _count_structure(
     candles: List[Any],
 ) -> Tuple[int, int, int, int]:
 
-    highs = detect_swing_highs(candles)
+    highs = detect_swing_highs(
+        candles
+    )
 
-    lows = detect_swing_lows(candles)
+    lows = detect_swing_lows(
+        candles
+    )
 
     higher_highs = 0
     lower_highs = 0
@@ -262,9 +399,11 @@ def _count_structure(
         ):
 
             if current > previous:
+
                 higher_highs += 1
 
             elif current < previous:
+
                 lower_highs += 1
 
     if len(lows) >= 2:
@@ -275,9 +414,11 @@ def _count_structure(
         ):
 
             if current > previous:
+
                 higher_lows += 1
 
             elif current < previous:
+
                 lower_lows += 1
 
     return (
@@ -297,7 +438,9 @@ def determine_direction_from_candles(
         higher_lows,
         lower_highs,
         lower_lows,
-    ) = _count_structure(candles)
+    ) = _count_structure(
+        candles
+    )
 
     return detect_direction_from_structure(
         higher_highs,
@@ -320,7 +463,9 @@ def calculate_structure_strength(
         higher_lows,
         lower_highs,
         lower_lows,
-    ) = _count_structure(candles)
+    ) = _count_structure(
+        candles
+    )
 
     bullish = (
         higher_highs
@@ -338,6 +483,7 @@ def calculate_structure_strength(
     )
 
     if total == 0:
+
         return 0.0
 
     dominant = max(
@@ -382,6 +528,7 @@ def is_primary_alignment_valid(
         direction == Direction.NEUTRAL
         for direction in directions
     ):
+
         return False
 
     return (
@@ -405,6 +552,7 @@ def determine_primary_direction(
         h1=h1,
         m15=m15,
     ):
+
         return Direction.NEUTRAL
 
     return h4
@@ -423,9 +571,10 @@ def build_multitimeframe_context(
     m15_strength: float,
 ) -> TrendContext:
     """
-    TrendContext représente maintenant H4 uniquement.
+    TrendContext représente H4 uniquement.
 
-    H1 et M15 sont validés séparément dans le pipeline.
+    H1 et M15 sont validés séparément
+    dans le pipeline principal.
     """
 
     _ = (
@@ -459,6 +608,7 @@ def calculate_atr(
     if len(candles) < (
         period + 1
     ):
+
         return 0.0
 
     true_ranges: List[float] = []
@@ -506,6 +656,7 @@ def calculate_atr(
         )
 
     if len(true_ranges) < period:
+
         return 0.0
 
     return (
@@ -610,9 +761,11 @@ def detect_candle_confirmation(
 ) -> bool:
 
     if len(candles) < 2:
+
         return False
 
     previous = candles[-2]
+
     current = candles[-1]
 
     previous_open = _candle_value(
@@ -661,6 +814,7 @@ def detect_candle_confirmation(
     )
 
     if current_range <= 0:
+
         return False
 
     current_body = abs(
@@ -753,6 +907,7 @@ def detect_micro_bos(
     if len(candles) < (
         lookback + 2
     ):
+
         return False
 
     previous = candles[
@@ -804,6 +959,7 @@ def detect_liquidity_sweep(
     if len(candles) < (
         lookback + 2
     ):
+
         return False
 
     previous = candles[
@@ -866,6 +1022,7 @@ def detect_rejection(
 ) -> bool:
 
     if not candles:
+
         return False
 
     candle = candles[-1]
@@ -895,6 +1052,7 @@ def detect_rejection(
     )
 
     if candle_range <= 0:
+
         return False
 
     body = abs(
@@ -946,6 +1104,7 @@ def detect_retest(
 ) -> bool:
 
     if len(candles) < 4:
+
         return False
 
     previous = candles[-4:-1]
@@ -1063,6 +1222,7 @@ def confirmation_valid(
         confirmation.micro_bos
         and confirmation.candle_confirmation
     ):
+
         return True
 
     if (
@@ -1070,6 +1230,7 @@ def confirmation_valid(
         and confirmation.rejection
         and confirmation.candle_confirmation
     ):
+
         return True
 
     if (
@@ -1077,6 +1238,7 @@ def confirmation_valid(
         and confirmation.rejection
         and confirmation.candle_confirmation
     ):
+
         return True
 
     return False
@@ -1176,11 +1338,13 @@ def calculate_trade_levels(
     if direction == Direction.BUY:
 
         risk = entry - sl
+
         reward = tp - entry
 
     else:
 
         risk = sl - entry
+
         reward = entry - tp
 
     if risk <= 0:
@@ -1214,6 +1378,8 @@ def determine_status(
     setup_aligned: bool = False,
     market_open: bool = True,
     market_closing_soon: bool = False,
+    news_blocked: bool = False,
+    news_reason: str = "",
 ) -> Tuple[str, str]:
 
     if direction == Direction.NEUTRAL:
@@ -1247,6 +1413,16 @@ def determine_status(
             (
                 "Marché proche de la fermeture. "
                 "Nouveau signal bloqué."
+            ),
+        )
+
+    if news_blocked:
+
+        return (
+            "NEWS_BLOCKED",
+            (
+                "Annonce économique HIGH IMPACT. "
+                f"{news_reason}"
             ),
         )
 
@@ -1322,29 +1498,32 @@ def analyze_market(
         "M15",
     )
 
+    # M5 est secondaire.
+    #
+    # Il peut être absent temporairement sans invalider
+    # le setup principal H4/H1/M15.
+
     m5 = get_candles(
         symbol,
         "M5",
     )
 
     if not h4:
+
         raise RuntimeError(
             f"Aucune donnée H4 pour {symbol}."
         )
 
     if not h1:
+
         raise RuntimeError(
             f"Aucune donnée H1 pour {symbol}."
         )
 
     if not m15:
+
         raise RuntimeError(
             f"Aucune donnée M15 pour {symbol}."
-        )
-
-    if not m5:
-        raise RuntimeError(
-            f"Aucune donnée M5 pour {symbol}."
         )
 
     # ========================================================
@@ -1435,10 +1614,19 @@ def analyze_market(
     # Confirmation secondaire uniquement.
     # ========================================================
 
-    confirmation = build_m5_confirmation(
-        m5,
-        direction,
-    )
+    if m5:
+
+        confirmation = build_m5_confirmation(
+            m5,
+            direction,
+        )
+
+    else:
+
+        confirmation = build_m5_confirmation(
+            [],
+            direction,
+        )
 
     m5_valid = confirmation_valid(
         confirmation
@@ -1446,7 +1634,18 @@ def analyze_market(
 
     # ========================================================
     # 10. SL / TP / RR
+    #
+    # Le M5 est utilisé comme source d'entrée lorsqu'il
+    # est disponible.
+    #
+    # Si M5 est indisponible, on utilise M15.
     # ========================================================
+
+    trade_candles = (
+        m5
+        if m5
+        else m15
+    )
 
     (
         entry,
@@ -1454,7 +1653,7 @@ def analyze_market(
         tp,
         rr,
     ) = calculate_trade_levels(
-        m5,
+        trade_candles,
         direction,
     )
 
@@ -1501,7 +1700,21 @@ def analyze_market(
     )
 
     # ========================================================
-    # 13. STATUS
+    # 13. NEWS ÉCONOMIQUES
+    #
+    # Le calendrier est vérifié avant la décision finale.
+    # Une HIGH IMPACT pertinente bloque uniquement
+    # la création d'un NOUVEAU signal.
+    # ========================================================
+
+    news_blocked, news_status = (
+        _check_economic_news(
+            symbol
+        )
+    )
+
+    # ========================================================
+    # 14. STATUS
     # ========================================================
 
     status, reason = determine_status(
@@ -1512,12 +1725,20 @@ def analyze_market(
         setup_aligned=setup_aligned,
         market_open=market_open,
         market_closing_soon=market_closing_soon,
+        news_blocked=news_blocked,
+        news_reason=news_status,
     )
 
     # ========================================================
-    # 14. CRÉATION DU SIGNAL
+    # 15. CRÉATION DU SIGNAL
     #
-    # H4/H1/M15 sont transmis explicitement.
+    # Le signal n'est créé que si :
+    #
+    # H4/H1/M15 alignés
+    # Score >= 60
+    # RR >= 2
+    # Marché ouvert
+    # Pas de HIGH IMPACT bloquante
     #
     # M5 reste NON BLOQUANT.
     # ========================================================
@@ -1557,7 +1778,7 @@ def analyze_market(
             )
 
     # ========================================================
-    # 15. RESULTAT
+    # 16. RESULTAT
     # ========================================================
 
     return {
@@ -1649,6 +1870,9 @@ def analyze_market(
                     else "NOT CONFIRMED"
                 ),
 
+            "available":
+                bool(m5),
+
             "retest":
                 confirmation.retest,
 
@@ -1718,8 +1942,21 @@ def analyze_market(
         # NEWS
         # ====================================================
 
-        "news":
-            "NOT CHECKED",
+        "news": {
+
+            "blocked":
+                news_blocked,
+
+            "status":
+                (
+                    "BLOCKED"
+                    if news_blocked
+                    else news_status
+                ),
+
+            "checked":
+                True,
+        },
 
         # ====================================================
         # EXECUTION
