@@ -2,34 +2,25 @@
 NOVA TRADE AI
 market_data.py
 
-MOTEUR CENTRAL DES DONNÉES DE MARCHÉ.
+MOTEUR CENTRAL DES DONNÉES DE MARCHÉ
 
-Objectifs :
-    - Twelve Data
-    - Cache intelligent
-    - Protection anti-429
-    - Réduction massive des requêtes inutiles
-    - Réutilisation contrôlée des dernières données valides
-    - Retry avec backoff
-    - Aucun affichage de clé API
-    - Compatibilité avec analysis/pipeline.py
+Timeframes utilisés par la stratégie :
+    H4  → tendance globale
+    H1  → structure / zones
+    M15 → zones / price action
+    M5  → confirmation secondaire
 
-TIMEFRAMES :
-    D1  -> 1day
-    H4  -> 4h
-    H1  -> 1h
-    M15 -> 15min
-    M5  -> 5min
+D1 n'est PAS utilisé par NOVA TRADE AI.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -37,112 +28,90 @@ from core.models import Candle
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION TWELVE DATA
 # ============================================================
 
 BASE_URL = "https://api.twelvedata.com/time_series"
 
 TIMEFRAME_MAP = {
-    "D1": "1day",
     "H4": "4h",
     "H1": "1h",
     "M15": "15min",
     "M5": "5min",
 }
 
-VALID_TIMEFRAMES = set(
-    TIMEFRAME_MAP.keys()
-)
+VALID_TIMEFRAMES = set(TIMEFRAME_MAP.keys())
 
 REQUEST_TIMEOUT = 15
 
-# Nombre maximum de tentatives pour une erreur temporaire.
 MAX_RETRIES = 3
 
-# Délais entre les tentatives classiques.
-RETRY_DELAYS = (
-    5,
-    15,
-    30,
-)
+RETRY_DELAYS = (5, 15, 30)
 
-# ------------------------------------------------------------
+
+# ============================================================
 # CACHE
-# ------------------------------------------------------------
+# ============================================================
 
-# Cache principal.
-#
-# Les bougies H4/H1/M15 changent beaucoup moins rapidement
-# que M5. On peut donc les conserver plus longtemps.
+# Cache plus long sur les grandes unités de temps.
 CACHE_TTL_SECONDS = {
-    "D1": 900,      # 15 minutes
-    "H4": 600,      # 10 minutes
-    "H1": 300,      # 5 minutes
-    "M15": 120,     # 2 minutes
-    "M5": 60,       # 1 minute
+    "H4": 600,    # 10 minutes
+    "H1": 300,    # 5 minutes
+    "M15": 120,   # 2 minutes
+    "M5": 60,     # 1 minute
 }
 
-# Durée maximale pendant laquelle des données précédemment
-# valides peuvent être utilisées lorsqu'une limitation API
-# temporaire est active.
+# Durée maximale pendant laquelle une ancienne donnée
+# peut être utilisée temporairement en cas de rate limit.
 STALE_CACHE_MAX_AGE_SECONDS = {
-    "D1": 7200,     # 2 heures
-    "H4": 3600,     # 1 heure
-    "H1": 1800,     # 30 minutes
-    "M15": 900,     # 15 minutes
-    "M5": 300,      # 5 minutes
+    "H4": 3600,   # 1 heure
+    "H1": 1800,   # 30 minutes
+    "M15": 900,   # 15 minutes
+    "M5": 300,    # 5 minutes
 }
 
-# Cooldown global après HTTP 429.
-DEFAULT_RATE_LIMIT_COOLDOWN = 60
-
-# Ne jamais attendre des heures dans le processus.
-MAX_RATE_LIMIT_COOLDOWN = 300
-
-# Nombre maximum d'entrées du cache.
-MAX_CACHE_ENTRIES = 500
 
 _CACHE_LOCK = Lock()
 
+# key:
+# (SYMBOL, TIMEFRAME, OUTPUTSIZE)
+#
+# value:
 # {
-#   cache_key: {
-#       "candles": list[Candle],
-#       "saved_at": float,
-#       "last_success": float,
-#   }
+#     "candles": [...],
+#     "timestamp": float
 # }
-_CANDLE_CACHE: dict[
-    tuple[str, str, int],
-    dict,
+_CANDLE_CACHE: Dict[
+    Tuple[str, str, int],
+    Dict[str, object],
 ] = {}
 
-# Dernier moment où Twelve Data a renvoyé 429.
-_RATE_LIMIT_UNTIL = 0.0
 
-# Dernier message 429.
-_RATE_LIMIT_MESSAGE = ""
+# ============================================================
+# RATE LIMIT GLOBAL
+# ============================================================
+
+_RATE_LIMIT_LOCK = Lock()
+
+# Timestamp jusqu'auquel les nouvelles requêtes API
+# sont temporairement bloquées.
+_RATE_LIMIT_UNTIL = 0.0
 
 
 # ============================================================
 # STATISTIQUES
 # ============================================================
 
-@dataclass
-class MarketDataStats:
+_STATS_LOCK = Lock()
 
-    requests_total: int = 0
-    requests_success: int = 0
-
-    rate_limit_count: int = 0
-
-    cache_hits: int = 0
-    stale_cache_hits: int = 0
-    cache_misses: int = 0
-
-    errors: int = 0
-
-
-_STATS = MarketDataStats()
+_STATS = {
+    "api_requests": 0,
+    "cache_hits": 0,
+    "stale_cache_hits": 0,
+    "rate_limit_hits": 0,
+    "errors": 0,
+    "successful_requests": 0,
+}
 
 
 # ============================================================
@@ -150,59 +119,46 @@ _STATS = MarketDataStats()
 # ============================================================
 
 def _get_api_key() -> str:
+    """
+    Récupère la clé Twelve Data depuis l'environnement.
+    """
 
-    api_key = os.getenv(
-        "TWELVE_DATA_API_KEY"
-    )
+    key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
-    if not api_key:
+    if not key:
         raise RuntimeError(
-            "TWELVE_DATA_API_KEY est absente "
-            "des variables d'environnement."
+            "Variable d'environnement TWELVE_DATA_API_KEY absente."
         )
 
-    return api_key.strip()
+    return key
 
 
 # ============================================================
 # TIMEFRAME
 # ============================================================
 
-def _normalize_timeframe(
-    timeframe: str,
-) -> str:
+def _normalize_timeframe(timeframe: str) -> str:
+    """
+    Normalise un timeframe.
 
-    normalized = str(
-        timeframe
-    ).upper().strip()
+    Exemples :
+        h4  -> H4
+        H1  -> H1
+        m15 -> M15
+        m5  -> M5
+    """
 
-    if normalized not in VALID_TIMEFRAMES:
-
+    if not isinstance(timeframe, str):
         raise ValueError(
-            "Timeframe invalide : "
-            f"{timeframe}. "
-            "Valeurs autorisées : "
-            f"{sorted(VALID_TIMEFRAMES)}"
+            "Le timeframe doit être une chaîne de caractères."
         )
 
-    return normalized
+    normalized = timeframe.strip().upper()
 
-
-# ============================================================
-# SYMBOL
-# ============================================================
-
-def _normalize_symbol(
-    symbol: str,
-) -> str:
-
-    normalized = str(
-        symbol
-    ).upper().strip()
-
-    if not normalized:
+    if normalized not in VALID_TIMEFRAMES:
         raise ValueError(
-            "Symbole vide."
+            f"Timeframe invalide : {timeframe}. "
+            f"Valeurs autorisées : {sorted(VALID_TIMEFRAMES)}"
         )
 
     return normalized
@@ -212,28 +168,28 @@ def _normalize_symbol(
 # TIMESTAMP
 # ============================================================
 
-def _parse_timestamp(
-    value: str,
-) -> datetime:
+def _parse_timestamp(value: str) -> datetime:
+    """
+    Convertit un timestamp Twelve Data en datetime UTC.
+    """
 
-    text = str(value).strip()
+    if not isinstance(value, str):
+        raise ValueError(
+            f"Timestamp invalide : {value}"
+        )
+
+    value = value.strip()
 
     formats = (
         "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
         "%Y-%m-%d",
     )
 
     for fmt in formats:
-
         try:
+            dt = datetime.strptime(value, fmt)
 
-            parsed = datetime.strptime(
-                text,
-                fmt,
-            )
-
-            return parsed.replace(
+            return dt.replace(
                 tzinfo=timezone.utc
             )
 
@@ -241,8 +197,189 @@ def _parse_timestamp(
             continue
 
     raise ValueError(
-        f"Timestamp Twelve Data invalide : {value}"
+        f"Format de timestamp inconnu : {value}"
     )
+
+
+# ============================================================
+# CACHE
+# ============================================================
+
+def _cache_key(
+    symbol: str,
+    timeframe: str,
+    outputsize: int,
+) -> Tuple[str, str, int]:
+
+    return (
+        symbol.strip().upper(),
+        timeframe.strip().upper(),
+        int(outputsize),
+    )
+
+
+def _get_cached_candles(
+    symbol: str,
+    timeframe: str,
+    outputsize: int,
+    allow_stale: bool = False,
+) -> Optional[List[Candle]]:
+    """
+    Retourne les données du cache si elles sont encore valides.
+
+    Si allow_stale=True, une donnée plus ancienne peut être
+    retournée en cas de problème API.
+    """
+
+    key = _cache_key(
+        symbol,
+        timeframe,
+        outputsize,
+    )
+
+    now = time.time()
+
+    with _CACHE_LOCK:
+
+        cached = _CANDLE_CACHE.get(key)
+
+        if cached is None:
+            return None
+
+        timestamp = float(
+            cached.get("timestamp", 0.0)
+        )
+
+        candles = cached.get("candles")
+
+        if not isinstance(candles, list):
+            return None
+
+        age = now - timestamp
+
+        ttl = CACHE_TTL_SECONDS.get(
+            timeframe,
+            60,
+        )
+
+        if age <= ttl:
+
+            with _STATS_LOCK:
+                _STATS["cache_hits"] += 1
+
+            return list(candles)
+
+        if allow_stale:
+
+            stale_limit = STALE_CACHE_MAX_AGE_SECONDS.get(
+                timeframe,
+                300,
+            )
+
+            if age <= stale_limit:
+
+                with _STATS_LOCK:
+                    _STATS["stale_cache_hits"] += 1
+
+                return list(candles)
+
+    return None
+
+
+def _set_cached_candles(
+    symbol: str,
+    timeframe: str,
+    outputsize: int,
+    candles: List[Candle],
+) -> None:
+
+    key = _cache_key(
+        symbol,
+        timeframe,
+        outputsize,
+    )
+
+    with _CACHE_LOCK:
+
+        _CANDLE_CACHE[key] = {
+            "candles": list(candles),
+            "timestamp": time.time(),
+        }
+
+
+def clear_cache() -> None:
+    """
+    Vide complètement le cache marché.
+    """
+
+    with _CACHE_LOCK:
+        _CANDLE_CACHE.clear()
+
+
+def clear_symbol_cache(symbol: str) -> None:
+    """
+    Supprime le cache d'un symbole.
+    """
+
+    symbol = symbol.strip().upper()
+
+    with _CACHE_LOCK:
+
+        keys_to_delete = [
+            key
+            for key in _CANDLE_CACHE
+            if key[0] == symbol
+        ]
+
+        for key in keys_to_delete:
+            del _CANDLE_CACHE[key]
+
+
+# ============================================================
+# RATE LIMIT
+# ============================================================
+
+def _is_rate_limited() -> bool:
+
+    with _RATE_LIMIT_LOCK:
+        return time.time() < _RATE_LIMIT_UNTIL
+
+
+def _remaining_rate_limit_seconds() -> int:
+
+    with _RATE_LIMIT_LOCK:
+
+        remaining = _RATE_LIMIT_UNTIL - time.time()
+
+    return max(
+        0,
+        int(round(remaining)),
+    )
+
+
+def _activate_rate_limit(
+    seconds: int,
+) -> None:
+
+    global _RATE_LIMIT_UNTIL
+
+    with _RATE_LIMIT_LOCK:
+
+        new_until = time.time() + max(
+            1,
+            seconds,
+        )
+
+        if new_until > _RATE_LIMIT_UNTIL:
+            _RATE_LIMIT_UNTIL = new_until
+
+
+def _clear_rate_limit() -> None:
+
+    global _RATE_LIMIT_UNTIL
+
+    with _RATE_LIMIT_LOCK:
+        _RATE_LIMIT_UNTIL = 0.0
 
 
 # ============================================================
@@ -252,356 +389,58 @@ def _parse_timestamp(
 def _parse_api_error(
     response: requests.Response,
 ) -> str:
+    """
+    Extrait un message d'erreur propre sans exposer
+    la clé API.
+    """
 
     try:
 
         data = response.json()
 
+        if isinstance(data, dict):
+
+            message = data.get("message")
+
+            if message:
+                return str(message)
+
+            code = data.get("code")
+
+            if code:
+                return f"Code API : {code}"
+
     except Exception:
+        pass
 
-        return (
-            f"HTTP {response.status_code}"
-        )
+    text = response.text.strip()
 
-    if isinstance(data, dict):
+    if text:
+        return text[:300]
 
-        message = data.get(
-            "message"
-        )
-
-        code = data.get(
-            "code"
-        )
-
-        if message and code:
-
-            return (
-                f"{message} "
-                f"(code {code})"
-            )
-
-        if message:
-            return str(message)
-
-    return (
-        f"HTTP {response.status_code}"
-    )
+    return f"HTTP {response.status_code}"
 
 
 # ============================================================
-# RATE LIMIT
-# ============================================================
-
-def _set_rate_limit(
-    retry_after: Optional[int] = None,
-) -> None:
-
-    global _RATE_LIMIT_UNTIL
-    global _RATE_LIMIT_MESSAGE
-
-    now = time.time()
-
-    delay = (
-        retry_after
-        if retry_after is not None
-        else DEFAULT_RATE_LIMIT_COOLDOWN
-    )
-
-    try:
-        delay = int(delay)
-    except (TypeError, ValueError):
-        delay = DEFAULT_RATE_LIMIT_COOLDOWN
-
-    delay = max(
-        1,
-        min(
-            delay,
-            MAX_RATE_LIMIT_COOLDOWN,
-        ),
-    )
-
-    with _CACHE_LOCK:
-
-        _RATE_LIMIT_UNTIL = max(
-            _RATE_LIMIT_UNTIL,
-            now + delay,
-        )
-
-        _RATE_LIMIT_MESSAGE = (
-            "Limite Twelve Data active. "
-            f"Nouvelle tentative dans environ {delay}s."
-        )
-
-        _STATS.rate_limit_count += 1
-
-
-def _rate_limit_remaining() -> int:
-
-    with _CACHE_LOCK:
-
-        remaining = (
-            _RATE_LIMIT_UNTIL
-            - time.time()
-        )
-
-    if remaining <= 0:
-        return 0
-
-    return int(
-        remaining + 0.999
-    )
-
-
-def _rate_limit_active() -> bool:
-
-    return (
-        _rate_limit_remaining()
-        > 0
-    )
-
-
-# ============================================================
-# CACHE KEY
-# ============================================================
-
-def _cache_key(
-    symbol: str,
-    timeframe: str,
-    outputsize: int,
-) -> tuple[str, str, int]:
-
-    return (
-        symbol.upper(),
-        timeframe.upper(),
-        int(outputsize),
-    )
-
-
-# ============================================================
-# CACHE READ
-# ============================================================
-
-def _get_cached_candles(
-    key: tuple[str, str, int],
-    timeframe: str,
-    allow_stale: bool = False,
-) -> Optional[list[Candle]]:
-
-    now = time.time()
-
-    with _CACHE_LOCK:
-
-        item = _CANDLE_CACHE.get(
-            key
-        )
-
-        if not item:
-            _STATS.cache_misses += 1
-            return None
-
-        saved_at = float(
-            item.get(
-                "saved_at",
-                0.0,
-            )
-        )
-
-        candles = item.get(
-            "candles"
-        )
-
-        if not candles:
-            _STATS.cache_misses += 1
-            return None
-
-        age = now - saved_at
-
-        ttl = CACHE_TTL_SECONDS[
-            timeframe
-        ]
-
-        if age <= ttl:
-
-            _STATS.cache_hits += 1
-
-            return list(candles)
-
-        if allow_stale:
-
-            max_age = (
-                STALE_CACHE_MAX_AGE_SECONDS[
-                    timeframe
-                ]
-            )
-
-            if age <= max_age:
-
-                _STATS.stale_cache_hits += 1
-
-                return list(candles)
-
-        _STATS.cache_misses += 1
-
-        return None
-
-
-# ============================================================
-# CACHE WRITE
-# ============================================================
-
-def _save_cache(
-    key: tuple[str, str, int],
-    candles: list[Candle],
-) -> None:
-
-    now = time.time()
-
-    with _CACHE_LOCK:
-
-        _CANDLE_CACHE[key] = {
-            "candles": list(candles),
-            "saved_at": now,
-            "last_success": now,
-        }
-
-        # ----------------------------------------------------
-        # Nettoyage simple si le cache devient trop gros.
-        # ----------------------------------------------------
-
-        if len(_CANDLE_CACHE) > MAX_CACHE_ENTRIES:
-
-            oldest_key = min(
-                _CANDLE_CACHE,
-                key=lambda cache_key:
-                _CANDLE_CACHE[
-                    cache_key
-                ].get(
-                    "saved_at",
-                    0.0,
-                ),
-            )
-
-            _CANDLE_CACHE.pop(
-                oldest_key,
-                None,
-            )
-
-
-# ============================================================
-# PARSING DES BOUGIES
-# ============================================================
-
-def _parse_candles(
-    data: dict,
-) -> list[Candle]:
-
-    values = data.get(
-        "values"
-    )
-
-    if not isinstance(
-        values,
-        list,
-    ):
-        raise RuntimeError(
-            "Réponse Twelve Data sans "
-            "liste 'values'."
-        )
-
-    candles: list[Candle] = []
-
-    for item in values:
-
-        if not isinstance(
-            item,
-            dict,
-        ):
-            continue
-
-        timestamp = item.get(
-            "datetime"
-        )
-
-        if timestamp is None:
-            continue
-
-        try:
-
-            candle = Candle(
-                timestamp=_parse_timestamp(
-                    timestamp
-                ),
-                open=float(
-                    item["open"]
-                ),
-                high=float(
-                    item["high"]
-                ),
-                low=float(
-                    item["low"]
-                ),
-                close=float(
-                    item["close"]
-                ),
-                volume=float(
-                    item.get(
-                        "volume",
-                        0.0,
-                    )
-                    or 0.0
-                ),
-            )
-
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-        ):
-
-            continue
-
-        candles.append(
-            candle
-        )
-
-    if not candles:
-
-        raise RuntimeError(
-            "Twelve Data a renvoyé "
-            "0 bougie exploitable."
-        )
-
-    # Twelve Data renvoie généralement
-    # la plus récente en premier.
-    #
-    # Le pipeline NOVA TRADE AI travaille
-    # dans l'ordre chronologique.
-    candles.sort(
-        key=lambda candle:
-        candle.timestamp
-    )
-
-    return candles
-
-
-# ============================================================
-# HTTP REQUEST
+# REQUEST TWELVE DATA
 # ============================================================
 
 def _request_candles(
     symbol: str,
     timeframe: str,
     outputsize: int,
-) -> list[Candle]:
+) -> List[Candle]:
+
+    timeframe = _normalize_timeframe(
+        timeframe
+    )
+
+    interval = TIMEFRAME_MAP[timeframe]
 
     api_key = _get_api_key()
 
-    interval = TIMEFRAME_MAP[
-        timeframe
-    ]
-
     params = {
-        "symbol": symbol,
+        "symbol": symbol.strip().upper(),
         "interval": interval,
         "outputsize": outputsize,
         "apikey": api_key,
@@ -609,13 +448,25 @@ def _request_candles(
 
     last_error: Optional[Exception] = None
 
-    for attempt in range(
-        MAX_RETRIES + 1
-    ):
+    for attempt in range(MAX_RETRIES):
 
-        _STATS.requests_total += 1
+        # ----------------------------------------------------
+        # RATE LIMIT GLOBAL
+        # ----------------------------------------------------
+
+        if _is_rate_limited():
+
+            remaining = _remaining_rate_limit_seconds()
+
+            raise RuntimeError(
+                "Limite Twelve Data active. "
+                f"Réessayer dans environ {remaining}s."
+            )
 
         try:
+
+            with _STATS_LOCK:
+                _STATS["api_requests"] += 1
 
             response = requests.get(
                 BASE_URL,
@@ -623,39 +474,18 @@ def _request_candles(
                 timeout=REQUEST_TIMEOUT,
             )
 
-        except requests.RequestException as exc:
+            # ------------------------------------------------
+            # HTTP 429
+            # ------------------------------------------------
 
-            last_error = exc
-            _STATS.errors += 1
+            if response.status_code == 429:
 
-            if attempt >= MAX_RETRIES:
-                break
+                with _STATS_LOCK:
+                    _STATS["rate_limit_hits"] += 1
 
-            delay = RETRY_DELAYS[
-                min(
-                    attempt,
-                    len(RETRY_DELAYS) - 1,
-                )
-            ]
-
-            time.sleep(delay)
-            continue
-
-        # ====================================================
-        # RATE LIMIT
-        # ====================================================
-
-        if response.status_code == 429:
-
-            retry_after = (
-                response.headers.get(
+                retry_after = response.headers.get(
                     "Retry-After"
                 )
-            )
-
-            retry_seconds = None
-
-            if retry_after:
 
                 try:
                     retry_seconds = int(
@@ -665,197 +495,245 @@ def _request_candles(
                     TypeError,
                     ValueError,
                 ):
-                    retry_seconds = None
+                    retry_seconds = RETRY_DELAYS[
+                        min(
+                            attempt,
+                            len(RETRY_DELAYS) - 1,
+                        )
+                    ]
 
-            _set_rate_limit(
-                retry_seconds
-            )
-
-            last_error = RuntimeError(
-                "Limite Twelve Data active."
-            )
-
-            # ------------------------------------------------
-            # IMPORTANT :
-            # On ne multiplie pas les requêtes pendant
-            # le rate limit.
-            # ------------------------------------------------
-
-            if attempt >= MAX_RETRIES:
-                break
-
-            remaining = _rate_limit_remaining()
-
-            # Attente limitée.
-            wait_time = min(
-                max(remaining, 1),
-                MAX_RATE_LIMIT_COOLDOWN,
-            )
-
-            time.sleep(
-                wait_time
-            )
-
-            continue
-
-        # ====================================================
-        # ERREURS 5XX
-        # ====================================================
-
-        if response.status_code >= 500:
-
-            message = _parse_api_error(
-                response
-            )
-
-            last_error = RuntimeError(
-                message
-            )
-
-            _STATS.errors += 1
-
-            if attempt >= MAX_RETRIES:
-                break
-
-            delay = RETRY_DELAYS[
-                min(
-                    attempt,
-                    len(RETRY_DELAYS) - 1,
+                retry_seconds = min(
+                    max(retry_seconds, 5),
+                    60,
                 )
-            ]
 
-            time.sleep(delay)
-            continue
+                _activate_rate_limit(
+                    retry_seconds
+                )
 
-        # ====================================================
-        # ERREURS 4XX
-        # ====================================================
+                last_error = RuntimeError(
+                    "Limite Twelve Data atteinte."
+                )
 
-        if response.status_code >= 400:
+                if attempt < MAX_RETRIES - 1:
 
-            message = _parse_api_error(
-                response
+                    time.sleep(
+                        retry_seconds
+                    )
+
+                    continue
+
+                raise last_error
+
+            # ------------------------------------------------
+            # AUTRES ERREURS HTTP
+            # ------------------------------------------------
+
+            if 400 <= response.status_code < 500:
+
+                message = _parse_api_error(
+                    response
+                )
+
+                raise RuntimeError(
+                    f"Erreur Twelve Data "
+                    f"HTTP {response.status_code}: "
+                    f"{message}"
+                )
+
+            if response.status_code >= 500:
+
+                last_error = RuntimeError(
+                    f"Erreur serveur Twelve Data "
+                    f"HTTP {response.status_code}"
+                )
+
+                if attempt < MAX_RETRIES - 1:
+
+                    delay = RETRY_DELAYS[
+                        min(
+                            attempt,
+                            len(RETRY_DELAYS) - 1,
+                        )
+                    ]
+
+                    time.sleep(delay)
+
+                    continue
+
+                raise last_error
+
+            # ------------------------------------------------
+            # JSON
+            # ------------------------------------------------
+
+            try:
+
+                data = response.json()
+
+            except json.JSONDecodeError as exc:
+
+                last_error = RuntimeError(
+                    "Réponse Twelve Data "
+                    "invalide."
+                )
+
+                if attempt < MAX_RETRIES - 1:
+
+                    delay = RETRY_DELAYS[
+                        min(
+                            attempt,
+                            len(RETRY_DELAYS) - 1,
+                        )
+                    ]
+
+                    time.sleep(delay)
+
+                    continue
+
+                raise last_error from exc
+
+            # ------------------------------------------------
+            # ERREUR API
+            # ------------------------------------------------
+
+            if isinstance(data, dict):
+
+                status = str(
+                    data.get("status", "")
+                ).lower()
+
+                if status == "error":
+
+                    message = data.get(
+                        "message",
+                        "Erreur inconnue.",
+                    )
+
+                    raise RuntimeError(
+                        f"Twelve Data : {message}"
+                    )
+
+            values = data.get("values")
+
+            if not isinstance(values, list):
+
+                raise RuntimeError(
+                    "Twelve Data n'a retourné "
+                    "aucune donnée candle."
+                )
+
+            # ------------------------------------------------
+            # PARSING CANDLES
+            # ------------------------------------------------
+
+            candles: List[Candle] = []
+
+            for item in values:
+
+                if not isinstance(item, dict):
+                    continue
+
+                try:
+
+                    timestamp = _parse_timestamp(
+                        item["datetime"]
+                    )
+
+                    candle = Candle(
+                        timestamp=timestamp,
+                        open=float(item["open"]),
+                        high=float(item["high"]),
+                        low=float(item["low"]),
+                        close=float(item["close"]),
+                        volume=float(
+                            item.get(
+                                "volume",
+                                0.0,
+                            )
+                        ),
+                    )
+
+                    candles.append(candle)
+
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+            if not candles:
+
+                raise RuntimeError(
+                    "Aucune candle exploitable "
+                    "dans la réponse Twelve Data."
+                )
+
+            # Twelve Data peut retourner les candles
+            # de la plus récente à la plus ancienne.
+            candles.sort(
+                key=lambda candle: candle.timestamp
             )
 
-            raise RuntimeError(
-                f"Twelve Data HTTP "
-                f"{response.status_code} : "
-                f"{message}"
-            )
+            _clear_rate_limit()
 
-        # ====================================================
-        # JSON
-        # ====================================================
+            with _STATS_LOCK:
+                _STATS["successful_requests"] += 1
 
-        try:
+            return candles
 
-            data = response.json()
-
-        except ValueError as exc:
+        except requests.RequestException as exc:
 
             last_error = RuntimeError(
-                "Réponse Twelve Data "
-                "non JSON."
+                f"Erreur réseau Twelve Data : {exc}"
             )
 
-            _STATS.errors += 1
+            if attempt < MAX_RETRIES - 1:
 
-            if attempt >= MAX_RETRIES:
-                break
-
-            time.sleep(
-                RETRY_DELAYS[
+                delay = RETRY_DELAYS[
                     min(
                         attempt,
                         len(RETRY_DELAYS) - 1,
                     )
                 ]
-            )
 
-            continue
+                time.sleep(delay)
 
-        # ====================================================
-        # ERREUR API DANS HTTP 200
-        # ====================================================
+                continue
 
-        if isinstance(
-            data,
-            dict,
-        ):
+            raise last_error from exc
 
-            status = str(
-                data.get(
-                    "status",
-                    ""
-                )
-            ).lower()
-
-            if status == "error":
-
-                message = data.get(
-                    "message",
-                    "Erreur Twelve Data.",
-                )
-
-                code = data.get(
-                    "code"
-                )
-
-                if code:
-
-                    message = (
-                        f"{message} "
-                        f"(code {code})"
-                    )
-
-                raise RuntimeError(
-                    str(message)
-                )
-
-        # ====================================================
-        # PARSING
-        # ====================================================
-
-        try:
-
-            candles = _parse_candles(
-                data
-            )
+        except RuntimeError:
+            raise
 
         except Exception as exc:
 
-            last_error = exc
-            _STATS.errors += 1
+            last_error = RuntimeError(
+                f"Erreur données marché : {exc}"
+            )
 
-            if attempt >= MAX_RETRIES:
-                break
+            if attempt < MAX_RETRIES - 1:
 
-            time.sleep(
-                RETRY_DELAYS[
+                delay = RETRY_DELAYS[
                     min(
                         attempt,
                         len(RETRY_DELAYS) - 1,
                     )
                 ]
-            )
 
-            continue
+                time.sleep(delay)
 
-        # ====================================================
-        # SUCCESS
-        # ====================================================
+                continue
 
-        _STATS.requests_success += 1
-
-        return candles
+            raise last_error from exc
 
     if last_error:
 
         raise last_error
 
     raise RuntimeError(
-        "Échec de récupération des "
-        "données Twelve Data."
+        "Impossible de récupérer les données marché."
     )
 
 
@@ -866,128 +744,110 @@ def _request_candles(
 def get_candles(
     symbol: str,
     timeframe: str,
-    outputsize: int = 100,
-) -> list[Candle]:
+    outputsize: int = 300,
+) -> List[Candle]:
 
-    symbol = _normalize_symbol(
-        symbol
-    )
+    if not symbol or not isinstance(
+        symbol,
+        str,
+    ):
+        raise ValueError(
+            "Symbole invalide."
+        )
 
     timeframe = _normalize_timeframe(
         timeframe
     )
-
-    try:
-
-        outputsize = int(
-            outputsize
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        raise ValueError(
-            "outputsize doit être un entier."
-        )
 
     if outputsize <= 0:
         raise ValueError(
             "outputsize doit être supérieur à 0."
         )
 
-    key = _cache_key(
+    # --------------------------------------------------------
+    # CACHE FRAIS
+    # --------------------------------------------------------
+
+    cached = _get_cached_candles(
         symbol,
         timeframe,
         outputsize,
-    )
-
-    # ========================================================
-    # 1. CACHE FRAIS
-    # ========================================================
-
-    cached = _get_cached_candles(
-        key,
-        timeframe,
         allow_stale=False,
     )
 
     if cached is not None:
         return cached
 
-    # ========================================================
-    # 2. RATE LIMIT GLOBAL
-    # ========================================================
+    # --------------------------------------------------------
+    # RATE LIMIT
+    # --------------------------------------------------------
 
-    if _rate_limit_active():
+    if _is_rate_limited():
 
         stale = _get_cached_candles(
-            key,
+            symbol,
             timeframe,
+            outputsize,
             allow_stale=True,
         )
 
         if stale is not None:
             return stale
 
-        remaining = (
-            _rate_limit_remaining()
-        )
+        remaining = _remaining_rate_limit_seconds()
 
         raise RuntimeError(
-            "Limite Twelve Data active "
-            "et aucune donnée récente en "
-            f"cache pour {symbol} "
-            f"{timeframe}. "
-            f"Réessayer dans environ "
-            f"{remaining}s."
+            "Limite Twelve Data active et "
+            f"aucune donnée récente en cache "
+            f"pour {symbol} {timeframe}. "
+            f"Réessayer dans environ {remaining}s."
         )
 
-    # ========================================================
-    # 3. REQUÊTE API
-    # ========================================================
+    # --------------------------------------------------------
+    # API
+    # --------------------------------------------------------
 
     try:
 
         candles = _request_candles(
+            symbol=symbol,
+            timeframe=timeframe,
+            outputsize=outputsize,
+        )
+
+        _set_cached_candles(
             symbol,
             timeframe,
             outputsize,
+            candles,
         )
 
-    except Exception as exc:
+        return candles
+
+    except Exception:
+
+        with _STATS_LOCK:
+            _STATS["errors"] += 1
 
         # ----------------------------------------------------
-        # Si Twelve Data devient temporairement indisponible,
-        # on tente une dernière fois le cache périmé.
+        # FALLBACK CACHE STALE
         # ----------------------------------------------------
 
         stale = _get_cached_candles(
-            key,
+            symbol,
             timeframe,
+            outputsize,
             allow_stale=True,
         )
 
         if stale is not None:
             return stale
 
-        raise exc
-
-    # ========================================================
-    # 4. CACHE
-    # ========================================================
-
-    _save_cache(
-        key,
-        candles,
-    )
-
-    return candles
+        raise
 
 
 # ============================================================
-# DERNIER PRIX
+# DERNIÈRE DONNÉE
 # ============================================================
 
 def get_latest_price(
@@ -995,8 +855,8 @@ def get_latest_price(
 ) -> float:
 
     candles = get_candles(
-        symbol,
-        "M5",
+        symbol=symbol,
+        timeframe="M5",
         outputsize=2,
     )
 
@@ -1011,100 +871,40 @@ def get_latest_price(
 
 
 # ============================================================
-# CACHE MANUEL
+# ALIAS COMPATIBILITÉ
 # ============================================================
 
-def clear_cache() -> None:
-
-    global _RATE_LIMIT_UNTIL
-    global _RATE_LIMIT_MESSAGE
-
-    with _CACHE_LOCK:
-
-        _CANDLE_CACHE.clear()
-
-        _RATE_LIMIT_UNTIL = 0.0
-        _RATE_LIMIT_MESSAGE = ""
-
-
-def clear_symbol_cache(
+def get_price(
     symbol: str,
-) -> None:
+) -> float:
+    """
+    Alias conservé pour compatibilité
+    avec les anciens modules.
+    """
 
-    symbol = _normalize_symbol(
+    return get_latest_price(
         symbol
     )
-
-    with _CACHE_LOCK:
-
-        keys_to_delete = [
-            key
-            for key in _CANDLE_CACHE
-            if key[0] == symbol
-        ]
-
-        for key in keys_to_delete:
-
-            _CANDLE_CACHE.pop(
-                key,
-                None,
-            )
 
 
 # ============================================================
 # STATISTIQUES
 # ============================================================
 
-def get_market_data_stats() -> dict:
+def get_market_data_stats() -> Dict[str, int]:
 
-    with _CACHE_LOCK:
+    with _STATS_LOCK:
 
-        cache_entries = len(
-            _CANDLE_CACHE
-        )
-
-        rate_limit_remaining = (
-            _rate_limit_remaining()
-        )
-
-    return {
-        "requests_total":
-            _STATS.requests_total,
-
-        "requests_success":
-            _STATS.requests_success,
-
-        "rate_limit_count":
-            _STATS.rate_limit_count,
-
-        "cache_hits":
-            _STATS.cache_hits,
-
-        "stale_cache_hits":
-            _STATS.stale_cache_hits,
-
-        "cache_misses":
-            _STATS.cache_misses,
-
-        "errors":
-            _STATS.errors,
-
-        "cache_entries":
-            cache_entries,
-
-        "rate_limit_remaining":
-            rate_limit_remaining,
-    }
+        return dict(_STATS)
 
 
 # ============================================================
-# COMPATIBILITÉ
+# RESET STATISTIQUES
 # ============================================================
 
-def get_price(
-    symbol: str,
-) -> float:
+def reset_market_data_stats() -> None:
 
-    return get_latest_price(
-        symbol
-    )
+    with _STATS_LOCK:
+
+        for key in _STATS:
+            _STATS[key] = 0
