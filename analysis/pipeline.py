@@ -60,7 +60,7 @@ from core.models import (
 )
 from market_data import get_candles
 from market_hours import is_market_open
-from economic_calendar import has_high_impact_news
+from economic_calendar import economic_filter
 from scoring.score_engine import ScoreEngine
 from signals.signal_engine import SignalEngine
 
@@ -1317,9 +1317,7 @@ def build_price_action_setup(
     # CONFIRMATION
     # ----------------------------------------------------------------------
 
-    confirmation_index = (
-        retest_index
-    )
+    confirmation_index = retest_index
 
     candle_confirmation = (
         detect_candle_confirmation(
@@ -1336,9 +1334,7 @@ def build_price_action_setup(
         < len(m15_candles)
     ):
 
-        next_index = (
-            retest_index + 1
-        )
+        next_index = retest_index + 1
 
         candle_confirmation = (
             detect_candle_confirmation(
@@ -1350,9 +1346,7 @@ def build_price_action_setup(
         )
 
         if candle_confirmation:
-            confirmation_index = (
-                next_index
-            )
+            confirmation_index = next_index
 
     if not candle_confirmation:
 
@@ -1456,12 +1450,8 @@ def build_price_action_setup(
             "entry_valid": False,
             "entry": entry,
             "entry_distance": entry_distance,
-            "max_entry_distance": (
-                max_entry_distance
-            ),
-            "confirmation_index": (
-                confirmation_index
-            ),
+            "max_entry_distance": max_entry_distance,
+            "confirmation_index": confirmation_index,
         }
 
     return zone, {
@@ -1477,12 +1467,8 @@ def build_price_action_setup(
         "entry_valid": True,
         "entry": entry,
         "entry_distance": entry_distance,
-        "max_entry_distance": (
-            max_entry_distance
-        ),
-        "confirmation_index": (
-            confirmation_index
-        ),
+        "max_entry_distance": max_entry_distance,
+        "confirmation_index": confirmation_index,
     }
 
 
@@ -2156,13 +2142,18 @@ def analyze_market(
 
     try:
 
+        blocked_by_news, news_reason = (
+            economic_filter(symbol)
+        )
+
         high_impact_news = bool(
-            has_high_impact_news(symbol)
+            blocked_by_news
         )
 
     except Exception:
 
         high_impact_news = False
+        news_reason = None
 
     # ----------------------------------------------------------------------
     # SETUP NON PRÊT
@@ -2192,6 +2183,9 @@ def analyze_market(
                 score=0.0,
             )
         )
+
+        if high_impact_news and news_reason:
+            reason = str(news_reason)
 
         return {
             "symbol": symbol,
@@ -2223,6 +2217,7 @@ def analyze_market(
                 "high_impact_news": (
                     high_impact_news
                 ),
+                "news_reason": news_reason,
             },
             "atr": atr,
             "price": current_price,
@@ -2274,6 +2269,7 @@ def analyze_market(
                 "high_impact_news": (
                     high_impact_news
                 ),
+                "news_reason": news_reason,
             },
             "atr": atr,
             "price": current_price,
@@ -2393,6 +2389,9 @@ def analyze_market(
         score=score,
     )
 
+    if high_impact_news and news_reason:
+        reason = str(news_reason)
+
     # ----------------------------------------------------------------------
     # SIGNAL
     # ----------------------------------------------------------------------
@@ -2511,6 +2510,7 @@ def analyze_market(
             "high_impact_news": (
                 high_impact_news
             ),
+            "news_reason": news_reason,
         },
         "atr": atr,
         "price": current_price,
