@@ -1,30 +1,30 @@
 """
 NOVA TRADE AI
 Economic News Supervisor
---------------------------------
+
 ROLE:
-- Information uniquement
-- Surveillance des annonces économiques HIGH
-- Explication des annonces avec Groq
-- Aucun impact sur le moteur de trading
+- Récupérer les annonces économiques depuis Finnhub.
+- Identifier les annonces à fort impact.
+- Fournir une explication via Groq.
+- INFORMER uniquement.
 
 IMPORTANT:
-Ce module NE DOIT PAS :
-- générer BUY / SELL
-- calculer un score
-- calculer un RR
-- proposer Entry / SL / TP
-- valider ou rejeter un signal
-- bloquer ou débloquer une entrée
-- modifier le moteur de trading
+Ce module n'a AUCUNE autorité sur le moteur de trading.
+Il ne valide, ne rejette, ne bloque et ne modifie aucun signal.
 """
 
+from __future__ import annotations
+
 import os
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -33,7 +33,15 @@ import requests
 
 SUPERVISOR_NEWS_ENABLED = (
     os.getenv("SUPERVISOR_NEWS_ENABLED", "true").lower()
-    == "true"
+    in ("1", "true", "yes", "on")
+)
+
+# Diagnostic temporaire.
+# Tant qu'il est à true, /testnews peut afficher une annonce
+# même si Finnhub lui donne un impact différent de HIGH.
+SUPERVISOR_NEWS_DIAGNOSTIC = (
+    os.getenv("SUPERVISOR_NEWS_DIAGNOSTIC", "true").lower()
+    in ("1", "true", "yes", "on")
 )
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
@@ -46,11 +54,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
-    "llama-3.3-70b-versatile"
+    "llama-3.3-70b-versatile",
 )
 
 REQUEST_TIMEOUT = int(
-    os.getenv("SUPERVISOR_NEWS_TIMEOUT", "8")
+    os.getenv("SUPERVISOR_NEWS_TIMEOUT", "10")
 )
 
 LOOKAHEAD_HOURS = int(
@@ -68,336 +76,699 @@ class SupervisorEconomicEvent:
     currency: str
     impact: str
     event_time: datetime
-    actual: Optional[str] = None
-    forecast: Optional[str] = None
-    previous: Optional[str] = None
-    country: Optional[str] = None
+    actual: Any = None
+    forecast: Any = None
+    previous: Any = None
+    country: str = ""
+    unit: str = ""
+
+    def is_high_impact(self) -> bool:
+        return self.impact.upper() == "HIGH"
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def _normalize_impact(value) -> str:
+def _safe_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+
+    try:
+        return str(value).strip()
+    except Exception:
+        return default
+
+
+def _normalize_impact(value: Any) -> str:
+    """
+    Finnhub documente normalement:
+        low
+        medium
+        high
+
+    Mais on accepte également plusieurs variantes pour
+    éviter qu'un changement de format casse le superviseur.
+    """
+
     if value is None:
         return "UNKNOWN"
 
-    value = str(value).strip().upper()
+    text = str(value).strip().lower()
 
-    if value in ("HIGH", "3", "3.0"):
+    if text in {
+        "high",
+        "3",
+        "3.0",
+        "major",
+        "critical",
+        "very high",
+    }:
         return "HIGH"
 
-    if value in ("MEDIUM", "MODERATE", "2", "2.0"):
+    if text in {
+        "medium",
+        "2",
+        "2.0",
+        "moderate",
+        "mid",
+    }:
         return "MEDIUM"
 
-    if value in ("LOW", "1", "1.0"):
+    if text in {
+        "low",
+        "1",
+        "1.0",
+        "minor",
+    }:
         return "LOW"
 
-    return value
+    return text.upper() if text else "UNKNOWN"
 
 
-def _parse_datetime(value) -> Optional[datetime]:
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    """
+    Accepte:
+    - YYYY-MM-DD HH:MM:SS
+    - ISO 8601
+    - timestamp Unix secondes
+    - timestamp Unix millisecondes
+    """
+
     if value is None:
         return None
 
-    if isinstance(value, datetime):
-        dt = value
+    # Timestamp numérique
+    if isinstance(value, (int, float)):
+        try:
+            timestamp = float(value)
 
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            # Millisecondes -> secondes
+            if timestamp > 10_000_000_000:
+                timestamp /= 1000.0
 
-        return dt
+            return datetime.fromtimestamp(
+                timestamp,
+                tz=timezone.utc,
+            )
+        except Exception:
+            return None
 
-    value = str(value).strip()
+    text = str(value).strip()
 
-    if not value:
+    if not text:
         return None
+
+    # Timestamp sous forme de texte
+    try:
+        numeric = float(text)
+
+        if numeric > 10_000_000_000:
+            numeric /= 1000.0
+
+        return datetime.fromtimestamp(
+            numeric,
+            tz=timezone.utc,
+        )
+    except Exception:
+        pass
 
     # ISO 8601
     try:
-        normalized = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(normalized)
+        iso_text = text.replace("Z", "+00:00")
+
+        dt = datetime.fromisoformat(iso_text)
 
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
 
         return dt
-    except ValueError:
+    except Exception:
         pass
 
-    # Formats courants
-    formats = [
+    # Format Finnhub classique
+    formats = (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
         "%Y-%m-%d",
-    ]
+    )
 
     for fmt in formats:
         try:
-            dt = datetime.strptime(value, fmt)
-            return dt.replace(tzinfo=timezone.utc)
-        except ValueError:
+            return datetime.strptime(
+                text,
+                fmt,
+            ).replace(tzinfo=timezone.utc)
+        except Exception:
             continue
 
     return None
 
 
+def _first_value(
+    data: Dict[str, Any],
+    keys: List[str],
+    default: Any = None,
+) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+
+    return default
+
+
 # ============================================================
-# ECONOMIC NEWS SUPERVISOR
+# SUPERVISOR
 # ============================================================
 
 class EconomicNewsSupervisor:
+    """
+    Superviseur informatif des annonces économiques.
 
-    def __init__(self):
+    Il est volontairement indépendant du moteur de trading.
+    """
+
+    def __init__(self) -> None:
         self.events: List[SupervisorEconomicEvent] = []
+
         self.last_update: Optional[datetime] = None
 
-    # --------------------------------------------------------
+        # Informations de diagnostic
+        self.raw_response: Any = None
+        self.raw_events: List[Dict[str, Any]] = []
+        self.raw_status_code: Optional[int] = None
+        self.last_error: Optional[str] = None
+        self.raw_event_count: int = 0
+        self.parsed_event_count: int = 0
+        self.high_impact_event_count: int = 0
+
+    # ========================================================
     # FETCH FINNHUB
-    # --------------------------------------------------------
+    # ========================================================
 
     def fetch_events(self) -> List[SupervisorEconomicEvent]:
+        """
+        Récupère les annonces économiques.
+
+        En mode diagnostic, si Finnhub répond correctement mais
+        qu'aucune annonce HIGH n'est trouvée, les événements
+        disponibles sont retournés afin que /testnews puisse
+        confirmer que la connexion et le parsing fonctionnent.
+        """
+
+        self.last_error = None
+        self.raw_response = None
+        self.raw_events = []
+        self.raw_status_code = None
 
         if not SUPERVISOR_NEWS_ENABLED:
-            print("[NEWS SUPERVISOR] Désactivé.")
+            self.last_error = "SUPERVISOR_NEWS_ENABLED=false"
             self.events = []
             return []
 
         if not FINNHUB_API_KEY:
-            print(
-                "[NEWS SUPERVISOR] FINNHUB_API_KEY "
-                "manquante."
+            self.last_error = (
+                "FINNHUB_API_KEY absente de l'environnement."
             )
             self.events = []
-            return []
+
+            raise RuntimeError(
+                "FINNHUB_API_KEY est absente de Railway."
+            )
 
         now = datetime.now(timezone.utc)
 
-        from_timestamp = int(now.timestamp())
-
-        to_datetime = now + timedelta(
-            hours=LOOKAHEAD_HOURS
-        )
-
-        to_timestamp = int(to_datetime.timestamp())
+        start_date = now.date()
+        end_date = (
+            now + timedelta(hours=LOOKAHEAD_HOURS)
+        ).date()
 
         params = {
-            "from": now.strftime("%Y-%m-%d"),
-            "to": to_datetime.strftime("%Y-%m-%d"),
+            "from": start_date.isoformat(),
+            "to": end_date.isoformat(),
             "token": FINNHUB_API_KEY,
         }
 
         try:
-
             response = requests.get(
                 FINNHUB_ECONOMIC_CALENDAR_URL,
                 params=params,
                 timeout=REQUEST_TIMEOUT,
             )
 
-            response.raise_for_status()
-
-            data = response.json()
-
-            events = self._parse_response(data)
-
-            # Garder uniquement les événements futurs
-            # et HIGH.
-            filtered = []
-
-            for event in events:
-
-                timestamp = int(
-                    event.event_time.timestamp()
-                )
-
-                if (
-                    event.impact == "HIGH"
-                    and timestamp >= from_timestamp
-                    and timestamp <= to_timestamp
-                ):
-                    filtered.append(event)
-
-            filtered.sort(
-                key=lambda event: event.event_time
-            )
-
-            self.events = filtered
-            self.last_update = now
-
-            print(
-                f"[NEWS SUPERVISOR] "
-                f"{len(filtered)} annonce(s) HIGH récupérée(s)."
-            )
-
-            return filtered
+            self.raw_status_code = response.status_code
 
         except requests.RequestException as exc:
-
-            print(
-                "[NEWS SUPERVISOR] "
-                f"Erreur Finnhub : {exc}"
+            self.last_error = (
+                f"Erreur réseau Finnhub: {exc}"
             )
-
             self.events = []
 
-            return []
+            raise RuntimeError(
+                "Impossible de contacter Finnhub."
+            ) from exc
 
-        except Exception as exc:
+        # ----------------------------------------------------
+        # HTTP ERROR
+        # ----------------------------------------------------
 
-            print(
-                "[NEWS SUPERVISOR] "
-                f"Erreur inattendue : {exc}"
+        if response.status_code != 200:
+            body = response.text[:500]
+
+            self.last_error = (
+                f"Finnhub HTTP {response.status_code}: {body}"
             )
 
+            raise RuntimeError(
+                f"Finnhub a répondu HTTP "
+                f"{response.status_code}."
+            )
+
+        # ----------------------------------------------------
+        # JSON
+        # ----------------------------------------------------
+
+        try:
+            payload = response.json()
+
+        except ValueError as exc:
+            self.last_error = (
+                "Réponse Finnhub non JSON."
+            )
+
+            raise RuntimeError(
+                "Finnhub a répondu avec des données "
+                "qui ne sont pas du JSON."
+            ) from exc
+
+        self.raw_response = payload
+
+        # ----------------------------------------------------
+        # STRUCTURE DE LA RÉPONSE
+        # ----------------------------------------------------
+
+        raw_events = self._extract_event_list(payload)
+
+        self.raw_events = raw_events
+        self.raw_event_count = len(raw_events)
+
+        # Finnhub peut retourner un message d'erreur dans JSON.
+        if not raw_events:
+
+            diagnostic = self._build_empty_response_diagnostic(
+                payload
+            )
+
+            self.last_error = diagnostic
             self.events = []
 
-            return []
+            raise RuntimeError(diagnostic)
 
-    # --------------------------------------------------------
-    # PARSE FINNHUB
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # PARSING
+        # ----------------------------------------------------
 
-    def _parse_response(self, data) -> List[SupervisorEconomicEvent]:
+        parsed_events: List[SupervisorEconomicEvent] = []
 
-        if not isinstance(data, dict):
-            return []
+        for raw_event in raw_events:
+            try:
+                event = self._parse_event(raw_event)
 
-        raw_events = data.get("economicCalendar", [])
+                if event is not None:
+                    parsed_events.append(event)
 
-        if not isinstance(raw_events, list):
-            return []
-
-        parsed = []
-
-        for item in raw_events:
-
-            if not isinstance(item, dict):
-                continue
-
-            impact = _normalize_impact(
-                item.get("impact")
-            )
-
-            if impact != "HIGH":
-                continue
-
-            event_time = _parse_datetime(
-                item.get("time")
-            )
-
-            if event_time is None:
-                event_time = _parse_datetime(
-                    item.get("datetime")
+            except Exception as exc:
+                logger.warning(
+                    "Événement Finnhub ignoré pendant "
+                    "le parsing: %s",
+                    exc,
                 )
 
-            if event_time is None:
-                continue
+        self.parsed_event_count = len(parsed_events)
 
-            title = (
-                item.get("event")
-                or item.get("title")
-                or "Economic Event"
-            )
+        # ----------------------------------------------------
+        # FILTRAGE TEMPOREL
+        # ----------------------------------------------------
 
-            currency = (
-                item.get("currency")
-                or ""
-            )
+        future_events: List[
+            SupervisorEconomicEvent
+        ] = []
 
-            country = (
-                item.get("country")
-                or ""
-            )
+        horizon = now + timedelta(
+            hours=LOOKAHEAD_HOURS
+        )
 
-            actual = item.get("actual")
-            forecast = item.get("estimate")
+        for event in parsed_events:
 
-            if forecast is None:
-                forecast = item.get("forecast")
+            event_time = event.event_time
 
-            previous = item.get("prev")
-
-            if previous is None:
-                previous = item.get("previous")
-
-            parsed.append(
-                SupervisorEconomicEvent(
-                    title=str(title),
-                    currency=str(currency),
-                    impact=impact,
-                    event_time=event_time,
-                    actual=(
-                        str(actual)
-                        if actual is not None
-                        else None
-                    ),
-                    forecast=(
-                        str(forecast)
-                        if forecast is not None
-                        else None
-                    ),
-                    previous=(
-                        str(previous)
-                        if previous is not None
-                        else None
-                    ),
-                    country=str(country),
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(
+                    tzinfo=timezone.utc
                 )
+
+            if now <= event_time <= horizon:
+                future_events.append(event)
+
+        # Si Finnhub renvoie un horaire légèrement différent
+        # ou des événements historiques, on garde quand même
+        # les événements récents en diagnostic.
+        if not future_events and SUPERVISOR_NEWS_DIAGNOSTIC:
+            future_events = parsed_events
+
+        # ----------------------------------------------------
+        # HIGH IMPACT
+        # ----------------------------------------------------
+
+        high_events = [
+            event
+            for event in future_events
+            if event.is_high_impact()
+        ]
+
+        self.high_impact_event_count = len(high_events)
+
+        # ----------------------------------------------------
+        # MODE NORMAL
+        # ----------------------------------------------------
+
+        if high_events:
+            self.events = sorted(
+                high_events,
+                key=lambda item: item.event_time,
             )
 
-        return parsed
+        # ----------------------------------------------------
+        # MODE DIAGNOSTIC
+        # ----------------------------------------------------
+        #
+        # Si aucun HIGH n'est trouvé, on retourne les événements
+        # disponibles afin que /testnews puisse nous montrer
+        # ce que Finnhub renvoie réellement.
+        #
 
-    # --------------------------------------------------------
+        elif SUPERVISOR_NEWS_DIAGNOSTIC and future_events:
+
+            logger.warning(
+                "Diagnostic Finnhub: aucun événement HIGH. "
+                "Retour temporaire des événements disponibles."
+            )
+
+            self.events = sorted(
+                future_events,
+                key=lambda item: item.event_time,
+            )
+
+        else:
+            self.events = []
+
+        self.last_update = now
+
+        logger.info(
+            "Finnhub economic calendar: "
+            "raw=%s parsed=%s high=%s returned=%s",
+            self.raw_event_count,
+            self.parsed_event_count,
+            self.high_impact_event_count,
+            len(self.events),
+        )
+
+        return self.events
+
+    # ========================================================
+    # EXTRACT EVENT LIST
+    # ========================================================
+
+    def _extract_event_list(
+        self,
+        payload: Any,
+    ) -> List[Dict[str, Any]]:
+        """
+        Extrait la liste d'événements sans supposer trop
+        fortement la structure de la réponse.
+        """
+
+        if isinstance(payload, list):
+
+            return [
+                item
+                for item in payload
+                if isinstance(item, dict)
+            ]
+
+        if not isinstance(payload, dict):
+            return []
+
+        possible_keys = (
+            "economicCalendar",
+            "economic_calendar",
+            "data",
+            "calendar",
+            "events",
+        )
+
+        for key in possible_keys:
+
+            value = payload.get(key)
+
+            if isinstance(value, list):
+
+                return [
+                    item
+                    for item in value
+                    if isinstance(item, dict)
+                ]
+
+        return []
+
+    # ========================================================
+    # PARSE EVENT
+    # ========================================================
+
+    def _parse_event(
+        self,
+        raw: Dict[str, Any],
+    ) -> Optional[SupervisorEconomicEvent]:
+
+        title = _first_value(
+            raw,
+            [
+                "event",
+                "title",
+                "name",
+                "indicator",
+            ],
+            "Economic Event",
+        )
+
+        country = _first_value(
+            raw,
+            [
+                "country",
+                "countryCode",
+                "country_code",
+            ],
+            "",
+        )
+
+        currency = _first_value(
+            raw,
+            [
+                "currency",
+                "currencyCode",
+                "currency_code",
+                "unit",
+            ],
+            "",
+        )
+
+        impact = _normalize_impact(
+            _first_value(
+                raw,
+                [
+                    "impact",
+                    "importance",
+                    "importance_level",
+                    "priority",
+                ],
+                "UNKNOWN",
+            )
+        )
+
+        time_value = _first_value(
+            raw,
+            [
+                "time",
+                "datetime",
+                "dateTime",
+                "date",
+                "timestamp",
+            ],
+        )
+
+        event_time = _parse_datetime(time_value)
+
+        if event_time is None:
+            logger.warning(
+                "Événement sans date exploitable: %s",
+                raw,
+            )
+            return None
+
+        actual = _first_value(
+            raw,
+            [
+                "actual",
+                "actualValue",
+            ],
+        )
+
+        forecast = _first_value(
+            raw,
+            [
+                "estimate",
+                "forecast",
+                "consensus",
+            ],
+        )
+
+        previous = _first_value(
+            raw,
+            [
+                "prev",
+                "previous",
+                "previousValue",
+            ],
+        )
+
+        unit = _safe_str(
+            _first_value(
+                raw,
+                ["unit"],
+                "",
+            )
+        )
+
+        return SupervisorEconomicEvent(
+            title=_safe_str(title, "Economic Event"),
+            currency=_safe_str(currency),
+            impact=impact,
+            event_time=event_time,
+            actual=actual,
+            forecast=forecast,
+            previous=previous,
+            country=_safe_str(country),
+            unit=unit,
+        )
+
+    # ========================================================
+    # DIAGNOSTIC EMPTY RESPONSE
+    # ========================================================
+
+    def _build_empty_response_diagnostic(
+        self,
+        payload: Any,
+    ) -> str:
+
+        if isinstance(payload, dict):
+
+            keys = list(payload.keys())
+
+            message = _first_value(
+                payload,
+                [
+                    "error",
+                    "message",
+                    "errorMessage",
+                ],
+                None,
+            )
+
+            status = payload.get("status")
+
+            parts = [
+                "Finnhub n'a retourné aucun événement.",
+                f"HTTP={self.raw_status_code}",
+                f"keys={keys}",
+            ]
+
+            if status is not None:
+                parts.append(
+                    f"status={status}"
+                )
+
+            if message:
+                parts.append(
+                    f"message={str(message)[:250]}"
+                )
+
+            return " | ".join(parts)
+
+        return (
+            "Finnhub n'a retourné aucun événement exploitable."
+        )
+
+    # ========================================================
     # NEXT EVENT
-    # --------------------------------------------------------
+    # ========================================================
 
     def get_next_event(
         self,
     ) -> Optional[SupervisorEconomicEvent]:
 
+        if not self.events:
+            self.fetch_events()
+
+        if not self.events:
+            return None
+
         now = datetime.now(timezone.utc)
 
-        future_events = [
+        future = [
             event
             for event in self.events
             if event.event_time >= now
         ]
 
-        if not future_events:
+        if not future:
             return None
 
         return min(
-            future_events,
-            key=lambda event: event.event_time
+            future,
+            key=lambda event: event.event_time,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # UPCOMING EVENTS
-    # --------------------------------------------------------
+    # ========================================================
 
     def get_upcoming_events(
         self,
-        limit: int = 5,
+        limit: int = 10,
     ) -> List[SupervisorEconomicEvent]:
+
+        if not self.events:
+            self.fetch_events()
 
         now = datetime.now(timezone.utc)
 
-        future_events = [
+        upcoming = [
             event
             for event in self.events
             if event.event_time >= now
         ]
 
-        future_events.sort(
+        upcoming.sort(
             key=lambda event: event.event_time
         )
 
-        return future_events[:limit]
+        return upcoming[:limit]
 
-    # --------------------------------------------------------
+    # ========================================================
     # AI PROMPT
-    # --------------------------------------------------------
+    # ========================================================
 
     def build_ai_prompt(
         self,
@@ -405,59 +776,68 @@ class EconomicNewsSupervisor:
     ) -> str:
 
         return f"""
-Tu es le superviseur informatif des annonces économiques
-de NOVA TRADE AI.
+Tu es un assistant spécialisé dans l'explication
+simple des annonces économiques.
 
-Ton rôle est UNIQUEMENT pédagogique et informatif.
+Tu dois UNIQUEMENT expliquer l'annonce suivante.
 
-Annonce économique :
-- Nom : {event.title}
-- Devise : {event.currency}
-- Pays : {event.country}
-- Impact : {event.impact}
-- Heure : {event.event_time.isoformat()}
-- Actual : {event.actual}
-- Prévision : {event.forecast}
-- Précédent : {event.previous}
+Annonce:
+{event.title}
 
-Explique cette annonce en français simple.
+Pays:
+{event.country}
 
-Donne :
+Devise:
+{event.currency}
 
-1. Ce que mesure cette annonce.
+Impact indiqué:
+{event.impact}
+
+Heure:
+{event.event_time.isoformat()}
+
+Valeur actuelle:
+{event.actual}
+
+Prévision:
+{event.forecast}
+
+Valeur précédente:
+{event.previous}
+
+Règles ABSOLUES:
+
+- Ne donne aucun BUY.
+- Ne donne aucun SELL.
+- Ne donne aucun Entry.
+- Ne donne aucun Stop Loss.
+- Ne donne aucun Take Profit.
+- Ne donne aucun RR.
+- Ne donne aucun score.
+- Ne valide aucun signal.
+- Ne rejette aucun signal.
+- Ne bloque aucune entrée.
+- Ne modifie aucune décision du moteur de trading.
+- Ne fais aucune analyse technique.
+- Ne remplace pas le moteur de trading.
+
+Explique simplement:
+
+1. Ce que représente cette annonce.
 2. Pourquoi elle est importante.
-3. Ce que signifie généralement une valeur supérieure
-   ou inférieure aux attentes.
-4. Les principaux actifs ou devises potentiellement
-   concernés de manière générale.
-5. Pourquoi le marché peut devenir plus volatil autour
-   de cette publication.
+3. Ce que signifie une donnée supérieure ou inférieure
+   aux attentes.
+4. Quels marchés ou devises peuvent généralement
+   être sensibles à cette annonce.
 
-INTERDICTIONS ABSOLUES :
+Termine par une phrase indiquant qu'il s'agit
+uniquement d'une information économique générale
+et non d'une décision de trading.
+""".strip()
 
-Tu ne dois jamais :
-- donner BUY ou SELL ;
-- faire une analyse technique ;
-- calculer un score ;
-- calculer un RR ;
-- proposer Entry ;
-- proposer Stop Loss ;
-- proposer Take Profit ;
-- donner un signal ;
-- valider ou rejeter un signal ;
-- bloquer ou débloquer une entrée ;
-- modifier une décision du moteur de trading ;
-- donner une recommandation de trading.
-
-Tu es uniquement un interprète pédagogique
-de l'annonce économique.
-
-Réponds clairement et brièvement.
-"""
-
-    # --------------------------------------------------------
+    # ========================================================
     # GROQ EXPLANATION
-    # --------------------------------------------------------
+    # ========================================================
 
     def explain_event(
         self,
@@ -466,15 +846,14 @@ Réponds clairement et brièvement.
 
         if not GROQ_API_KEY:
             return (
-                "Explication IA indisponible : "
-                "GROQ_API_KEY manquante."
+                "Explication IA indisponible: "
+                "GROQ_API_KEY absente."
             )
 
         prompt = self.build_ai_prompt(event)
 
         url = (
-            "https://api.groq.com/openai/v1/"
-            "chat/completions"
+            "https://api.groq.com/openai/v1/chat/completions"
         )
 
         headers = {
@@ -489,7 +868,8 @@ Réponds clairement et brièvement.
                     "role": "system",
                     "content": (
                         "Tu es un assistant économique "
-                        "strictement informatif."
+                        "informatif. Tu n'as aucune "
+                        "autorité sur le trading."
                     ),
                 },
                 {
@@ -498,6 +878,7 @@ Réponds clairement et brièvement.
                 },
             ],
             "temperature": 0.2,
+            "max_tokens": 500,
         }
 
         try:
@@ -509,39 +890,55 @@ Réponds clairement et brièvement.
                 timeout=REQUEST_TIMEOUT,
             )
 
-            response.raise_for_status()
+            if response.status_code != 200:
+
+                logger.error(
+                    "Groq HTTP %s: %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+
+                return (
+                    "Explication IA indisponible "
+                    f"(Groq HTTP {response.status_code})."
+                )
 
             data = response.json()
 
-            choices = data.get("choices", [])
+            choices = data.get(
+                "choices",
+                [],
+            )
 
             if not choices:
                 return (
-                    "Aucune explication IA disponible."
+                    "Explication IA indisponible: "
+                    "réponse Groq vide."
                 )
 
             message = choices[0].get(
                 "message",
-                {}
+                {},
             )
 
             content = message.get(
                 "content",
-                ""
+                "",
             )
 
             if not content:
                 return (
-                    "Aucune explication IA disponible."
+                    "Explication IA indisponible: "
+                    "contenu vide."
                 )
 
-            return content.strip()
+            return str(content).strip()
 
         except requests.RequestException as exc:
 
-            print(
-                "[NEWS SUPERVISOR] "
-                f"Erreur Groq : {exc}"
+            logger.error(
+                "Erreur Groq: %s",
+                exc,
             )
 
             return (
@@ -551,9 +948,9 @@ Réponds clairement et brièvement.
 
         except Exception as exc:
 
-            print(
-                "[NEWS SUPERVISOR] "
-                f"Erreur IA inattendue : {exc}"
+            logger.exception(
+                "Erreur inattendue Groq: %s",
+                exc,
             )
 
             return (
@@ -561,36 +958,69 @@ Réponds clairement et brièvement.
                 "indisponible."
             )
 
-    # --------------------------------------------------------
-    # TELEGRAM MESSAGE
-    # --------------------------------------------------------
+    # ========================================================
+    # FORMAT TELEGRAM
+    # ========================================================
 
     def format_event_message(
         self,
         event: SupervisorEconomicEvent,
-        explanation: str,
+        explanation: Optional[str] = None,
     ) -> str:
 
-        event_time = event.event_time.astimezone(
-            timezone.utc
-        ).strftime("%d/%m/%Y %H:%M UTC")
+        event_time = event.event_time
 
-        return (
-            "📰 <b>ALERTE ÉCONOMIQUE</b>\n\n"
-            f"📌 <b>{event.title}</b>\n"
-            f"💱 Devise : {event.currency}\n"
-            f"🌍 Pays : {event.country or 'N/A'}\n"
-            f"🔴 Impact : <b>{event.impact}</b>\n"
-            f"🕒 Heure : {event_time}\n\n"
-            "📊 <b>Données</b>\n"
-            f"• Actual : {event.actual or 'N/A'}\n"
-            f"• Prévision : {event.forecast or 'N/A'}\n"
-            f"• Précédent : {event.previous or 'N/A'}\n\n"
-            "🤖 <b>Explication</b>\n"
-            f"{explanation}\n\n"
-            "ℹ️ <i>Information économique uniquement. "
-            "Aucun signal de trading.</i>"
+        try:
+            formatted_time = event_time.strftime(
+                "%d/%m/%Y %H:%M UTC"
+            )
+        except Exception:
+            formatted_time = str(event_time)
+
+        diagnostic_note = ""
+
+        if (
+            SUPERVISOR_NEWS_DIAGNOSTIC
+            and not event.is_high_impact()
+        ):
+            diagnostic_note = (
+                "\n\n🧪 MODE DIAGNOSTIC"
+                "\nCette annonce est affichée pour "
+                "tester le parsing Finnhub."
+                "\nElle n'est pas classée HIGH."
+            )
+
+        message = (
+            "📰 <b>ECONOMIC NEWS SUPERVISOR</b>\n\n"
+            f"📌 <b>Annonce :</b> {event.title}\n"
+            f"🌍 <b>Pays :</b> {event.country or 'N/A'}\n"
+            f"💱 <b>Devise :</b> "
+            f"{event.currency or 'N/A'}\n"
+            f"⚠️ <b>Impact :</b> {event.impact}\n"
+            f"🕐 <b>Heure :</b> {formatted_time}\n\n"
+            f"📊 <b>Actuel :</b> "
+            f"{event.actual if event.actual is not None else 'N/A'}\n"
+            f"🔮 <b>Prévision :</b> "
+            f"{event.forecast if event.forecast is not None else 'N/A'}\n"
+            f"◀️ <b>Précédent :</b> "
+            f"{event.previous if event.previous is not None else 'N/A'}"
         )
+
+        if explanation:
+            message += (
+                "\n\n🤖 <b>EXPLICATION</b>\n"
+                f"{explanation}"
+            )
+
+        message += diagnostic_note
+
+        message += (
+            "\n\nℹ️ <i>Information économique uniquement. "
+            "Ce module ne prend aucune décision de trading "
+            "et ne modifie aucun signal.</i>"
+        )
+
+        return message
 
 
 # ============================================================
@@ -601,171 +1031,82 @@ economic_news_supervisor = EconomicNewsSupervisor()
 
 
 # ============================================================
-# HELPERS PUBLICS
+# HELPERS GLOBAUX
 # ============================================================
 
-def update_supervisor_news():
+def update_supervisor_news() -> List[SupervisorEconomicEvent]:
+    """
+    Actualise les annonces économiques.
+    """
 
     return economic_news_supervisor.fetch_events()
 
 
-def get_next_supervisor_event():
+def get_next_supervisor_event() -> Optional[SupervisorEconomicEvent]:
+    """
+    Retourne la prochaine annonce disponible.
+    """
 
     return economic_news_supervisor.get_next_event()
 
 
 # ============================================================
-# TEST LOCAL TEMPORAIRE
+# TEST DIRECT DU MODULE
 # ============================================================
 
 if __name__ == "__main__":
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
     print("=" * 60)
-    print("NOVA TRADE AI")
-    print("TEST ECONOMIC NEWS SUPERVISOR")
+    print("NOVA TRADE AI - ECONOMIC NEWS SUPERVISOR")
     print("=" * 60)
 
-    print("\n[1] Vérification de la configuration")
+    try:
 
-    print(
-        "SUPERVISOR_NEWS_ENABLED :",
-        SUPERVISOR_NEWS_ENABLED,
-    )
-
-    print(
-        "FINNHUB_API_KEY :",
-        "OK" if FINNHUB_API_KEY else "MANQUANTE",
-    )
-
-    print(
-        "GROQ_API_KEY :",
-        "OK" if GROQ_API_KEY else "MANQUANTE",
-    )
-
-    print(
-        "GROQ_MODEL :",
-        GROQ_MODEL,
-    )
-
-    print("\n[2] Récupération des annonces HIGH...")
-
-    events = economic_news_supervisor.fetch_events()
-
-    print(
-        f"\nNombre d'annonces HIGH : {len(events)}"
-    )
-
-    if not events:
+        events = economic_news_supervisor.fetch_events()
 
         print(
-            "\n❌ Aucune annonce HIGH récupérée."
+            f"Événements récupérés : {len(events)}"
         )
 
         print(
-            "Vérifie FINNHUB_API_KEY et la réponse "
-            "de Finnhub."
+            f"Événements bruts : "
+            f"{economic_news_supervisor.raw_event_count}"
         )
-
-    else:
 
         print(
-            "\n[3] Annonces trouvées"
+            f"Événements parsés : "
+            f"{economic_news_supervisor.parsed_event_count}"
         )
-
-        for index, event in enumerate(
-            events[:5],
-            start=1,
-        ):
-
-            print("\n" + "-" * 60)
-
-            print(
-                f"Annonce #{index}"
-            )
-
-            print(
-                "Titre      :",
-                event.title,
-            )
-
-            print(
-                "Devise     :",
-                event.currency,
-            )
-
-            print(
-                "Impact     :",
-                event.impact,
-            )
-
-            print(
-                "Pays       :",
-                event.country,
-            )
-
-            print(
-                "Date/heure :",
-                event.event_time,
-            )
-
-            print(
-                "Actual     :",
-                event.actual,
-            )
-
-            print(
-                "Forecast   :",
-                event.forecast,
-            )
-
-            print(
-                "Previous   :",
-                event.previous,
-            )
-
-        # ----------------------------------------------------
-        # TEST GROQ SUR LA PREMIÈRE ANNONCE
-        # ----------------------------------------------------
-
-        first_event = events[0]
 
         print(
-            "\n[4] Test de l'explication IA..."
+            f"Événements HIGH : "
+            f"{economic_news_supervisor.high_impact_event_count}"
         )
 
-        explanation = (
-            economic_news_supervisor
-            .explain_event(first_event)
-        )
+        if events:
 
-        print("\n" + "-" * 60)
-        print("EXPLICATION GROQ")
-        print("-" * 60)
+            event = events[0]
 
-        print(explanation)
+            print()
+            print(
+                economic_news_supervisor.format_event_message(
+                    event
+                )
+            )
 
-        # ----------------------------------------------------
-        # TEST FORMAT TELEGRAM
-        # ----------------------------------------------------
+        else:
+
+            print(
+                "Aucun événement disponible."
+            )
+
+    except Exception as exc:
 
         print(
-            "\n[5] Test du message Telegram..."
+            f"ERREUR: {exc}"
         )
-
-        telegram_message = (
-            economic_news_supervisor
-            .format_event_message(
-                first_event,
-                explanation,
-            )
-        )
-
-        print("\n" + "-" * 60)
-        print("MESSAGE TELEGRAM")
-        print("-" * 60)
-
-        print(telegram_message)
-
-    print("\n" + "=" * 60)
-    print("TEST TERMINÉ")
-    print("=" * 60)
