@@ -1,17 +1,54 @@
-import os
+"""
+NOVA TRADE AI
+telegram_bot.py
+
+Interface Telegram + scanner automatique.
+
+Architecture :
+    H4  -> tendance principale
+    H1  -> structure / zone
+    M15 -> validation principale
+    M5  -> confirmation secondaire
+
+Validation signal :
+    H4 + H1 + M15 alignés
+    Score >= CONFIG.SIGNAL_THRESHOLD
+    RR >= CONFIG.MINIMUM_RR
+
+M5 ne bloque pas un setup H4/H1/M15 valide.
+
+Protection :
+    - analyses sérialisées
+    - délai entre symboles
+    - scanner démarré après Telegram
+    - aucun doublon de task au démarrage
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
+from typing import Any, Dict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
 )
 
-from config import CONFIG, ALL_SYMBOLS
+from config import (
+    CONFIG,
+    ALL_SYMBOLS,
+)
+
 from analysis.pipeline import analyze_market
 
 
@@ -20,103 +57,175 @@ from analysis.pipeline import analyze_market
 # ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(message)s"
+    ),
     level=logging.INFO,
 )
 
-logger = logging.getLogger("NOVA_TRADE_AI")
+logger = logging.getLogger(
+    "NOVA_TRADE_AI.TELEGRAM"
+)
 
 
 # ============================================================
-# CONFIGURATION
+# TOKEN
 # ============================================================
 
-# Nettoyage automatique du token :
-# supprime espaces, retours à la ligne et caractères invisibles.
+# IMPORTANT :
+# supprime automatiquement espaces et retours à la ligne
+# éventuellement présents dans Railway.
 TELEGRAM_BOT_TOKEN = "".join(
-    os.getenv("TELEGRAM_BOT_TOKEN", "").split()
+    os.getenv(
+        "TELEGRAM_BOT_TOKEN",
+        ""
+    ).split()
 )
-
-SCAN_INTERVAL_SECONDS = int(
-    os.getenv("SCAN_INTERVAL_SECONDS", "900")
-)
-
-# Délai entre deux marchés.
-# Important pour éviter les bursts Twelve Data.
-SCAN_SYMBOL_DELAY_SECONDS = int(
-    os.getenv("SCAN_SYMBOL_DELAY_SECONDS", "15")
-)
-
-
-# ============================================================
-# VERIFICATION TOKEN
-# ============================================================
 
 if not TELEGRAM_BOT_TOKEN:
+
     raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN est absent des variables Railway."
+        "TELEGRAM_BOT_TOKEN est absent "
+        "des variables d'environnement."
     )
 
 
 # ============================================================
-# LOCK GLOBAL
+# SCANNER
 # ============================================================
 
-# Empêche une analyse automatique et une analyse manuelle
-# de contacter les fournisseurs de données simultanément.
+SCAN_INTERVAL_SECONDS = int(
+    os.getenv(
+        "SCAN_INTERVAL_SECONDS",
+        "900"
+    )
+)
+
+SCAN_SYMBOL_DELAY_SECONDS = int(
+    os.getenv(
+        "SCAN_SYMBOL_DELAY_SECONDS",
+        "15"
+    )
+)
+
+
+# ============================================================
+# LOCK ANALYSES
+# ============================================================
+
 analysis_lock = asyncio.Lock()
 
 
 # ============================================================
-# OUTILS
+# ETAT SCANNER
 # ============================================================
 
-def utc_now():
-    return datetime.now(timezone.utc)
+scanner_started = False
+
+scanner_task = None
 
 
-def safe_float(value, default=0.0):
+# ============================================================
+# UTILS
+# ============================================================
+
+def safe_float(
+    value: Any,
+    default: float = 0.0
+) -> float:
+
     try:
         return float(value)
-    except Exception:
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
         return default
 
 
-def get_result_value(result, key, default=None):
-    if not isinstance(result, dict):
-        return default
-
-    value = result.get(key)
-
-    if value is None:
-        return default
-
-    return value
+def utc_now():
+    return datetime.now(
+        timezone.utc
+    )
 
 
 # ============================================================
-# ANALYSE SECURISEE
+# MENU
 # ============================================================
 
-async def run_market_analysis(symbol):
+def main_menu():
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📊 Analyser",
+                callback_data="analyse",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📡 Statut",
+                callback_data="status",
+            ),
+            InlineKeyboardButton(
+                "ℹ️ À propos",
+                callback_data="about",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔄 Actualiser",
+                callback_data="refresh",
+            )
+        ],
+    ]
+
+    return InlineKeyboardMarkup(
+        keyboard
+    )
+
+
+# ============================================================
+# ANALYSE
+# ============================================================
+
+async def run_market_analysis(
+    symbol: str
+) -> Dict[str, Any]:
+
     """
-    Lance une analyse de marché en protégeant les appels
-    fournisseurs contre les analyses simultanées.
+    Sérialise les analyses afin d'éviter :
+
+        scanner -> Twelve Data
+        Telegram -> Twelve Data
+
+    en même temps.
     """
 
     async with analysis_lock:
 
         try:
+
             result = await asyncio.to_thread(
                 analyze_market,
                 symbol
             )
 
-            if not isinstance(result, dict):
+            if not isinstance(
+                result,
+                dict
+            ):
+
                 return {
-                    "status": "ERROR",
-                    "reason": "Réponse d'analyse invalide.",
                     "symbol": symbol,
+                    "status": "ERROR",
+                    "reason": (
+                        "Réponse d'analyse invalide."
+                    ),
                 }
 
             return result
@@ -130,81 +239,138 @@ async def run_market_analysis(symbol):
             )
 
             return {
+                "symbol": symbol,
                 "status": "ERROR",
                 "reason": str(exc),
-                "symbol": symbol,
             }
 
 
 # ============================================================
-# VALIDATION SIGNAL AUTOMATIQUE
+# VALIDATION AUTOMATIQUE
 # ============================================================
 
-def is_valid_automatic_signal(result):
+def is_valid_automatic_signal(
+    result: Dict[str, Any]
+) -> bool:
 
-    if not isinstance(result, dict):
+    if not isinstance(
+        result,
+        dict
+    ):
         return False
 
     status = str(
-        result.get("status", "")
+        result.get(
+            "status",
+            ""
+        )
     ).upper()
 
     direction = str(
-        result.get("direction", "")
+        result.get(
+            "direction",
+            ""
+        )
     ).upper()
 
     if status != "ACTIVE":
         return False
 
-    if direction not in ("BUY", "SELL"):
+    if direction not in (
+        "BUY",
+        "SELL",
+    ):
         return False
 
+    # --------------------------------------------------------
+    # VALIDATION PRINCIPALE
+    # H4 + H1 + M15
+    # --------------------------------------------------------
+
     h4 = str(
-        result.get("h4_direction", "")
+        result.get(
+            "h4_direction",
+            ""
+        )
     ).upper()
 
     h1 = str(
-        result.get("h1_direction", "")
+        result.get(
+            "h1_direction",
+            ""
+        )
     ).upper()
 
     m15 = str(
-        result.get("m15_direction", "")
+        result.get(
+            "m15_direction",
+            ""
+        )
     ).upper()
 
-    # Validation principale stricte :
-    # H4 + H1 + M15 doivent être alignés.
     if not (
         h4 == direction
         and h1 == direction
         and m15 == direction
     ):
+
         return False
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
 
     score = safe_float(
-        result.get("score", 0)
+        result.get(
+            "score",
+            0
+        )
     )
 
-    rr = safe_float(
-        result.get("rr", 0)
-    )
+    if (
+        score
+        < CONFIG.SIGNAL_THRESHOLD
+    ):
 
-    if score < CONFIG.SIGNAL_THRESHOLD:
         return False
 
-    if rr < CONFIG.MINIMUM_RR:
+    # --------------------------------------------------------
+    # RR
+    # --------------------------------------------------------
+
+    rr = safe_float(
+        result.get(
+            "rr",
+            0
+        )
+    )
+
+    if (
+        rr
+        < CONFIG.MINIMUM_RR
+    ):
+
         return False
 
     return True
 
 
 # ============================================================
-# FORMATAGE RESULTAT
+# FORMAT RESULTAT
 # ============================================================
 
-def format_analysis(result):
+def format_analysis(
+    result: Dict[str, Any]
+) -> str:
 
-    if not isinstance(result, dict):
-        return "❌ Résultat d'analyse invalide."
+    if not isinstance(
+        result,
+        dict
+    ):
+
+        return (
+            "❌ Résultat d'analyse invalide."
+        )
 
     symbol = result.get(
         "symbol",
@@ -217,16 +383,25 @@ def format_analysis(result):
     )
 
     score = safe_float(
-        result.get("score", 0)
+        result.get(
+            "score",
+            0
+        )
     )
 
     rr = safe_float(
-        result.get("rr", 0)
+        result.get(
+            "rr",
+            0
+        )
     )
 
     quality = result.get(
         "quality",
-        result.get("qualite", "N/A")
+        result.get(
+            "qualite",
+            "N/A"
+        )
     )
 
     status = result.get(
@@ -244,12 +419,16 @@ def format_analysis(result):
 
     stop_loss = result.get(
         "stop_loss",
-        result.get("sl")
+        result.get(
+            "sl"
+        )
     )
 
     take_profit = result.get(
         "take_profit",
-        result.get("tp")
+        result.get(
+            "tp"
+        )
     )
 
     h4 = result.get(
@@ -282,7 +461,7 @@ def format_analysis(result):
         f"⭐ Qualité : *{quality}*",
         f"📌 Statut : *{status}*",
         "",
-        "🧭 *Alignement*",
+        "🧭 *ALIGNEMENT*",
         f"H4  : `{h4}`",
         f"H1  : `{h1}`",
         f"M15 : `{m15}`",
@@ -290,25 +469,29 @@ def format_analysis(result):
     ]
 
     if entry is not None:
+
         lines.extend(
             [
                 "",
-                "💰 *Trade*",
+                "💰 *TRADE*",
                 f"Entry : `{entry}`",
             ]
         )
 
     if stop_loss is not None:
+
         lines.append(
             f"🛑 SL : `{stop_loss}`"
         )
 
     if take_profit is not None:
+
         lines.append(
             f"🎯 TP : `{take_profit}`"
         )
 
     if reason:
+
         lines.extend(
             [
                 "",
@@ -316,41 +499,9 @@ def format_analysis(result):
             ]
         )
 
-    return "\n".join(lines)
-
-
-# ============================================================
-# MENU
-# ============================================================
-
-def main_menu():
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "📊 Analyser",
-                callback_data="analyse"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📡 Statut",
-                callback_data="status"
-            ),
-            InlineKeyboardButton(
-                "ℹ️ À propos",
-                callback_data="about"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🔄 Actualiser",
-                callback_data="refresh"
-            ),
-        ],
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
@@ -362,14 +513,24 @@ async def start_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if update.effective_chat:
+
+        context.application.bot_data.setdefault(
+            "chat_ids",
+            set()
+        ).add(
+            update.effective_chat.id
+        )
+
     text = (
         "🤖 *Bienvenue sur NOVA TRADE AI*\n\n"
         "Système d'analyse multi-timeframe "
-        "basé sur Price Action / SMC / ICT.\n\n"
+        "Price Action / SMC / ICT.\n\n"
         "Sélectionne une action :"
     )
 
     if update.message:
+
         await update.message.reply_text(
             text,
             parse_mode="Markdown",
@@ -386,6 +547,15 @@ async def help_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if update.effective_chat:
+
+        context.application.bot_data.setdefault(
+            "chat_ids",
+            set()
+        ).add(
+            update.effective_chat.id
+        )
+
     text = (
         "📚 *Commandes disponibles*\n\n"
         "/start — Menu principal\n"
@@ -395,11 +565,13 @@ async def help_command(
         "/help — Aide"
     )
 
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=main_menu(),
-    )
+    if update.message:
+
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_menu(),
+        )
 
 
 # ============================================================
@@ -411,7 +583,16 @@ async def analyse_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.message is None:
+    if update.effective_chat:
+
+        context.application.bot_data.setdefault(
+            "chat_ids",
+            set()
+        ).add(
+            update.effective_chat.id
+        )
+
+    if not update.message:
         return
 
     await update.message.reply_text(
@@ -423,7 +604,9 @@ async def analyse_command(
     )
 
     await update.message.reply_text(
-        format_analysis(result),
+        format_analysis(
+            result
+        ),
         parse_mode="Markdown",
         reply_markup=main_menu(),
     )
@@ -438,21 +621,36 @@ async def status_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if update.effective_chat:
+
+        context.application.bot_data.setdefault(
+            "chat_ids",
+            set()
+        ).add(
+            update.effective_chat.id
+        )
+
     text = (
         "🟢 *NOVA TRADE AI*\n\n"
-        f"Seuil signal : `{CONFIG.SIGNAL_THRESHOLD}/100`\n"
-        f"RR minimum : `{CONFIG.MINIMUM_RR}`\n"
-        f"Risque/trade : `{CONFIG.DEFAULT_RISK_PERCENT}%`\n\n"
+        f"Score minimum : "
+        f"`{CONFIG.SIGNAL_THRESHOLD}/100`\n"
+        f"RR minimum : "
+        f"`{CONFIG.MINIMUM_RR}`\n"
+        f"Risque/trade : "
+        f"`{CONFIG.DEFAULT_RISK_PERCENT}%`\n\n"
         "Validation principale :\n"
-        "H4 + H1 + M15\n\n"
-        "Confirmation secondaire : M5"
+        "*H4 + H1 + M15*\n\n"
+        "Confirmation secondaire :\n"
+        "*M5*"
     )
 
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=main_menu(),
-    )
+    if update.message:
+
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_menu(),
+        )
 
 
 # ============================================================
@@ -464,27 +662,41 @@ async def about_command(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    if update.effective_chat:
+
+        context.application.bot_data.setdefault(
+            "chat_ids",
+            set()
+        ).add(
+            update.effective_chat.id
+        )
+
     text = (
         "🤖 *NOVA TRADE AI*\n\n"
-        "Analyse multi-timeframe professionnelle.\n\n"
+        "Moteur d'analyse basé sur "
+        "Price Action / SMC / ICT.\n\n"
         "Architecture :\n"
         "• H4 → tendance\n"
-        "• H1 → structure / zones\n"
-        "• M15 → confirmation de zone\n"
-        "• M5 → confirmation d'entrée secondaire\n\n"
-        f"Score minimum : {CONFIG.SIGNAL_THRESHOLD}/100\n"
-        f"RR minimum : {CONFIG.MINIMUM_RR}"
+        "• H1 → structure / zone\n"
+        "• M15 → validation principale\n"
+        "• M5 → confirmation secondaire\n\n"
+        f"Score minimum : "
+        f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
+        f"RR minimum : "
+        f"{CONFIG.MINIMUM_RR}"
     )
 
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=main_menu(),
-    )
+    if update.message:
+
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=main_menu(),
+        )
 
 
 # ============================================================
-# CALLBACKS
+# CALLBACK
 # ============================================================
 
 async def callback_handler(
@@ -494,12 +706,25 @@ async def callback_handler(
 
     query = update.callback_query
 
-    if query is None:
+    if not query:
         return
 
     await query.answer()
 
+    if query.message:
+
+        context.application.bot_data.setdefault(
+            "chat_ids",
+            set()
+        ).add(
+            query.message.chat_id
+        )
+
     action = query.data
+
+    # --------------------------------------------------------
+    # ANALYSE
+    # --------------------------------------------------------
 
     if action == "analyse":
 
@@ -512,12 +737,18 @@ async def callback_handler(
         )
 
         await query.edit_message_text(
-            format_analysis(result),
+            format_analysis(
+                result
+            ),
             parse_mode="Markdown",
             reply_markup=main_menu(),
         )
 
         return
+
+    # --------------------------------------------------------
+    # REFRESH
+    # --------------------------------------------------------
 
     if action == "refresh":
 
@@ -530,20 +761,29 @@ async def callback_handler(
         )
 
         await query.edit_message_text(
-            format_analysis(result),
+            format_analysis(
+                result
+            ),
             parse_mode="Markdown",
             reply_markup=main_menu(),
         )
 
         return
 
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
+
     if action == "status":
 
         text = (
-            "🟢 *Système opérationnel*\n\n"
-            f"Score minimum : `{CONFIG.SIGNAL_THRESHOLD}/100`\n"
-            f"RR minimum : `{CONFIG.MINIMUM_RR}`\n"
-            "Validation : H4 + H1 + M15\n"
+            "🟢 *SYSTÈME OPÉRATIONNEL*\n\n"
+            f"Score minimum : "
+            f"`{CONFIG.SIGNAL_THRESHOLD}/100`\n"
+            f"RR minimum : "
+            f"`{CONFIG.MINIMUM_RR}`\n\n"
+            "Validation principale : "
+            "*H4 + H1 + M15*\n"
             "M5 : confirmation secondaire"
         )
 
@@ -554,6 +794,10 @@ async def callback_handler(
         )
 
         return
+
+    # --------------------------------------------------------
+    # ABOUT
+    # --------------------------------------------------------
 
     if action == "about":
 
@@ -569,8 +813,6 @@ async def callback_handler(
             reply_markup=main_menu(),
         )
 
-        return
-
 
 # ============================================================
 # SCANNER AUTOMATIQUE
@@ -579,6 +821,18 @@ async def callback_handler(
 async def automatic_scanner(
     application: Application
 ):
+
+    global scanner_started
+
+    if scanner_started:
+
+        logger.warning(
+            "Scanner déjà démarré."
+        )
+
+        return
+
+    scanner_started = True
 
     logger.info(
         "Scanner automatique démarré."
@@ -592,7 +846,9 @@ async def automatic_scanner(
                 "=== NOUVEAU SCAN ==="
             )
 
-            for symbol in ALL_SYMBOLS:
+            for index, symbol in enumerate(
+                ALL_SYMBOLS
+            ):
 
                 try:
 
@@ -601,8 +857,10 @@ async def automatic_scanner(
                         symbol,
                     )
 
-                    result = await run_market_analysis(
-                        symbol
+                    result = (
+                        await run_market_analysis(
+                            symbol
+                        )
                     )
 
                     if is_valid_automatic_signal(
@@ -614,31 +872,42 @@ async def automatic_scanner(
                             symbol,
                         )
 
-                        message = format_analysis(
-                            result
+                        message = (
+                            format_analysis(
+                                result
+                            )
                         )
 
-                        # Envoi aux utilisateurs ayant lancé /start
-                        # si l'application possède un chat_id configuré.
-                        chat_ids = application.bot_data.get(
-                            "chat_ids",
-                            set()
+                        chat_ids = (
+                            application
+                            .bot_data
+                            .get(
+                                "chat_ids",
+                                set()
+                            )
                         )
 
-                        for chat_id in list(chat_ids):
+                        for chat_id in list(
+                            chat_ids
+                        ):
 
                             try:
 
-                                await application.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=message,
-                                    parse_mode="Markdown",
+                                await (
+                                    application
+                                    .bot
+                                    .send_message(
+                                        chat_id=chat_id,
+                                        text=message,
+                                        parse_mode="Markdown",
+                                    )
                                 )
 
                             except Exception as exc:
 
                                 logger.error(
-                                    "Erreur envoi Telegram %s : %s",
+                                    "Erreur envoi Telegram "
+                                    "%s : %s",
                                     chat_id,
                                     exc,
                                 )
@@ -658,13 +927,24 @@ async def automatic_scanner(
                         exc,
                     )
 
-                # Anti-burst Twelve Data
-                await asyncio.sleep(
-                    SCAN_SYMBOL_DELAY_SECONDS
-                )
+                # ------------------------------------------------
+                # DELAI ENTRE LES SYMBOLES
+                # ------------------------------------------------
+
+                if index < (
+                    len(ALL_SYMBOLS) - 1
+                ):
+
+                    await asyncio.sleep(
+                        SCAN_SYMBOL_DELAY_SECONDS
+                    )
 
             logger.info(
-                "Scan terminé. Prochain scan dans %s secondes.",
+                "Scan terminé."
+            )
+
+            logger.info(
+                "Prochain scan dans %s secondes.",
                 SCAN_INTERVAL_SECONDS,
             )
 
@@ -673,9 +953,13 @@ async def automatic_scanner(
             )
 
         except asyncio.CancelledError:
+
             logger.info(
                 "Scanner automatique arrêté."
             )
+
+            scanner_started = False
+
             raise
 
         except Exception as exc:
@@ -685,7 +969,34 @@ async def automatic_scanner(
                 exc,
             )
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(
+                60
+            )
+
+
+# ============================================================
+# DEMARRAGE DIFFERE DU SCANNER
+# ============================================================
+
+def _start_scanner_later(
+    application: Application
+):
+
+    global scanner_task
+
+    if scanner_task is not None:
+
+        if not scanner_task.done():
+
+            return
+
+    scanner_task = (
+        application.create_task(
+            automatic_scanner(
+                application
+            )
+        )
+    )
 
 
 # ============================================================
@@ -696,49 +1007,33 @@ async def post_init(
     application: Application
 ):
 
-    application.bot_data["chat_ids"] = set()
-
-    async def register_chat(update: Update):
-
-        if update.effective_chat:
-
-            application.bot_data[
-                "chat_ids"
-            ].add(
-                update.effective_chat.id
-            )
-
     application.bot_data[
-        "register_chat"
-    ] = register_chat
+        "chat_ids"
+    ] = set()
 
-    # Lancement du scanner
-    application.create_task(
-        automatic_scanner(application)
+    # --------------------------------------------------------
+    # IMPORTANT
+    #
+    # On NE démarre plus directement le scanner ici.
+    #
+    # post_init intervient avant que l'application soit
+    # complètement en état RUNNING.
+    #
+    # call_later permet de créer la task après le démarrage
+    # réel de l'application et supprime le PTBUserWarning.
+    # --------------------------------------------------------
+
+    loop = asyncio.get_running_loop()
+
+    loop.call_later(
+        2.0,
+        _start_scanner_later,
+        application,
     )
 
     logger.info(
-        "Scanner automatique initialisé."
+        "Scanner automatique programmé."
     )
-
-
-# ============================================================
-# TRACK CHAT IDS
-# ============================================================
-
-async def track_chat(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if update.effective_chat:
-
-        context.application.bot_data.setdefault(
-            "chat_ids",
-            set()
-        ).add(
-            update.effective_chat.id
-        )
 
 
 # ============================================================
@@ -753,23 +1048,23 @@ def run_bot():
 
     application = (
         Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
+        .token(
+            TELEGRAM_BOT_TOKEN
+        )
+        .post_init(
+            post_init
+        )
         .build()
     )
 
-    # Commandes
+    # --------------------------------------------------------
+    # COMMANDES
+    # --------------------------------------------------------
+
     application.add_handler(
         CommandHandler(
             "start",
             start_command
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command
         )
     )
 
@@ -794,12 +1089,26 @@ def run_bot():
         )
     )
 
-    # Track utilisateur
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command
+        )
+    )
+
+    # --------------------------------------------------------
+    # CALLBACKS
+    # --------------------------------------------------------
+
     application.add_handler(
         CallbackQueryHandler(
             callback_handler
         )
     )
+
+    # --------------------------------------------------------
+    # BANNER
+    # --------------------------------------------------------
 
     logger.info(
         "NOVA TRADE AI prêt."
@@ -809,31 +1118,47 @@ def run_bot():
     print("=" * 50)
     print("        NOVA TRADE AI")
     print("=" * 50)
+
     print(
         f"Signal minimum : "
         f"{CONFIG.SIGNAL_THRESHOLD}/100"
     )
+
     print(
         f"RR minimum     : "
         f"{CONFIG.MINIMUM_RR}"
     )
+
     print(
         f"Risk/trade     : "
         f"{CONFIG.DEFAULT_RISK_PERCENT}%"
     )
+
     print(
         f"Tendance       : "
         f"{' + '.join(CONFIG.TREND_TIMEFRAMES)}"
     )
+
     print(
         f"Zones          : "
         f"{' + '.join(CONFIG.ZONE_TIMEFRAMES)}"
     )
+
     print(
         f"Confirmation   : "
         f"{CONFIG.CONFIRMATION_TIMEFRAME}"
     )
+
+    print(
+        f"Auto execution : "
+        f"{CONFIG.AUTO_EXECUTION_ENABLED}"
+    )
+
     print("=" * 50)
+
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
 
     application.run_polling(
         drop_pending_updates=True
