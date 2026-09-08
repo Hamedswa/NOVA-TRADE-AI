@@ -14,27 +14,27 @@ Architecture :
         ↓
     Alignement principal
         ↓
-    Recherche multi-zones
+    Recherche MULTI-ZONES
         ↓
     Breakout
+        ↓
+    Momentum / vitesse du breakout
         ↓
     Retest
         ↓
     Rejection
         ↓
-    Confirmation candle
-        ↓
-    Momentum / vitesse
+    Confirmation candle M15
         ↓
     Volatilité / ATR
         ↓
-    Liquidité
+    Liquidité / M5
         ↓
-    M5 = confirmation secondaire
+    M5 = confirmation secondaire NON BLOQUANTE
         ↓
     SL / TP / RR
         ↓
-    Score
+    Score >= 60
         ↓
     News / marché
         ↓
@@ -48,8 +48,12 @@ RÈGLES :
     - Score minimum : 60.
     - RR minimum : 2.0.
     - Aucun signal forcé.
-    - Breakout absent = WAIT, pas faux REJECT.
     - Plusieurs zones candidates sont testées.
+    - Breakout absent = WAIT.
+    - Retest absent = WAIT.
+    - Rejection absente = WAIT.
+    - Confirmation candle absente = WAIT.
+    - Momentum insuffisant = WAIT.
     - Crypto indépendante de Twelve Data.
 """
 
@@ -159,6 +163,18 @@ DIRECTIONS = {
 
 MINIMUM_CANDLES = 20
 
+# Nombre maximum de zones à examiner
+MAX_ZONE_CANDIDATES = 8
+
+# Nombre de bougies M15 utilisées pour rechercher un breakout
+BREAKOUT_LOOKBACK = 8
+
+# Nombre de bougies maximum après breakout pour rechercher le retest
+RETEST_LOOKBACK = 12
+
+# Tolérance de regroupement des niveaux
+LEVEL_CLUSTER_PERCENT = 0.0005
+
 
 # ============================================================================
 # HELPERS
@@ -228,6 +244,7 @@ def _is_crypto_symbol(
 
 
 def _utc_now() -> datetime:
+
     return datetime.now(
         timezone.utc
     )
@@ -362,6 +379,7 @@ def _twelve_data_ready(
     symbol: str,
 ) -> Tuple[bool, str]:
 
+    # Crypto = Coinbase uniquement.
     if _is_crypto_symbol(
         symbol
     ):
@@ -711,6 +729,7 @@ def _candle_value(
 
 
 def _open(candle: Any) -> float:
+
     return _candle_value(
         candle,
         "open",
@@ -718,6 +737,7 @@ def _open(candle: Any) -> float:
 
 
 def _close(candle: Any) -> float:
+
     return _candle_value(
         candle,
         "close",
@@ -725,6 +745,7 @@ def _close(candle: Any) -> float:
 
 
 def _high(candle: Any) -> float:
+
     return _candle_value(
         candle,
         "high",
@@ -732,6 +753,7 @@ def _high(candle: Any) -> float:
 
 
 def _low(candle: Any) -> float:
+
     return _candle_value(
         candle,
         "low",
@@ -780,7 +802,9 @@ def _calculate_atr(
             )
 
         if tr >= 0:
-            true_ranges.append(tr)
+            true_ranges.append(
+                tr
+            )
 
         previous_close = close
 
@@ -838,7 +862,9 @@ def _swing_highs(
                 break
 
         if valid:
-            highs.append(current)
+            highs.append(
+                current
+            )
 
     return highs
 
@@ -885,7 +911,9 @@ def _swing_lows(
                 break
 
         if valid:
-            lows.append(current)
+            lows.append(
+                current
+            )
 
     return lows
 
@@ -977,7 +1005,7 @@ def _primary_alignment(
 def _build_zone_candidates(
     candles: Sequence[Any],
     direction: str,
-    max_zones: int = 8,
+    max_zones: int = MAX_ZONE_CANDIDATES,
 ) -> List[Tuple[float, float]]:
 
     direction = _normalize_direction(
@@ -995,8 +1023,7 @@ def _build_zone_candidates(
 
     if direction == "BUY":
 
-        # Pour BUY, on recherche des résistances
-        # dont la cassure peut confirmer l'impulsion.
+        # BUY = recherche de résistances à casser.
         candidates.extend(
             _swing_highs(
                 recent,
@@ -1006,14 +1033,13 @@ def _build_zone_candidates(
 
         candidates.extend(
             _high(c)
-            for c in recent[-20:]
+            for c in recent[-25:]
             if _high(c) > 0
         )
 
     elif direction == "SELL":
 
-        # Pour SELL, on recherche des supports
-        # dont la cassure peut confirmer l'impulsion.
+        # SELL = recherche de supports à casser.
         candidates.extend(
             _swing_lows(
                 recent,
@@ -1023,13 +1049,9 @@ def _build_zone_candidates(
 
         candidates.extend(
             _low(c)
-            for c in recent[-20:]
+            for c in recent[-25:]
             if _low(c) > 0
         )
-
-    # ------------------------------------------------------------------
-    # Nettoyage
-    # ------------------------------------------------------------------
 
     clean: List[float] = []
 
@@ -1042,19 +1064,22 @@ def _build_zone_candidates(
         if value <= 0:
             continue
 
+        tolerance = max(
+            abs(value)
+            * LEVEL_CLUSTER_PERCENT,
+            1e-8,
+        )
+
         if not any(
-            abs(value - existing)
-            <= max(
-                abs(value) * 0.0005,
-                1e-8,
-            )
+            abs(
+                value - existing
+            ) <= tolerance
             for existing in clean
         ):
-            clean.append(value)
 
-    # ------------------------------------------------------------------
-    # Trier selon proximité au prix actuel
-    # ------------------------------------------------------------------
+            clean.append(
+                value
+            )
 
     current_price = _close(
         recent[-1]
@@ -1072,7 +1097,9 @@ def _build_zone_candidates(
 
         clean.reverse()
 
-    clean = clean[:max_zones]
+    clean = clean[
+        :max_zones
+    ]
 
     zones: List[
         Tuple[float, float]
@@ -1096,8 +1123,76 @@ def _build_zone_candidates(
 
 
 # ============================================================================
-# BREAKOUT
+# BREAKOUT DÉTAILLÉ
 # ============================================================================
+
+def _find_breakout(
+    candles: Sequence[Any],
+    direction: str,
+    level_low: float,
+    level_high: float,
+) -> Optional[int]:
+
+    direction = _normalize_direction(
+        direction
+    )
+
+    if not candles:
+        return None
+
+    if (
+        level_low <= 0
+        or level_high <= 0
+    ):
+        return None
+
+    start = max(
+        0,
+        len(candles)
+        - BREAKOUT_LOOKBACK,
+    )
+
+    for index in range(
+        start,
+        len(candles),
+    ):
+
+        candle = candles[index]
+
+        close_price = _close(
+            candle
+        )
+
+        open_price = _open(
+            candle
+        )
+
+        if (
+            close_price <= 0
+            or open_price <= 0
+        ):
+            continue
+
+        if direction == "BUY":
+
+            if (
+                close_price
+                > level_high
+            ):
+
+                return index
+
+        elif direction == "SELL":
+
+            if (
+                close_price
+                < level_low
+            ):
+
+                return index
+
+    return None
+
 
 def _breakout_confirmed(
     candles: Sequence[Any],
@@ -1106,187 +1201,466 @@ def _breakout_confirmed(
     level_high: float,
 ) -> bool:
 
+    return (
+        _find_breakout(
+            candles,
+            direction,
+            level_low,
+            level_high,
+        )
+        is not None
+    )
+
+
+# ============================================================================
+# MOMENTUM / VITESSE DU BREAKOUT
+# ============================================================================
+
+def _analyze_breakout_momentum(
+    candles: Sequence[Any],
+    direction: str,
+    breakout_index: Optional[int],
+    atr: float = 0.0,
+) -> Dict[str, Any]:
+
     direction = _normalize_direction(
         direction
     )
 
-    if not candles:
-        return False
-
     if (
-        level_low <= 0
-        or level_high <= 0
+        not candles
+        or breakout_index is None
+        or breakout_index < 0
+        or breakout_index >= len(candles)
     ):
-        return False
 
-    recent = list(
-        candles
-    )[-5:]
+        return {
+            "valid": False,
+            "speed": 0.0,
+            "body_ratio": 0.0,
+            "range_ratio": 0.0,
+            "expansion": False,
+            "breakout_index": None,
+        }
 
-    if direction == "BUY":
+    candle = candles[
+        breakout_index
+    ]
 
-        return any(
-            _close(candle)
-            > level_high
-            for candle in recent
+    open_price = _open(
+        candle
+    )
+
+    close_price = _close(
+        candle
+    )
+
+    high = _high(
+        candle
+    )
+
+    low = _low(
+        candle
+    )
+
+    candle_range = (
+        high - low
+    )
+
+    body = abs(
+        close_price - open_price
+    )
+
+    if candle_range <= 0:
+
+        return {
+            "valid": False,
+            "speed": 0.0,
+            "body_ratio": 0.0,
+            "range_ratio": 0.0,
+            "expansion": False,
+            "breakout_index": breakout_index,
+        }
+
+    body_ratio = (
+        body / candle_range
+    )
+
+    # ATR
+    range_ratio = 0.0
+
+    if atr > 0:
+
+        range_ratio = (
+            candle_range / atr
         )
 
-    if direction == "SELL":
+    # Vitesse = déplacement sur les 3 dernières
+    # bougies avant le breakout.
+    speed = 0.0
 
-        return any(
-            _close(candle)
-            < level_low
-            for candle in recent
-        )
+    start_index = max(
+        0,
+        breakout_index - 3,
+    )
 
-    return False
+    previous_close = _close(
+        candles[start_index]
+    )
+
+    if previous_close > 0:
+
+        speed = abs(
+            close_price
+            - previous_close
+        ) / previous_close
+
+    candle_direction = "NEUTRAL"
+
+    if close_price > open_price:
+        candle_direction = "BUY"
+
+    elif close_price < open_price:
+        candle_direction = "SELL"
+
+    directional = (
+        candle_direction == direction
+    )
+
+    # Expansion :
+    # le breakout doit au minimum présenter
+    # une bougie suffisamment active.
+    expansion = (
+        range_ratio >= 0.50
+    )
+
+    # Validation raisonnable :
+    # direction + corps correct + amplitude minimale.
+    valid = (
+        directional
+        and body_ratio >= 0.40
+        and expansion
+    )
+
+    return {
+        "valid": bool(valid),
+        "speed": round(
+            speed,
+            8,
+        ),
+        "body_ratio": round(
+            body_ratio,
+            4,
+        ),
+        "range_ratio": round(
+            range_ratio,
+            4,
+        ),
+        "expansion": bool(
+            expansion
+        ),
+        "direction": candle_direction,
+        "breakout_index": breakout_index,
+    }
 
 
 # ============================================================================
-# RETEST
+# RETEST APRÈS BREAKOUT
 # ============================================================================
 
-def _retest_confirmed(
+def _find_retest(
     candles: Sequence[Any],
     direction: str,
     level_low: float,
     level_high: float,
-) -> bool:
+    breakout_index: Optional[int],
+) -> Optional[int]:
 
     direction = _normalize_direction(
         direction
     )
 
-    if not candles:
-        return False
+    if (
+        not candles
+        or breakout_index is None
+    ):
+        return None
+
+    if (
+        breakout_index < 0
+        or breakout_index >= len(candles)
+    ):
+        return None
+
+    zone_width = abs(
+        level_high - level_low
+    )
 
     tolerance = max(
-        abs(
-            level_high - level_low
-        ) * 1.5,
+        zone_width * 1.5,
         1e-8,
     )
 
-    recent = list(
-        candles
-    )[-12:]
+    start = (
+        breakout_index + 1
+    )
 
-    for candle in recent:
+    end = min(
+        len(candles),
+        start + RETEST_LOOKBACK,
+    )
+
+    if start >= end:
+        return None
+
+    for index in range(
+        start,
+        end,
+    ):
+
+        candle = candles[index]
 
         high = _high(candle)
         low = _low(candle)
 
+        if (
+            high <= 0
+            or low <= 0
+        ):
+            continue
+
+        # Le prix doit revenir dans / proche
+        # de la zone après le breakout.
+        overlaps = (
+            high
+            >= level_low - tolerance
+            and low
+            <= level_high + tolerance
+        )
+
+        if not overlaps:
+            continue
+
+        close_price = _close(
+            candle
+        )
+
         if direction == "BUY":
 
+            # Le retest doit tester la zone
+            # et conserver une clôture acceptable.
             if (
                 low
                 <= level_high + tolerance
-                and high
-                >= level_low - tolerance
+                and close_price > 0
             ):
-                return True
+                return index
 
         elif direction == "SELL":
 
             if (
                 high
                 >= level_low - tolerance
-                and low
-                <= level_high + tolerance
+                and close_price > 0
             ):
-                return True
+                return index
 
-    return False
+    return None
+
+
+def _retest_confirmed(
+    candles: Sequence[Any],
+    direction: str,
+    level_low: float,
+    level_high: float,
+    breakout_index: Optional[int] = None,
+) -> bool:
+
+    if breakout_index is None:
+
+        breakout_index = _find_breakout(
+            candles,
+            direction,
+            level_low,
+            level_high,
+        )
+
+    return (
+        _find_retest(
+            candles,
+            direction,
+            level_low,
+            level_high,
+            breakout_index,
+        )
+        is not None
+    )
 
 
 # ============================================================================
-# REJECTION
+# REJECTION APRÈS RETEST
 # ============================================================================
+
+def _find_rejection(
+    candles: Sequence[Any],
+    direction: str,
+    retest_index: Optional[int],
+) -> Optional[int]:
+
+    direction = _normalize_direction(
+        direction
+    )
+
+    if (
+        not candles
+        or retest_index is None
+    ):
+        return None
+
+    # On analyse les bougies qui suivent le retest.
+    start = max(
+        retest_index,
+        0,
+    )
+
+    end = min(
+        len(candles),
+        retest_index + 4,
+    )
+
+    for index in range(
+        start,
+        end,
+    ):
+
+        candle = candles[index]
+
+        open_price = _open(
+            candle
+        )
+
+        close_price = _close(
+            candle
+        )
+
+        high = _high(
+            candle
+        )
+
+        low = _low(
+            candle
+        )
+
+        if (
+            open_price <= 0
+            or close_price <= 0
+            or high <= 0
+            or low <= 0
+        ):
+            continue
+
+        body = abs(
+            close_price - open_price
+        )
+
+        upper_wick = max(
+            0.0,
+            high
+            - max(
+                open_price,
+                close_price,
+            ),
+        )
+
+        lower_wick = max(
+            0.0,
+            min(
+                open_price,
+                close_price,
+            )
+            - low,
+        )
+
+        if direction == "BUY":
+
+            if (
+                close_price >= open_price
+                and lower_wick >= body
+            ):
+                return index
+
+        elif direction == "SELL":
+
+            if (
+                close_price <= open_price
+                and upper_wick >= body
+            ):
+                return index
+
+    return None
+
 
 def _rejection_confirmed(
     candles: Sequence[Any],
     direction: str,
 ) -> bool:
 
-    direction = _normalize_direction(
-        direction
-    )
-
     if not candles:
         return False
 
-    candle = list(
-        candles
-    )[-1]
+    index = len(candles) - 1
 
-    open_price = _open(candle)
-    close_price = _close(candle)
-    high = _high(candle)
-    low = _low(candle)
-
-    body = abs(
-        close_price - open_price
-    )
-
-    upper_wick = max(
-        0.0,
-        high
-        - max(
-            open_price,
-            close_price,
-        ),
-    )
-
-    lower_wick = max(
-        0.0,
-        min(
-            open_price,
-            close_price,
+    return (
+        _find_rejection(
+            candles,
+            direction,
+            index,
         )
-        - low,
+        is not None
     )
-
-    if direction == "BUY":
-
-        return (
-            close_price >= open_price
-            and lower_wick >= body
-        )
-
-    if direction == "SELL":
-
-        return (
-            close_price <= open_price
-            and upper_wick >= body
-        )
-
-    return False
 
 
 # ============================================================================
 # CANDLE CONFIRMATION
 # ============================================================================
 
-def _candle_confirmation(
+def _candle_confirmation_at(
     candles: Sequence[Any],
     direction: str,
+    index: Optional[int],
 ) -> bool:
 
     direction = _normalize_direction(
         direction
     )
 
-    if not candles:
+    if (
+        not candles
+        or index is None
+        or index < 0
+        or index >= len(candles)
+    ):
         return False
 
-    candle = list(
-        candles
-    )[-1]
+    candle = candles[
+        index
+    ]
 
-    open_price = _open(candle)
-    close_price = _close(candle)
-    high = _high(candle)
-    low = _low(candle)
+    open_price = _open(
+        candle
+    )
+
+    close_price = _close(
+        candle
+    )
+
+    high = _high(
+        candle
+    )
+
+    low = _low(
+        candle
+    )
 
     candle_range = (
         high - low
@@ -1320,142 +1694,215 @@ def _candle_confirmation(
     return False
 
 
-# ============================================================================
-# MOMENTUM / VITESSE
-# ============================================================================
-
-def _momentum_analysis(
+def _candle_confirmation(
     candles: Sequence[Any],
     direction: str,
-) -> Dict[str, Any]:
-
-    direction = _normalize_direction(
-        direction
-    )
+) -> bool:
 
     if not candles:
+        return False
 
-        return {
-            "valid": False,
-            "direction": "NEUTRAL",
-            "speed": 0.0,
-            "body_ratio": 0.0,
-            "expansion": False,
-        }
-
-    recent = list(
-        candles
-    )[-10:]
-
-    if len(recent) < 5:
-
-        return {
-            "valid": False,
-            "direction": "NEUTRAL",
-            "speed": 0.0,
-            "body_ratio": 0.0,
-            "expansion": False,
-        }
-
-    last = recent[-1]
-
-    last_open = _open(last)
-    last_close = _close(last)
-    last_high = _high(last)
-    last_low = _low(last)
-
-    current_range = (
-        last_high - last_low
+    return _candle_confirmation_at(
+        candles,
+        direction,
+        len(candles) - 1,
     )
 
-    current_body = abs(
-        last_close - last_open
-    )
 
-    body_ratio = 0.0
+# ============================================================================
+# VALIDATION COMPLÈTE D'UNE ZONE
+# ============================================================================
 
-    if current_range > 0:
+def _evaluate_zone(
+    candles: Sequence[Any],
+    direction: str,
+    level_low: float,
+    level_high: float,
+    atr: float,
+) -> Dict[str, Any]:
 
-        body_ratio = (
-            current_body
-            / current_range
-        )
-
-    previous_ranges = []
-
-    for candle in recent[:-1]:
-
-        candle_range = (
-            _high(candle)
-            - _low(candle)
-        )
-
-        if candle_range > 0:
-            previous_ranges.append(
-                candle_range
-            )
-
-    average_range = 0.0
-
-    if previous_ranges:
-
-        average_range = (
-            sum(previous_ranges)
-            / len(previous_ranges)
-        )
-
-    expansion = (
-        average_range > 0
-        and current_range
-        >= average_range * 1.10
-    )
-
-    speed = 0.0
-
-    if len(recent) >= 4:
-
-        old_close = _close(
-            recent[-4]
-        )
-
-        if old_close > 0:
-
-            speed = abs(
-                last_close - old_close
-            ) / old_close
-
-    candle_direction = "NEUTRAL"
-
-    if last_close > last_open:
-        candle_direction = "BUY"
-
-    elif last_close < last_open:
-        candle_direction = "SELL"
-
-    directional = (
-        candle_direction == direction
-    )
-
-    valid = (
-        directional
-        and body_ratio >= 0.40
-    )
-
-    return {
-        "valid": bool(valid),
-        "direction": candle_direction,
-        "speed": round(
-            speed,
-            8,
-        ),
-        "body_ratio": round(
-            body_ratio,
-            4,
-        ),
-        "expansion": bool(
-            expansion
-        ),
+    result: Dict[str, Any] = {
+        "low": level_low,
+        "high": level_high,
+        "key_level": (
+            level_low + level_high
+        ) / 2,
+        "breakout_confirmed": False,
+        "breakout_index": None,
+        "momentum_valid": False,
+        "momentum": {},
+        "retest_confirmed": False,
+        "retest_index": None,
+        "rejection_confirmed": False,
+        "rejection_index": None,
+        "candle_confirmation": False,
+        "complete": False,
+        "stage": "ZONE",
     }
+
+    # ------------------------------------------------------------------
+    # 1. BREAKOUT
+    # ------------------------------------------------------------------
+
+    breakout_index = _find_breakout(
+        candles,
+        direction,
+        level_low,
+        level_high,
+    )
+
+    if breakout_index is None:
+
+        result["stage"] = (
+            "WAIT_BREAKOUT"
+        )
+
+        return result
+
+    result[
+        "breakout_confirmed"
+    ] = True
+
+    result[
+        "breakout_index"
+    ] = breakout_index
+
+    # ------------------------------------------------------------------
+    # 2. MOMENTUM
+    # ------------------------------------------------------------------
+
+    momentum = _analyze_breakout_momentum(
+        candles,
+        direction,
+        breakout_index,
+        atr,
+    )
+
+    result[
+        "momentum"
+    ] = momentum
+
+    result[
+        "momentum_valid"
+    ] = bool(
+        momentum.get(
+            "valid",
+            False,
+        )
+    )
+
+    if not result[
+        "momentum_valid"
+    ]:
+
+        result["stage"] = (
+            "WAIT_MOMENTUM"
+        )
+
+        return result
+
+    # ------------------------------------------------------------------
+    # 3. RETEST
+    # ------------------------------------------------------------------
+
+    retest_index = _find_retest(
+        candles,
+        direction,
+        level_low,
+        level_high,
+        breakout_index,
+    )
+
+    if retest_index is None:
+
+        result["stage"] = (
+            "WAIT_RETEST"
+        )
+
+        return result
+
+    result[
+        "retest_confirmed"
+    ] = True
+
+    result[
+        "retest_index"
+    ] = retest_index
+
+    # ------------------------------------------------------------------
+    # 4. REJECTION
+    # ------------------------------------------------------------------
+
+    rejection_index = _find_rejection(
+        candles,
+        direction,
+        retest_index,
+    )
+
+    if rejection_index is None:
+
+        result["stage"] = (
+            "WAIT_REJECTION"
+        )
+
+        return result
+
+    result[
+        "rejection_confirmed"
+    ] = True
+
+    result[
+        "rejection_index"
+    ] = rejection_index
+
+    # ------------------------------------------------------------------
+    # 5. CANDLE CONFIRMATION
+    # ------------------------------------------------------------------
+
+    # La confirmation doit arriver après le retest.
+    confirmation_index = (
+        len(candles) - 1
+    )
+
+    if confirmation_index < retest_index:
+
+        result["stage"] = (
+            "WAIT_CANDLE"
+        )
+
+        return result
+
+    candle_confirmation = (
+        _candle_confirmation_at(
+            candles,
+            direction,
+            confirmation_index,
+        )
+    )
+
+    if not candle_confirmation:
+
+        result["stage"] = (
+            "WAIT_CANDLE"
+        )
+
+        return result
+
+    result[
+        "candle_confirmation"
+    ] = True
+
+    result["confirmation_index"] = (
+        confirmation_index
+    )
+
+    result["complete"] = True
+
+    result["stage"] = (
+        "COMPLETE"
+    )
+
+    return result
 
 
 # ============================================================================
@@ -1567,12 +2014,18 @@ def _m5_confirmation(
     return {
         "valid": bool(valid),
         "direction": m5_direction,
-        "micro_bos": bool(micro_bos),
+        "micro_bos": bool(
+            micro_bos
+        ),
         "liquidity_sweep": bool(
             liquidity_sweep
         ),
-        "retest": bool(retest),
-        "rejection": bool(rejection),
+        "retest": bool(
+            retest
+        ),
+        "rejection": bool(
+            rejection
+        ),
         "candle_confirmation": bool(
             candle_confirmation
         ),
@@ -1728,7 +2181,7 @@ def _validate_geometry(
 
 
 # ============================================================================
-# SCORE
+# SCORE FALLBACK
 # ============================================================================
 
 def _fallback_score(
@@ -1739,6 +2192,7 @@ def _fallback_score(
     m5: Dict[str, Any],
     rr: float,
     momentum: Dict[str, Any],
+    zone: Dict[str, Any],
 ) -> float:
 
     direction = _normalize_direction(
@@ -1747,40 +2201,76 @@ def _fallback_score(
 
     score = 0.0
 
+    # H4
     if _normalize_direction(
         h4_direction
     ) == direction:
         score += 20
 
+    # H1
     if _normalize_direction(
         h1_direction
     ) == direction:
         score += 20
 
+    # M15
     if _normalize_direction(
         m15_direction
     ) == direction:
         score += 20
 
-    # Setup zone
-    score += 10
+    # Zone complète
+    if zone.get(
+        "breakout_confirmed"
+    ):
+        score += 2
 
-    # Momentum / vitesse
-    if momentum.get("valid"):
+    if zone.get(
+        "retest_confirmed"
+    ):
+        score += 2
+
+    if zone.get(
+        "rejection_confirmed"
+    ):
+        score += 2
+
+    if zone.get(
+        "candle_confirmation"
+    ):
+        score += 2
+
+    if zone.get(
+        "structure_confirmed"
+    ):
+        score += 2
+
+    # Momentum
+    if momentum.get(
+        "valid"
+    ):
         score += 5
 
-    if momentum.get("expansion"):
+    if momentum.get(
+        "expansion"
+    ):
         score += 5
 
     # M5 secondaire
-    if m5.get("retest"):
-        score += 5
+    if m5.get(
+        "retest"
+    ):
+        score += 3
 
-    if m5.get("candle_confirmation"):
-        score += 5
+    if m5.get(
+        "candle_confirmation"
+    ):
+        score += 3
 
-    if m5.get("liquidity_sweep"):
-        score += 5
+    if m5.get(
+        "liquidity_sweep"
+    ):
+        score += 4
 
     # RR
     if rr >= 2.0:
@@ -1877,6 +2367,7 @@ def _calculate_final_score(
         m5=m5,
         rr=rr,
         momentum=momentum,
+        zone=zone,
     )
 
 
@@ -2046,7 +2537,9 @@ def _wait_result(
     )
 
     if extra:
-        result.update(extra)
+        result.update(
+            extra
+        )
 
     return result
 
@@ -2079,18 +2572,24 @@ def _reject_result(
             "status": "REJECT",
             "reason": reason,
             "score": round(
-                _safe_float(score),
+                _safe_float(
+                    score
+                ),
                 2,
             ),
             "rr": round(
-                _safe_float(rr),
+                _safe_float(
+                    rr
+                ),
                 4,
             ),
         }
     )
 
     if extra:
-        result.update(extra)
+        result.update(
+            extra
+        )
 
     return result
 
@@ -2112,9 +2611,9 @@ def analyze_market(
         symbol,
     )
 
-    # ----------------------------------------------------------------------
+    # ======================================================================
     # 1. PROVIDER
-    # ----------------------------------------------------------------------
+    # ======================================================================
 
     if not _is_crypto_symbol(
         symbol
@@ -2138,9 +2637,9 @@ def analyze_market(
                 provider_reason,
             )
 
-    # ----------------------------------------------------------------------
+    # ======================================================================
     # 2. MARCHÉ
-    # ----------------------------------------------------------------------
+    # ======================================================================
 
     if not _market_open(
         symbol
@@ -2151,9 +2650,9 @@ def analyze_market(
             "Marché actuellement fermé.",
         )
 
-    # ----------------------------------------------------------------------
+    # ======================================================================
     # 3. DONNÉES
-    # ----------------------------------------------------------------------
+    # ======================================================================
 
     candles: Dict[
         str,
@@ -2162,6 +2661,7 @@ def analyze_market(
 
     for timeframe in TIMEFRAMES:
 
+        # Crypto ne dépend jamais du cooldown Twelve Data.
         if not _is_crypto_symbol(
             symbol
         ):
@@ -2227,9 +2727,9 @@ def analyze_market(
             timeframe
         ] = data
 
-    # ----------------------------------------------------------------------
+    # ======================================================================
     # 4. DIRECTIONS
-    # ----------------------------------------------------------------------
+    # ======================================================================
 
     h4_direction = _structure_direction(
         candles["H4"]
@@ -2254,9 +2754,9 @@ def analyze_market(
         m15_direction,
     )
 
-    # ----------------------------------------------------------------------
-    # 5. ALIGNEMENT
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 5. ALIGNEMENT PRINCIPAL
+    # ======================================================================
 
     direction = _primary_alignment(
         h4_direction,
@@ -2284,23 +2784,52 @@ def analyze_market(
         )
 
     logger.info(
-        "%s direction principale : %s",
+        (
+            "%s ALIGNEMENT PRINCIPAL VALIDÉ : "
+            "H4=%s | H1=%s | M15=%s | direction=%s"
+        ),
         symbol,
+        h4_direction,
+        h1_direction,
+        m15_direction,
         direction,
     )
 
-    # ----------------------------------------------------------------------
-    # 6. RECHERCHE MULTI-ZONES
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 6. ATR M15
+    # ======================================================================
+
+    atr = _calculate_atr(
+        candles["M15"],
+        period=14,
+    )
+
+    if atr <= 0:
+
+        return _wait_result(
+            symbol,
+            (
+                "Alignement H4/H1/M15 valide, "
+                "mais ATR M15 indisponible."
+            ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+        )
+
+    # ======================================================================
+    # 7. RECHERCHE MULTI-ZONES
+    # ======================================================================
 
     zone_candidates = _build_zone_candidates(
         candles["M15"],
         direction,
-        max_zones=8,
+        max_zones=MAX_ZONE_CANDIDATES,
     )
 
     logger.info(
-        "%s : %s zones candidates détectées.",
+        "%s : %s zones candidates à tester.",
         symbol,
         len(zone_candidates),
     )
@@ -2310,7 +2839,7 @@ def analyze_market(
         return _wait_result(
             symbol,
             (
-                "Contexte H4/H1/M15 valide, "
+                "Alignement H4/H1/M15 validé, "
                 "mais aucune zone clé exploitable "
                 "n'est actuellement disponible."
             ),
@@ -2320,63 +2849,148 @@ def analyze_market(
             m15_direction=m15_direction,
         )
 
-    # ----------------------------------------------------------------------
-    # 7. RECHERCHE BREAKOUT
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 8. ÉVALUATION DE TOUTES LES ZONES
+    # ======================================================================
 
-    selected_zone = None
+    zone_results: List[
+        Dict[str, Any]
+    ] = []
 
-    for zone_low, zone_high in zone_candidates:
+    for zone_number, (
+        zone_low,
+        zone_high,
+    ) in enumerate(
+        zone_candidates,
+        start=1,
+    ):
 
-        breakout = _breakout_confirmed(
+        evaluation = _evaluate_zone(
             candles["M15"],
             direction,
             zone_low,
             zone_high,
+            atr,
+        )
+
+        evaluation[
+            "zone_number"
+        ] = zone_number
+
+        zone_results.append(
+            evaluation
         )
 
         logger.info(
             (
-                "%s zone %.5f-%.5f | "
-                "breakout=%s"
+                "%s ZONE #%s %.5f-%.5f | "
+                "stage=%s | breakout=%s | "
+                "momentum=%s | retest=%s | "
+                "rejection=%s | candle=%s"
             ),
             symbol,
+            zone_number,
             zone_low,
             zone_high,
-            breakout,
-        )
-
-        if breakout:
-
-            selected_zone = (
-                zone_low,
-                zone_high,
-            )
-
-            break
-
-    # ----------------------------------------------------------------------
-    # IMPORTANT :
-    # aucun breakout = WAIT
-    # et NON REJECT.
-    # ----------------------------------------------------------------------
-
-    if selected_zone is None:
-
-        logger.info(
-            (
-                "%s : aucun breakout confirmé. "
-                "Contexte directionnel conservé."
+            evaluation.get(
+                "stage"
             ),
-            symbol,
+            evaluation.get(
+                "breakout_confirmed"
+            ),
+            evaluation.get(
+                "momentum_valid"
+            ),
+            evaluation.get(
+                "retest_confirmed"
+            ),
+            evaluation.get(
+                "rejection_confirmed"
+            ),
+            evaluation.get(
+                "candle_confirmation"
+            ),
         )
+
+    # ======================================================================
+    # 9. RECHERCHE DE LA MEILLEURE ZONE
+    # ======================================================================
+
+    # Priorité :
+    #
+    # COMPLETE
+    # WAIT_CANDLE
+    # WAIT_REJECTION
+    # WAIT_RETEST
+    # WAIT_MOMENTUM
+    # WAIT_BREAKOUT
+    #
+    # Cela permet au bot de conserver la zone
+    # la plus avancée dans son cycle.
+
+    stage_priority = {
+        "COMPLETE": 6,
+        "WAIT_CANDLE": 5,
+        "WAIT_REJECTION": 4,
+        "WAIT_RETEST": 3,
+        "WAIT_MOMENTUM": 2,
+        "WAIT_BREAKOUT": 1,
+        "ZONE": 0,
+    }
+
+    best_zone = max(
+        zone_results,
+        key=lambda item: (
+            stage_priority.get(
+                item.get(
+                    "stage",
+                    "ZONE",
+                ),
+                0,
+            ),
+            -abs(
+                _close(
+                    candles["M15"][-1]
+                )
+                - item.get(
+                    "key_level",
+                    0.0,
+                )
+            ),
+        ),
+    )
+
+    stage = best_zone.get(
+        "stage",
+        "ZONE",
+    )
+
+    logger.info(
+        (
+            "%s meilleure zone = #%s | "
+            "stage=%s"
+        ),
+        symbol,
+        best_zone.get(
+            "zone_number"
+        ),
+        stage,
+    )
+
+    # ======================================================================
+    # 10. SI AUCUN BREAKOUT
+    # ======================================================================
+
+    if stage == "WAIT_BREAKOUT":
 
         return _wait_result(
             symbol,
             (
                 "H4 + H1 + M15 alignés, "
-                "mais aucun breakout de zone clé "
-                "n'est encore confirmé."
+                "zones clés analysées, "
+                "mais aucun breakout valide "
+                "n'est encore confirmé. "
+                "Surveillance en attente."
             ),
             direction=direction,
             h4_direction=h4_direction,
@@ -2384,199 +2998,175 @@ def analyze_market(
             m15_direction=m15_direction,
             extra={
                 "zones_tested": len(
-                    zone_candidates
+                    zone_results
                 ),
+                "zone": best_zone,
                 "breakout_confirmed": False,
+                "retest_confirmed": False,
+                "rejection_confirmed": False,
+                "candle_confirmation": False,
             },
         )
 
-    zone_low, zone_high = selected_zone
+    # ======================================================================
+    # 11. BREAKOUT MAIS MOMENTUM INSUFFISANT
+    # ======================================================================
 
-    logger.info(
-        (
-            "%s breakout confirmé | "
-            "zone=%.5f-%.5f"
-        ),
-        symbol,
-        zone_low,
-        zone_high,
-    )
-
-    # ----------------------------------------------------------------------
-    # 8. RETEST
-    # ----------------------------------------------------------------------
-
-    retest = _retest_confirmed(
-        candles["M15"],
-        direction,
-        zone_low,
-        zone_high,
-    )
-
-    if not retest:
+    if stage == "WAIT_MOMENTUM":
 
         return _wait_result(
             symbol,
             (
-                "Breakout confirmé, "
-                "mais retest de la zone "
-                "encore absent."
+                "Breakout détecté sur une zone clé, "
+                "mais la vitesse/momentum du mouvement "
+                "est insuffisante. "
+                "Le bot attend une impulsion plus propre."
             ),
             direction=direction,
             h4_direction=h4_direction,
             h1_direction=h1_direction,
             m15_direction=m15_direction,
             extra={
+                "zones_tested": len(
+                    zone_results
+                ),
+                "zone": best_zone,
                 "breakout_confirmed": True,
                 "retest_confirmed": False,
-                "zone": {
-                    "low": zone_low,
-                    "high": zone_high,
-                },
+                "rejection_confirmed": False,
+                "candle_confirmation": False,
+                "momentum": best_zone.get(
+                    "momentum",
+                    {},
+                ),
             },
         )
 
-    logger.info(
-        "%s retest confirmé.",
-        symbol,
-    )
+    # ======================================================================
+    # 12. BREAKOUT + MOMENTUM MAIS PAS RETEST
+    # ======================================================================
 
-    # ----------------------------------------------------------------------
-    # 9. REJECTION
-    # ----------------------------------------------------------------------
-
-    rejection = _rejection_confirmed(
-        candles["M15"],
-        direction,
-    )
-
-    if not rejection:
+    if stage == "WAIT_RETEST":
 
         return _wait_result(
             symbol,
             (
-                "Retest détecté, "
-                "mais rejection de zone "
-                "non confirmée."
+                "Breakout + momentum confirmés. "
+                "Le bot attend maintenant le retest "
+                "de la zone cassée."
             ),
             direction=direction,
             h4_direction=h4_direction,
             h1_direction=h1_direction,
             m15_direction=m15_direction,
             extra={
+                "zones_tested": len(
+                    zone_results
+                ),
+                "zone": best_zone,
+                "breakout_confirmed": True,
+                "retest_confirmed": False,
+                "rejection_confirmed": False,
+                "candle_confirmation": False,
+                "momentum": best_zone.get(
+                    "momentum",
+                    {},
+                ),
+            },
+        )
+
+    # ======================================================================
+    # 13. RETEST MAIS PAS REJECTION
+    # ======================================================================
+
+    if stage == "WAIT_REJECTION":
+
+        return _wait_result(
+            symbol,
+            (
+                "Breakout + momentum + retest "
+                "confirmés. "
+                "Le bot attend maintenant le rejet "
+                "de la zone."
+            ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            extra={
+                "zones_tested": len(
+                    zone_results
+                ),
+                "zone": best_zone,
                 "breakout_confirmed": True,
                 "retest_confirmed": True,
                 "rejection_confirmed": False,
-                "zone": {
-                    "low": zone_low,
-                    "high": zone_high,
-                },
+                "candle_confirmation": False,
+                "momentum": best_zone.get(
+                    "momentum",
+                    {},
+                ),
             },
         )
 
-    logger.info(
-        "%s rejection confirmée.",
-        symbol,
-    )
+    # ======================================================================
+    # 14. REJECTION MAIS PAS BOUGIE DE CONFIRMATION
+    # ======================================================================
 
-    # ----------------------------------------------------------------------
-    # 10. CONFIRMATION M15
-    # ----------------------------------------------------------------------
-
-    candle_confirmation = (
-        _candle_confirmation(
-            candles["M15"],
-            direction,
-        )
-    )
-
-    if not candle_confirmation:
+    if stage == "WAIT_CANDLE":
 
         return _wait_result(
             symbol,
             (
-                "Rejection détectée, "
-                "mais la bougie de confirmation "
-                "M15 n'est pas encore valide."
+                "Rejet de zone confirmé. "
+                "Le bot attend maintenant une bougie "
+                "de confirmation M15 valide avant "
+                "de calculer l'entrée."
             ),
             direction=direction,
             h4_direction=h4_direction,
             h1_direction=h1_direction,
             m15_direction=m15_direction,
             extra={
+                "zones_tested": len(
+                    zone_results
+                ),
+                "zone": best_zone,
                 "breakout_confirmed": True,
                 "retest_confirmed": True,
                 "rejection_confirmed": True,
                 "candle_confirmation": False,
-                "zone": {
-                    "low": zone_low,
-                    "high": zone_high,
-                },
+                "momentum": best_zone.get(
+                    "momentum",
+                    {},
+                ),
             },
         )
 
-    logger.info(
-        "%s confirmation candle M15 valide.",
-        symbol,
-    )
+    # ======================================================================
+    # 15. ZONE COMPLÈTE
+    # ======================================================================
 
-    # ----------------------------------------------------------------------
-    # 11. MOMENTUM / VITESSE
-    # ----------------------------------------------------------------------
-
-    momentum = _momentum_analysis(
-        candles["M15"],
-        direction,
-    )
-
-    logger.info(
-        (
-            "%s momentum : valid=%s | "
-            "speed=%s | body_ratio=%s | "
-            "expansion=%s"
-        ),
-        symbol,
-        momentum.get("valid"),
-        momentum.get("speed"),
-        momentum.get("body_ratio"),
-        momentum.get("expansion"),
-    )
-
-    # Momentum analysé mais ne force jamais un signal.
-    # S'il est insuffisant, on attend simplement.
-
-    if not momentum.get(
-        "valid",
-        False,
-    ):
-
-        return _wait_result(
-            symbol,
-            (
-                "Structure et zone confirmées, "
-                "mais vitesse/momentum insuffisant "
-                "pour une entrée de qualité."
-            ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            extra={
-                "breakout_confirmed": True,
-                "retest_confirmed": True,
-                "rejection_confirmed": True,
-                "candle_confirmation": True,
-                "momentum": momentum,
-                "zone": {
-                    "low": zone_low,
-                    "high": zone_high,
-                },
-            },
+    zone_low = _safe_float(
+        best_zone.get(
+            "low"
         )
+    )
 
-    # ----------------------------------------------------------------------
-    # 12. ENTRY
-    # ----------------------------------------------------------------------
+    zone_high = _safe_float(
+        best_zone.get(
+            "high"
+        )
+    )
+
+    momentum = best_zone.get(
+        "momentum",
+        {},
+    )
+
+    # ======================================================================
+    # 16. ENTRY
+    # ======================================================================
 
     current_candle = (
         candles["M5"][-1]
@@ -2603,29 +3193,9 @@ def analyze_market(
             m15_direction=m15_direction,
         )
 
-    # ----------------------------------------------------------------------
-    # 13. ATR
-    # ----------------------------------------------------------------------
-
-    atr = _calculate_atr(
-        candles["M15"],
-        period=14,
-    )
-
-    if atr <= 0:
-
-        return _reject_result(
-            symbol,
-            "ATR invalide.",
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-        )
-
-    # ----------------------------------------------------------------------
-    # 14. SL / TP
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 17. SL / TP
+    # ======================================================================
 
     stop_loss, take_profit = (
         _build_sl_tp(
@@ -2650,11 +3220,14 @@ def analyze_market(
             h4_direction=h4_direction,
             h1_direction=h1_direction,
             m15_direction=m15_direction,
+            extra={
+                "zone": best_zone,
+            },
         )
 
-    # ----------------------------------------------------------------------
-    # 15. RR
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 18. RR
+    # ======================================================================
 
     rr = calculate_rr(
         entry,
@@ -2694,11 +3267,15 @@ def analyze_market(
             h1_direction=h1_direction,
             m15_direction=m15_direction,
             rr=rr,
+            extra={
+                "zone": best_zone,
+                "momentum": momentum,
+            },
         )
 
-    # ----------------------------------------------------------------------
-    # 16. M5
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 19. M5 SECONDAIRE
+    # ======================================================================
 
     m5 = _m5_confirmation(
         candles["M5"],
@@ -2707,52 +3284,87 @@ def analyze_market(
 
     logger.info(
         (
-            "%s M5 : valid=%s | "
+            "%s M5 SECONDARY : valid=%s | "
             "direction=%s | BOS=%s | "
             "sweep=%s | retest=%s | candle=%s"
         ),
         symbol,
-        m5.get("valid"),
-        m5.get("direction"),
-        m5.get("micro_bos"),
-        m5.get("liquidity_sweep"),
-        m5.get("retest"),
-        m5.get("candle_confirmation"),
+        m5.get(
+            "valid"
+        ),
+        m5.get(
+            "direction"
+        ),
+        m5.get(
+            "micro_bos"
+        ),
+        m5.get(
+            "liquidity_sweep"
+        ),
+        m5.get(
+            "retest"
+        ),
+        m5.get(
+            "candle_confirmation"
+        ),
     )
 
-    # ----------------------------------------------------------------------
     # IMPORTANT :
-    # M5 ne peut PAS rejeter.
-    # ----------------------------------------------------------------------
+    #
+    # M5 n'est JAMAIS utilisé pour rejeter
+    # un setup H4/H1/M15 déjà validé.
+    #
+    # Il sert uniquement à améliorer le score
+    # et la qualité d'entrée.
 
-    # ----------------------------------------------------------------------
-    # 17. ZONE FINALE
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 20. ZONE FINALE
+    # ======================================================================
 
     zone = {
         "low": zone_low,
         "high": zone_high,
         "direction": direction,
+        "level_type": (
+            "RESISTANCE"
+            if direction == "BUY"
+            else "SUPPORT"
+        ),
+        "key_level": (
+            zone_low
+            + zone_high
+        ) / 2,
         "breakout_confirmed": True,
+        "breakout_index": best_zone.get(
+            "breakout_index"
+        ),
         "retest_confirmed": True,
+        "retest_index": best_zone.get(
+            "retest_index"
+        ),
         "rejection_confirmed": True,
+        "rejection_index": best_zone.get(
+            "rejection_index"
+        ),
         "candle_confirmation": True,
         "entry_valid": True,
         "structure_confirmed": True,
         "momentum_valid": bool(
-            momentum.get("valid")
+            momentum.get(
+                "valid"
+            )
         ),
+        "breakout_momentum": momentum,
         "liquidity": bool(
-            m5.get("liquidity_sweep")
+            m5.get(
+                "liquidity_sweep"
+            )
         ),
-        "key_level": (
-            zone_low + zone_high
-        ) / 2,
     }
 
-    # ----------------------------------------------------------------------
-    # 18. SCORE
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 21. SCORE
+    # ======================================================================
 
     score = _calculate_final_score(
         symbol=symbol,
@@ -2786,7 +3398,7 @@ def analyze_market(
 
     logger.info(
         (
-            "%s score=%.2f/100 | "
+            "%s SCORE FINAL = %.2f/100 | "
             "RR=%.2f | seuil=%.2f"
         ),
         symbol,
@@ -2815,14 +3427,15 @@ def analyze_market(
             score=score,
             rr=rr,
             extra={
-                "momentum": momentum,
                 "zone": zone,
+                "momentum": momentum,
+                "m5_confirmation": m5,
             },
         )
 
-    # ----------------------------------------------------------------------
-    # 19. NEWS
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 22. NEWS
+    # ======================================================================
 
     news_blocked, news_reason = (
         _check_news(
@@ -2855,12 +3468,13 @@ def analyze_market(
                 "take_profit": take_profit,
                 "zone": zone,
                 "momentum": momentum,
+                "m5_confirmation": m5,
             },
         )
 
-    # ----------------------------------------------------------------------
-    # 20. CONSTRUCTION SIGNAL
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 23. CONSTRUCTION DU SIGNAL
+    # ======================================================================
 
     signal = None
 
@@ -2927,9 +3541,9 @@ def analyze_market(
                 exc,
             )
 
-    # ----------------------------------------------------------------------
-    # 21. SIGNAL ID
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 24. SIGNAL ID
+    # ======================================================================
 
     signal_id = None
 
@@ -2952,9 +3566,9 @@ def analyze_market(
                 None,
             )
 
-    # ----------------------------------------------------------------------
-    # 22. ÉCHEC CONSTRUCTION
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 25. ÉCHEC CONSTRUCTION
+    # ======================================================================
 
     if (
         build_signal is not None
@@ -2987,19 +3601,20 @@ def analyze_market(
             },
         )
 
-    # ----------------------------------------------------------------------
-    # 23. RÉSULTAT FINAL
-    # ----------------------------------------------------------------------
+    # ======================================================================
+    # 26. SIGNAL FINAL
+    # ======================================================================
 
     result = {
         "symbol": symbol,
         "status": "ACTIVE",
         "reason": (
             "Signal validé : "
-            "H4 + H1 + M15 alignés, "
-            "zone + breakout + retest + "
-            "rejection + confirmation + "
-            "momentum validés."
+            "H4 + H1 + M15 parfaitement alignés, "
+            "zone clé identifiée, breakout confirmé, "
+            "momentum/vitesse validé, retest confirmé, "
+            "rejection confirmée, bougie M15 confirmée, "
+            "RR et score validés."
         ),
         "direction": direction,
         "score": round(
@@ -3028,6 +3643,9 @@ def analyze_market(
         "zone": zone,
         "momentum": momentum,
         "atr": atr,
+        "zones_tested": len(
+            zone_results
+        ),
         "breakout_confirmed": True,
         "retest_confirmed": True,
         "rejection_confirmed": True,
@@ -3037,17 +3655,34 @@ def analyze_market(
 
     logger.info(
         (
+            "=================================================="
+        ),
+    )
+
+    logger.info(
+        (
             "SIGNAL VALIDE %s | %s | "
+            "H4=%s | H1=%s | M15=%s | "
             "score=%.2f | RR=%.2f | "
-            "entry=%s | SL=%s | TP=%s"
+            "zones=%s | entry=%s | SL=%s | TP=%s"
         ),
         symbol,
         direction,
+        h4_direction,
+        h1_direction,
+        m15_direction,
         score,
         rr,
+        len(zone_results),
         entry,
         stop_loss,
         take_profit,
+    )
+
+    logger.info(
+        (
+            "=================================================="
+        ),
     )
 
     return result
