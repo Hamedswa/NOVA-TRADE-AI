@@ -1,11 +1,8 @@
 """
 NOVA TRADE AI
 analysis/pipeline.py
-
 PIPELINE PRINCIPAL D'ANALYSE.
-
 ARCHITECTURE :
-
     H4
      ↓
     H1
@@ -16,34 +13,39 @@ ARCHITECTURE :
      ↓
     ZONE CLÉ
      ↓
-    CASSURE
-     ↓
-    RETEST
-     ↓
-    REJET
-     ↓
-    BOUGIE DE CONFIRMATION
-     ↓
-    ENTRÉE
-     ↓
-    SL / TP / RR
-     ↓
-    SCORE
-     ↓
-    SIGNAL
-
+    ┌──────────────────────────────┐
+    │ SETUP CLASSIQUE M15          │
+    │ cassure → retest → rejet     │
+    │ → confirmation → entrée      │
+    └──────────────────────────────┘
+                 OU
+    ┌──────────────────────────────┐
+    │ SNIPER M5                    │
+    │ cassure → retest → rejet     │
+    │ → confirmation → entrée      │
+    └──────────────────────────────┘
+                 ↓
+              SL / TP
+                 ↓
+                RR
+                 ↓
+               SCORE
+                 ↓
+              SIGNAL
 IMPORTANT :
-- H4 + H1 + M15 = validation principale.
-- M5 = confirmation secondaire NON BLOQUANTE.
+- H4 + H1 + M15 = validation principale obligatoire.
+- H4 est rafraîchi toutes les 8 heures.
+- H1 est rafraîchi toutes les 2 heures.
+- M15 est rafraîchi toutes les 30 minutes.
+- M5 est analysé régulièrement.
+- Le SNIPER M5 est extrêmement strict.
 - Aucun D1.
 """
-
 from __future__ import annotations
-
+import time
+from threading import Lock
 from typing import Any, Optional
-
 from config import CONFIG
-
 from core.models import (
     Candle,
     Confirmation,
@@ -52,8 +54,7 @@ from core.models import (
     TrendContext,
     Zone,
 )
-
-from market_data import get_candles, get_latest_price
+from market_data import get_candles
 from market_hours import is_market_open
 from economic_calendar import economic_filter
 from risk.risk_manager import calculate_rr
@@ -62,32 +63,133 @@ from scoring.score_engine import (
     should_send_signal,
 )
 from signals.signal_engine import SignalEngine
-
-
 # ============================================================
 # PARAMÈTRES
 # ============================================================
-
 SWING_LOOKBACK = 2
-
 MIN_BREAKOUT_BODY_RATIO = 0.45
 MIN_CONFIRMATION_BODY_RATIO = 0.50
-
 LEVEL_ATR_TOLERANCE = 0.20
-
+# Setup classique
 MAX_ENTRY_ATR_DISTANCE = 0.35
 MAX_CURRENT_PRICE_ATR_DISTANCE = 0.50
-
+# SNIPER M5 : beaucoup plus strict
+SNIPER_MAX_ENTRY_ATR_DISTANCE = 0.18
+SNIPER_MAX_CURRENT_PRICE_ATR_DISTANCE = 0.20
+SNIPER_LEVEL_TOLERANCE_ATR = 0.12
+SNIPER_MIN_BREAKOUT_BODY_RATIO = 0.60
+SNIPER_MIN_CONFIRMATION_BODY_RATIO = 0.60
+SNIPER_LOOKBACK = 24
 SL_ATR_BUFFER = 0.15
-
 SETUP_LOOKBACK = 35
 RECENT_SWINGS = 3
-
-
+# ============================================================
+# RAFRAÎCHISSEMENT MULTI-TIMEFRAME
+# ============================================================
+# H4  : 8 heures
+# H1  : 2 heures
+# M15 : 30 minutes
+# M5  : 0 = toujours rafraîchi
+TIMEFRAME_REFRESH_SECONDS = {
+    "H4": 8 * 60 * 60,
+    "H1": 2 * 60 * 60,
+    "M15": 30 * 60,
+    "M5": 0,
+}
+_TF_CACHE_LOCK = Lock()
+# key:
+# (SYMBOL, TIMEFRAME, OUTPUTSIZE)
+#
+# value:
+# {
+#     "candles": [...],
+#     "timestamp": float
+# }
+_TIMEFRAME_CACHE: dict[
+    tuple[str, str, int],
+    dict[str, Any],
+] = {}
+def _tf_cache_key(
+    symbol: str,
+    timeframe: str,
+    outputsize: int,
+) -> tuple[str, str, int]:
+    return (
+        symbol.strip().upper(),
+        timeframe.strip().upper(),
+        int(outputsize),
+    )
+def clear_pipeline_cache() -> None:
+    """
+    Vide le cache interne du pipeline.
+    """
+    with _TF_CACHE_LOCK:
+        _TIMEFRAME_CACHE.clear()
+def clear_symbol_pipeline_cache(
+    symbol: str,
+) -> None:
+    normalized = symbol.strip().upper()
+    with _TF_CACHE_LOCK:
+        keys = [
+            key
+            for key in _TIMEFRAME_CACHE
+            if key[0] == normalized
+        ]
+        for key in keys:
+            del _TIMEFRAME_CACHE[key]
+def _get_pipeline_cached_candles(
+    symbol: str,
+    timeframe: str,
+    outputsize: int,
+) -> Optional[list[Candle]]:
+    key = _tf_cache_key(
+        symbol,
+        timeframe,
+        outputsize,
+    )
+    now = time.time()
+    with _TF_CACHE_LOCK:
+        cached = _TIMEFRAME_CACHE.get(key)
+        if cached is None:
+            return None
+        timestamp = float(
+            cached.get("timestamp", 0.0)
+        )
+        candles = cached.get("candles")
+        if not isinstance(candles, list):
+            return None
+        refresh_seconds = (
+            TIMEFRAME_REFRESH_SECONDS.get(
+                timeframe,
+                0,
+            )
+        )
+        # M5 = toujours actualisé
+        if refresh_seconds <= 0:
+            return None
+        age = now - timestamp
+        if age < refresh_seconds:
+            return list(candles)
+    return None
+def _set_pipeline_cached_candles(
+    symbol: str,
+    timeframe: str,
+    outputsize: int,
+    candles: list[Candle],
+) -> None:
+    key = _tf_cache_key(
+        symbol,
+        timeframe,
+        outputsize,
+    )
+    with _TF_CACHE_LOCK:
+        _TIMEFRAME_CACHE[key] = {
+            "candles": list(candles),
+            "timestamp": time.time(),
+        }
 # ============================================================
 # OUTILS GÉNÉRAUX
 # ============================================================
-
 def _safe_float(
     value: Any,
     default: float = 0.0,
@@ -96,41 +198,30 @@ def _safe_float(
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
 def _normalize_direction(
     value: Any,
 ) -> Direction:
-
     if isinstance(value, Direction):
         return value
-
     if value is None:
         return Direction.NEUTRAL
-
     text = str(value).upper().strip()
-
     if text in {
         "BUY",
         "LONG",
         "BULLISH",
     }:
         return Direction.BUY
-
     if text in {
         "SELL",
         "SHORT",
         "BEARISH",
     }:
         return Direction.SELL
-
     return Direction.NEUTRAL
-
-
 def _market_type(
     symbol: str,
 ) -> MarketType:
-
     crypto = {
         "BTC/USD",
         "ETH/USD",
@@ -138,17 +229,12 @@ def _market_type(
         "BNB/USD",
         "XRP/USD",
     }
-
     if symbol.upper() in crypto:
         return MarketType.CRYPTO
-
     return MarketType.FOREX
-
-
 def _empty_result(
     symbol: str,
 ) -> dict:
-
     return {
         "symbol": symbol,
         "market_type": _market_type(symbol),
@@ -165,102 +251,78 @@ def _empty_result(
         "confirmation": None,
         "signal": None,
         "m5_confirmed": False,
+        "sniper": False,
+        "sniper_setup": False,
         "news_blocked": False,
     }
-
-
 # ============================================================
 # CHANDELIERS
 # ============================================================
-
 def _get_value(
     item: Any,
     name: str,
     default: Any = None,
 ) -> Any:
-
     if isinstance(item, dict):
         return item.get(name, default)
-
     return getattr(
         item,
         name,
         default,
     )
-
-
 def _extract_candles(
     data: Any,
 ) -> list[Candle]:
-
     if data is None:
         return []
-
     if isinstance(data, dict):
-
+        items = None
         for key in (
             "candles",
             "data",
             "values",
         ):
-
             if isinstance(
                 data.get(key),
                 list,
             ):
                 items = data[key]
                 break
-
-        else:
+        if items is None:
             return []
-
     elif isinstance(data, (list, tuple)):
         items = data
-
     elif hasattr(data, "candles"):
-
         items = getattr(
             data,
             "candles",
         )
-
     else:
         return []
-
     if not items:
         return []
-
     result: list[Candle] = []
-
     for item in items:
-
         if isinstance(item, Candle):
-
             result.append(item)
             continue
-
         try:
-
             timestamp = _get_value(
                 item,
                 "timestamp",
             )
-
             if timestamp is None:
                 timestamp = _get_value(
                     item,
                     "datetime",
                 )
-
             if timestamp is None:
                 timestamp = _get_value(
                     item,
                     "date",
                 )
-
             if timestamp is None:
                 continue
-
             open_price = _safe_float(
                 _get_value(
                     item,
@@ -268,7 +330,6 @@ def _extract_candles(
                     0.0,
                 )
             )
-
             high_price = _safe_float(
                 _get_value(
                     item,
@@ -276,7 +337,6 @@ def _extract_candles(
                     0.0,
                 )
             )
-
             low_price = _safe_float(
                 _get_value(
                     item,
@@ -284,7 +344,6 @@ def _extract_candles(
                     0.0,
                 )
             )
-
             close_price = _safe_float(
                 _get_value(
                     item,
@@ -292,7 +351,6 @@ def _extract_candles(
                     0.0,
                 )
             )
-
             volume = _safe_float(
                 _get_value(
                     item,
@@ -300,7 +358,6 @@ def _extract_candles(
                     0.0,
                 )
             )
-
             if (
                 open_price <= 0
                 or high_price <= 0
@@ -308,10 +365,8 @@ def _extract_candles(
                 or close_price <= 0
             ):
                 continue
-
             if high_price < low_price:
                 continue
-
             result.append(
                 Candle(
                     timestamp=timestamp,
@@ -322,54 +377,68 @@ def _extract_candles(
                     volume=volume,
                 )
             )
-
         except Exception:
             continue
-
     result.sort(
         key=lambda candle: candle.timestamp
     )
-
     return result
-
-
 def _load_candles(
     symbol: str,
     timeframe: str,
     outputsize: int,
 ) -> list[Candle]:
-
+    timeframe = timeframe.upper()
+    # --------------------------------------------------------
+    # M5 : TOUJOURS FRAIS
+    # --------------------------------------------------------
+    if timeframe == "M5":
+        data = get_candles(
+            symbol=symbol,
+            timeframe="M5",
+            outputsize=outputsize,
+        )
+        return _extract_candles(data)
+    # --------------------------------------------------------
+    # H4 / H1 / M15 : CACHE LONG
+    # --------------------------------------------------------
+    cached = _get_pipeline_cached_candles(
+        symbol,
+        timeframe,
+        outputsize,
+    )
+    if cached is not None:
+        return cached
     data = get_candles(
         symbol=symbol,
         timeframe=timeframe,
         outputsize=outputsize,
     )
-
-    return _extract_candles(data)
-
-
+    candles = _extract_candles(data)
+    if candles:
+        _set_pipeline_cached_candles(
+            symbol,
+            timeframe,
+            outputsize,
+            candles,
+        )
+    return candles
 # ============================================================
 # ATR
 # ============================================================
-
 def _calculate_atr(
     candles: list[Candle],
     period: int = 14,
 ) -> float:
-
     if len(candles) < period + 1:
         return 0.0
-
     true_ranges: list[float] = []
-
     for i in range(
         1,
         len(candles),
     ):
-
         current = candles[i]
         previous = candles[i - 1]
-
         true_range = max(
             current.high - current.low,
             abs(
@@ -381,372 +450,258 @@ def _calculate_atr(
                 - previous.close
             ),
         )
-
         true_ranges.append(
             true_range
         )
-
     if len(true_ranges) < period:
         return 0.0
-
     return sum(
         true_ranges[-period:]
     ) / period
-
-
 # ============================================================
 # SWINGS
 # ============================================================
-
 def _swing_highs(
     candles: list[Candle],
     lookback: int = SWING_LOOKBACK,
 ) -> list[tuple[int, float]]:
-
     result: list[tuple[int, float]] = []
-
     if len(candles) < (
         lookback * 2 + 1
     ):
         return result
-
     for i in range(
         lookback,
         len(candles) - lookback,
     ):
-
         current = candles[i]
-
         left = candles[
             i - lookback:i
         ]
-
         right = candles[
             i + 1:i + lookback + 1
         ]
-
         if all(
             current.high > candle.high
             for candle in left + right
         ):
-
             result.append(
                 (
                     i,
                     current.high,
                 )
             )
-
     return result
-
-
 def _swing_lows(
     candles: list[Candle],
     lookback: int = SWING_LOOKBACK,
 ) -> list[tuple[int, float]]:
-
     result: list[tuple[int, float]] = []
-
     if len(candles) < (
         lookback * 2 + 1
     ):
         return result
-
     for i in range(
         lookback,
         len(candles) - lookback,
     ):
-
         current = candles[i]
-
         left = candles[
             i - lookback:i
         ]
-
         right = candles[
             i + 1:i + lookback + 1
         ]
-
         if all(
             current.low < candle.low
             for candle in left + right
         ):
-
             result.append(
                 (
                     i,
                     current.low,
                 )
             )
-
     return result
-
-
 # ============================================================
 # DIRECTION STRUCTURELLE
 # ============================================================
-
 def _structure_direction(
     candles: list[Candle],
 ) -> Direction:
-
     if len(candles) < 10:
         return Direction.NEUTRAL
-
     highs = _swing_highs(candles)
     lows = _swing_lows(candles)
-
     recent_highs = highs[
         -RECENT_SWINGS:
     ]
-
     recent_lows = lows[
         -RECENT_SWINGS:
     ]
-
     bullish_points = 0
     bearish_points = 0
-
-    # --------------------------------------------------------
-    # STRUCTURE DES SOMMETS
-    # --------------------------------------------------------
-
     if len(recent_highs) >= 2:
-
         for i in range(
             1,
             len(recent_highs),
         ):
-
             previous = recent_highs[
                 i - 1
             ][1]
-
             current = recent_highs[
                 i
             ][1]
-
             if current > previous:
                 bullish_points += 1
-
             elif current < previous:
                 bearish_points += 1
-
-    # --------------------------------------------------------
-    # STRUCTURE DES CREUX
-    # --------------------------------------------------------
-
     if len(recent_lows) >= 2:
-
         for i in range(
             1,
             len(recent_lows),
         ):
-
             previous = recent_lows[
                 i - 1
             ][1]
-
             current = recent_lows[
                 i
             ][1]
-
             if current > previous:
                 bullish_points += 1
-
             elif current < previous:
                 bearish_points += 1
-
-    # --------------------------------------------------------
-    # VALIDATION STRUCTURELLE
-    # --------------------------------------------------------
-
     if (
         bullish_points > bearish_points
         and bullish_points >= 2
     ):
         return Direction.BUY
-
     if (
         bearish_points > bullish_points
         and bearish_points >= 2
     ):
         return Direction.SELL
-
-    # --------------------------------------------------------
-    # ANALYSE DU PRIX RÉCENT
-    # --------------------------------------------------------
-
     recent_count = min(
         20,
         len(candles),
     )
-
     recent = candles[
         -recent_count:
     ]
-
     first_close = recent[0].close
     last_close = recent[-1].close
-
     if first_close <= 0:
         return Direction.NEUTRAL
-
     price_change = (
         last_close - first_close
     )
-
     atr = _calculate_atr(
         candles
     )
-
-    # Si l'ATR est disponible,
-    # on exige un mouvement significatif.
     if atr > 0:
-
         movement_threshold = (
             atr * 0.50
         )
-
         if price_change >= movement_threshold:
             return Direction.BUY
-
         if price_change <= -movement_threshold:
             return Direction.SELL
-
     else:
-
         if last_close > first_close:
             return Direction.BUY
-
         if last_close < first_close:
             return Direction.SELL
-
     return Direction.NEUTRAL
-
-
 # ============================================================
 # ALIGNEMENT H4 + H1 + M15
 # ============================================================
-
 def is_primary_alignment_valid(
     h4: Direction,
     h1: Direction,
     m15: Direction,
 ) -> bool:
-
     h4 = _normalize_direction(h4)
     h1 = _normalize_direction(h1)
     m15 = _normalize_direction(m15)
-
     if (
         h4 == Direction.NEUTRAL
         or h1 == Direction.NEUTRAL
         or m15 == Direction.NEUTRAL
     ):
         return False
-
     return (
         h4 == h1
         and h1 == m15
     )
-
-
 def get_primary_direction(
     h4: Direction,
     h1: Direction,
     m15: Direction,
 ) -> Direction:
-
     if not is_primary_alignment_valid(
         h4,
         h1,
         m15,
     ):
         return Direction.NEUTRAL
-
     return _normalize_direction(h4)
-
-
 # ============================================================
 # NIVEAUX CLÉS
 # ============================================================
-
 def _nearest_resistance(
     candles: list[Candle],
     current_price: float,
 ) -> Optional[float]:
-
     highs = _swing_highs(candles)
-
     candidates = [
         price
         for _, price in highs
         if price > current_price
     ]
-
     if not candidates:
         return None
-
     return min(candidates)
-
-
 def _nearest_support(
     candles: list[Candle],
     current_price: float,
 ) -> Optional[float]:
-
     lows = _swing_lows(candles)
-
     candidates = [
         price
         for _, price in lows
         if price < current_price
     ]
-
     if not candidates:
         return None
-
     return max(candidates)
-
-
 def _find_key_level(
     direction: Direction,
     h1_candles: list[Candle],
     m15_candles: list[Candle],
     current_price: float,
 ) -> tuple[str, float]:
-
     if direction == Direction.BUY:
-
         h1_level = _nearest_resistance(
             h1_candles,
             current_price,
         )
-
         m15_level = _nearest_resistance(
             m15_candles,
             current_price,
         )
-
         if h1_level is None:
             return "NONE", 0.0
-
         if m15_level is not None:
-
             atr = _calculate_atr(
                 m15_candles
             )
-
             tolerance = max(
                 atr * LEVEL_ATR_TOLERANCE,
                 1e-8,
             )
-
             if abs(
                 h1_level - m15_level
             ) <= tolerance:
-
                 return (
                     "RESISTANCE",
                     (
@@ -754,42 +709,32 @@ def _find_key_level(
                         + m15_level
                     ) / 2,
                 )
-
         return (
             "RESISTANCE",
             h1_level,
         )
-
     if direction == Direction.SELL:
-
         h1_level = _nearest_support(
             h1_candles,
             current_price,
         )
-
         m15_level = _nearest_support(
             m15_candles,
             current_price,
         )
-
         if h1_level is None:
             return "NONE", 0.0
-
         if m15_level is not None:
-
             atr = _calculate_atr(
                 m15_candles
             )
-
             tolerance = max(
                 atr * LEVEL_ATR_TOLERANCE,
                 1e-8,
             )
-
             if abs(
                 h1_level - m15_level
             ) <= tolerance:
-
                 return (
                     "SUPPORT",
                     (
@@ -797,151 +742,112 @@ def _find_key_level(
                         + m15_level
                     ) / 2,
                 )
-
         return (
             "SUPPORT",
             h1_level,
         )
-
     return "NONE", 0.0
-
-
 # ============================================================
 # CASSURE
 # ============================================================
-
 def _detect_breakout(
     candles: list[Candle],
     level: float,
     direction: Direction,
+    minimum_body_ratio: float = MIN_BREAKOUT_BODY_RATIO,
+    lookback: int = SETUP_LOOKBACK,
 ) -> tuple[bool, Optional[int]]:
-
     if not candles or level <= 0:
         return False, None
-
     start = max(
         1,
-        len(candles)
-        - SETUP_LOOKBACK,
+        len(candles) - lookback,
     )
-
     for i in range(
         start,
         len(candles),
     ):
-
         candle = candles[i]
-
         if candle.range <= 0:
             continue
-
         if (
             candle.body_ratio
-            < MIN_BREAKOUT_BODY_RATIO
+            < minimum_body_ratio
         ):
             continue
-
         previous = candles[
             i - 1
         ]
-
         if direction == Direction.BUY:
-
             if (
                 candle.close > level
                 and previous.close <= level
             ):
                 return True, i
-
         elif direction == Direction.SELL:
-
             if (
                 candle.close < level
                 and previous.close >= level
             ):
                 return True, i
-
     return False, None
-
-
 # ============================================================
 # RETEST
 # ============================================================
-
 def _detect_retest(
     candles: list[Candle],
     level: float,
     breakout_index: int,
     direction: Direction,
+    tolerance_atr: float = LEVEL_ATR_TOLERANCE,
 ) -> tuple[bool, Optional[int]]:
-
     if breakout_index is None:
         return False, None
-
     if breakout_index >= (
         len(candles) - 1
     ):
         return False, None
-
     atr = _calculate_atr(
         candles
     )
-
     if atr <= 0:
         return False, None
-
     tolerance = (
-        atr * LEVEL_ATR_TOLERANCE
+        atr * tolerance_atr
     )
-
     for i in range(
         breakout_index + 1,
         len(candles),
     ):
-
         candle = candles[i]
-
         touched = (
             candle.low
             <= level + tolerance
             and candle.high
             >= level - tolerance
         )
-
         if not touched:
             continue
-
         if direction == Direction.BUY:
-
             if candle.close >= level:
                 return True, i
-
         elif direction == Direction.SELL:
-
             if candle.close <= level:
                 return True, i
-
     return False, None
-
-
 # ============================================================
 # REJET
 # ============================================================
-
 def _detect_rejection(
     candle: Candle,
     level: float,
     direction: Direction,
 ) -> bool:
-
     if candle.range <= 0:
         return False
-
     if candle.body <= 0:
         return False
-
     if direction == Direction.BUY:
-
         return (
             candle.low
             <= level
@@ -950,9 +856,7 @@ def _detect_rejection(
             and candle.lower_wick
             >= candle.body
         )
-
     if direction == Direction.SELL:
-
         return (
             candle.high
             >= level
@@ -961,48 +865,36 @@ def _detect_rejection(
             and candle.upper_wick
             >= candle.body
         )
-
     return False
-
-
 # ============================================================
 # BOUGIE DE CONFIRMATION
 # ============================================================
-
 def _confirmation_candle(
     candle: Candle,
     direction: Direction,
+    minimum_body_ratio: float = MIN_CONFIRMATION_BODY_RATIO,
 ) -> bool:
-
     if candle.range <= 0:
         return False
-
     if (
         candle.body_ratio
-        < MIN_CONFIRMATION_BODY_RATIO
+        < minimum_body_ratio
     ):
         return False
-
     if direction == Direction.BUY:
         return candle.bullish
-
     if direction == Direction.SELL:
         return candle.bearish
-
     return False
-
-
 # ============================================================
-# PRICE ACTION SETUP
+# SETUP CLASSIQUE M15
 # ============================================================
-
 def build_price_action_setup(
     direction: Direction,
     h1_candles: list[Candle],
     m15_candles: list[Candle],
     current_price: float,
 ) -> dict:
-
     result = {
         "ready": False,
         "level_type": "NONE",
@@ -1018,16 +910,13 @@ def build_price_action_setup(
         "breakout_index": None,
         "retest_index": None,
     }
-
     if direction == Direction.NEUTRAL:
         return result
-
     if (
         not h1_candles
         or not m15_candles
     ):
         return result
-
     level_type, key_level = (
         _find_key_level(
             direction=direction,
@@ -1036,25 +925,12 @@ def build_price_action_setup(
             current_price=current_price,
         )
     )
-
-    result[
-        "level_type"
-    ] = level_type
-
-    result[
-        "key_level"
-    ] = key_level
-
+    result["level_type"] = level_type
+    result["key_level"] = key_level
     if level_type == "NONE":
         return result
-
     if key_level <= 0:
         return result
-
-    # --------------------------------------------------------
-    # CASSURE
-    # --------------------------------------------------------
-
     breakout, breakout_index = (
         _detect_breakout(
             candles=m15_candles,
@@ -1062,30 +938,15 @@ def build_price_action_setup(
             direction=direction,
         )
     )
-
-    result[
-        "breakout_confirmed"
-    ] = breakout
-
-    result[
-        "breakout_direction"
-    ] = (
+    result["breakout_confirmed"] = breakout
+    result["breakout_direction"] = (
         direction
         if breakout
         else Direction.NEUTRAL
     )
-
-    result[
-        "breakout_index"
-    ] = breakout_index
-
+    result["breakout_index"] = breakout_index
     if not breakout:
         return result
-
-    # --------------------------------------------------------
-    # RETEST
-    # --------------------------------------------------------
-
     retest, retest_index = (
         _detect_retest(
             candles=m15_candles,
@@ -1094,180 +955,283 @@ def build_price_action_setup(
             direction=direction,
         )
     )
-
-    result[
-        "retest_confirmed"
-    ] = retest
-
-    result[
-        "retest_index"
-    ] = retest_index
-
+    result["retest_confirmed"] = retest
+    result["retest_index"] = retest_index
     if not retest:
         return result
-
-    # --------------------------------------------------------
-    # REJET
-    # --------------------------------------------------------
-
-    retest_candle = (
-        m15_candles[
-            retest_index
-        ]
-    )
-
+    retest_candle = m15_candles[
+        retest_index
+    ]
     rejection = _detect_rejection(
         candle=retest_candle,
         level=key_level,
         direction=direction,
     )
-
-    result[
-        "rejection_confirmed"
-    ] = rejection
-
+    result["rejection_confirmed"] = rejection
     if not rejection:
         return result
-
-    # --------------------------------------------------------
-    # CONFIRMATION
-    # --------------------------------------------------------
-
     confirmation_index = (
         retest_index + 1
     )
-
     if confirmation_index >= len(
         m15_candles
     ):
         return result
-
     confirmation_candle = (
         m15_candles[
             confirmation_index
         ]
     )
-
     confirmed = _confirmation_candle(
         candle=confirmation_candle,
         direction=direction,
     )
-
-    result[
-        "candle_confirmation"
-    ] = confirmed
-
+    result["candle_confirmation"] = confirmed
     if not confirmed:
         return result
-
-    # --------------------------------------------------------
-    # ENTRÉE
-    # --------------------------------------------------------
-
-    entry = (
-        confirmation_candle.close
-    )
-
+    entry = confirmation_candle.close
     atr = _calculate_atr(
         m15_candles
     )
-
     if atr <= 0:
         return result
-
     entry_distance = abs(
         entry - key_level
     )
-
-    result[
-        "entry"
-    ] = entry
-
-    result[
-        "entry_distance"
-    ] = entry_distance
-
+    result["entry"] = entry
+    result["entry_distance"] = entry_distance
     if (
         entry_distance
         > atr * MAX_ENTRY_ATR_DISTANCE
     ):
         return result
-
-    # --------------------------------------------------------
-    # PRIX ACTUEL
-    # --------------------------------------------------------
-
     current_distance = abs(
         current_price - key_level
     )
-
     if (
         current_distance
         > atr * MAX_CURRENT_PRICE_ATR_DISTANCE
     ):
         return result
-
-    result[
-        "entry_valid"
-    ] = True
-
-    result[
-        "ready"
-    ] = True
-
+    result["entry_valid"] = True
+    result["ready"] = True
     return result
-
-
+# ============================================================
+# SNIPER M5
+# ============================================================
+def build_m5_sniper_setup(
+    direction: Direction,
+    zone_level_type: str,
+    key_level: float,
+    m5_candles: list[Candle],
+    current_price: float,
+) -> dict:
+    result = {
+        "ready": False,
+        "level_type": zone_level_type,
+        "key_level": key_level,
+        "breakout_confirmed": False,
+        "breakout_direction": Direction.NEUTRAL,
+        "retest_confirmed": False,
+        "rejection_confirmed": False,
+        "candle_confirmation": False,
+        "entry_valid": False,
+        "entry": None,
+        "entry_distance": 0.0,
+        "breakout_index": None,
+        "retest_index": None,
+        "reason": "SNIPER M5 non confirmé",
+    }
+    if direction == Direction.NEUTRAL:
+        result["reason"] = "Direction neutre."
+        return result
+    if key_level <= 0:
+        result["reason"] = "Niveau clé invalide."
+        return result
+    if len(m5_candles) < 15:
+        result["reason"] = "Données M5 insuffisantes."
+        return result
+    atr = _calculate_atr(
+        m5_candles
+    )
+    if atr <= 0:
+        result["reason"] = "ATR M5 invalide."
+        return result
+    # --------------------------------------------------------
+    # PRIX DOIT ÊTRE PROCHE DU NIVEAU
+    # --------------------------------------------------------
+    current_distance = abs(
+        current_price - key_level
+    )
+    if (
+        current_distance
+        > atr * SNIPER_MAX_CURRENT_PRICE_ATR_DISTANCE
+    ):
+        result["reason"] = (
+            "Prix trop éloigné du niveau clé."
+        )
+        return result
+    # --------------------------------------------------------
+    # CASSURE M5
+    # --------------------------------------------------------
+    breakout, breakout_index = (
+        _detect_breakout(
+            candles=m5_candles,
+            level=key_level,
+            direction=direction,
+            minimum_body_ratio=(
+                SNIPER_MIN_BREAKOUT_BODY_RATIO
+            ),
+            lookback=SNIPER_LOOKBACK,
+        )
+    )
+    result["breakout_confirmed"] = breakout
+    result["breakout_direction"] = (
+        direction
+        if breakout
+        else Direction.NEUTRAL
+    )
+    result["breakout_index"] = breakout_index
+    if not breakout:
+        result["reason"] = (
+            "SNIPER : cassure M5 absente."
+        )
+        return result
+    # --------------------------------------------------------
+    # RETEST M5 STRICT
+    # --------------------------------------------------------
+    retest, retest_index = (
+        _detect_retest(
+            candles=m5_candles,
+            level=key_level,
+            breakout_index=breakout_index,
+            direction=direction,
+            tolerance_atr=(
+                SNIPER_LEVEL_TOLERANCE_ATR
+            ),
+        )
+    )
+    result["retest_confirmed"] = retest
+    result["retest_index"] = retest_index
+    if not retest:
+        result["reason"] = (
+            "SNIPER : retest M5 absent."
+        )
+        return result
+    # --------------------------------------------------------
+    # REJET M5
+    # --------------------------------------------------------
+    retest_candle = m5_candles[
+        retest_index
+    ]
+    rejection = _detect_rejection(
+        candle=retest_candle,
+        level=key_level,
+        direction=direction,
+    )
+    result["rejection_confirmed"] = rejection
+    if not rejection:
+        result["reason"] = (
+            "SNIPER : rejet M5 insuffisant."
+        )
+        return result
+    # --------------------------------------------------------
+    # BOUGIE M5 DE CONFIRMATION
+    # --------------------------------------------------------
+    confirmation_index = (
+        retest_index + 1
+    )
+    if confirmation_index >= len(
+        m5_candles
+    ):
+        result["reason"] = (
+            "SNIPER : bougie de confirmation absente."
+        )
+        return result
+    confirmation_candle = (
+        m5_candles[
+            confirmation_index
+        ]
+    )
+    confirmed = _confirmation_candle(
+        candle=confirmation_candle,
+        direction=direction,
+        minimum_body_ratio=(
+            SNIPER_MIN_CONFIRMATION_BODY_RATIO
+        ),
+    )
+    result["candle_confirmation"] = confirmed
+    if not confirmed:
+        result["reason"] = (
+            "SNIPER : confirmation M5 trop faible."
+        )
+        return result
+    # --------------------------------------------------------
+    # ENTRÉE AU PLUS PRÈS DU NIVEAU
+    # --------------------------------------------------------
+    entry = confirmation_candle.close
+    entry_distance = abs(
+        entry - key_level
+    )
+    result["entry"] = entry
+    result["entry_distance"] = entry_distance
+    if (
+        entry_distance
+        > atr * SNIPER_MAX_ENTRY_ATR_DISTANCE
+    ):
+        result["reason"] = (
+            "SNIPER : entrée trop éloignée du niveau."
+        )
+        return result
+    # --------------------------------------------------------
+    # PRIX ACTUEL TOUJOURS PROCHE
+    # --------------------------------------------------------
+    if (
+        abs(current_price - key_level)
+        > atr * SNIPER_MAX_CURRENT_PRICE_ATR_DISTANCE
+    ):
+        result["reason"] = (
+            "SNIPER : prix déjà trop éloigné."
+        )
+        return result
+    result["entry_valid"] = True
+    result["ready"] = True
+    result["reason"] = (
+        "SNIPER M5 confirmé : "
+        "cassure + retest + rejet + "
+        "bougie de confirmation."
+    )
+    return result
 # ============================================================
 # ZONE
 # ============================================================
-
 def build_zone_from_setup(
     direction: Direction,
     setup: dict,
     h1_candles: list[Candle],
     m15_candles: list[Candle],
 ) -> Optional[Zone]:
-
     if not setup.get("ready"):
         return None
-
     key_level = _safe_float(
-        setup.get(
-            "key_level"
-        )
+        setup.get("key_level")
     )
-
     if key_level <= 0:
         return None
-
     atr = _calculate_atr(
         m15_candles
     )
-
     if atr <= 0:
         return None
-
     half_width = max(
         atr * 0.10,
         1e-8,
     )
-
-    low = (
-        key_level
-        - half_width
-    )
-
-    high = (
-        key_level
-        + half_width
-    )
-
     return Zone(
         direction=direction,
         timeframe="M15",
-        low=low,
-        high=high,
+        low=key_level - half_width,
+        high=key_level + half_width,
         h1_strength=1.0,
         m15_strength=1.0,
         kind="KEY_LEVEL_RETEST",
@@ -1303,361 +1267,288 @@ def build_zone_from_setup(
             )
         ),
     )
-
-
+def build_zone_from_level(
+    direction: Direction,
+    level_type: str,
+    key_level: float,
+    m15_candles: list[Candle],
+) -> Optional[Zone]:
+    if key_level <= 0:
+        return None
+    atr = _calculate_atr(
+        m15_candles
+    )
+    if atr <= 0:
+        return None
+    half_width = max(
+        atr * 0.10,
+        1e-8,
+    )
+    return Zone(
+        direction=direction,
+        timeframe="M15",
+        low=key_level - half_width,
+        high=key_level + half_width,
+        h1_strength=1.0,
+        m15_strength=1.0,
+        kind="KEY_LEVEL_SNIPER",
+        structure_confirmed=True,
+        liquidity_nearby=False,
+        order_block=False,
+        fvg=False,
+        level_type=level_type,
+        key_level=key_level,
+        breakout_confirmed=False,
+        breakout_direction=Direction.NEUTRAL,
+        retest_confirmed=False,
+        rejection_confirmed=False,
+        candle_confirmation=False,
+        entry_valid=False,
+        entry_distance=0.0,
+    )
 # ============================================================
 # CONFIRMATION M5
 # ============================================================
-
 def _m5_micro_bos(
     candles: list[Candle],
     direction: Direction,
 ) -> bool:
-
     if len(candles) < 8:
         return False
-
     recent = candles[-8:]
-
-    highs = _swing_highs(
-        recent
-    )
-
-    lows = _swing_lows(
-        recent
-    )
-
+    highs = _swing_highs(recent)
+    lows = _swing_lows(recent)
     if direction == Direction.BUY:
-
         if not highs:
             return False
-
         return (
             candles[-1].close
             > highs[-1][1]
         )
-
     if direction == Direction.SELL:
-
         if not lows:
             return False
-
         return (
             candles[-1].close
             < lows[-1][1]
         )
-
     return False
-
-
 def _m5_liquidity_sweep(
     candles: list[Candle],
     direction: Direction,
 ) -> bool:
-
     if len(candles) < 5:
         return False
-
     previous = candles[-2]
     current = candles[-1]
-
     if direction == Direction.BUY:
-
         previous_low = min(
             candle.low
             for candle in candles[-5:-2]
         )
-
         return (
             previous.low
             < previous_low
             and current.close
             > previous.high
         )
-
     if direction == Direction.SELL:
-
         previous_high = max(
             candle.high
             for candle in candles[-5:-2]
         )
-
         return (
             previous.high
             > previous_high
             and current.close
             < previous.low
         )
-
     return False
-
-
 def _m5_retest(
     candles: list[Candle],
     zone: Zone,
     direction: Direction,
 ) -> bool:
-
     if not candles:
         return False
-
     for candle in candles[-3:]:
-
         touched = (
             candle.low
             <= zone.high
             and candle.high
             >= zone.low
         )
-
         if not touched:
             continue
-
         if direction == Direction.BUY:
-
             if candle.close >= zone.key_level:
                 return True
-
         elif direction == Direction.SELL:
-
             if candle.close <= zone.key_level:
                 return True
-
     return False
-
-
 def _m5_rejection(
     candles: list[Candle],
     zone: Zone,
     direction: Direction,
 ) -> bool:
-
     if not candles:
         return False
-
-    candle = candles[-1]
-
     return _detect_rejection(
-        candle=candle,
+        candle=candles[-1],
         level=zone.key_level,
         direction=direction,
     )
-
-
 def build_m5_confirmation(
     direction: Direction,
     m5_candles: list[Candle],
     zone: Zone,
 ) -> Confirmation:
-
     micro_bos = _m5_micro_bos(
         m5_candles,
         direction,
     )
-
     liquidity_sweep = (
         _m5_liquidity_sweep(
             m5_candles,
             direction,
         )
     )
-
     retest = _m5_retest(
         m5_candles,
         zone,
         direction,
     )
-
     rejection = _m5_rejection(
         m5_candles,
         zone,
         direction,
     )
-
     candle_confirmation = False
-
     if m5_candles:
-
         candle_confirmation = (
             _confirmation_candle(
                 m5_candles[-1],
                 direction,
             )
         )
-
     return Confirmation(
         direction=direction,
         retest=retest,
         rejection=rejection,
         liquidity_sweep=liquidity_sweep,
         micro_bos=micro_bos,
-        candle_confirmation=(
-            candle_confirmation
-        ),
+        candle_confirmation=candle_confirmation,
     )
-
-
 # ============================================================
 # STOP LOSS
 # ============================================================
-
 def _build_structural_stop(
     direction: Direction,
     entry: float,
     candles: list[Candle],
 ) -> float:
-
     atr = _calculate_atr(
         candles
     )
-
     if atr <= 0:
         return 0.0
-
     lows = _swing_lows(
         candles
     )
-
     highs = _swing_highs(
         candles
     )
-
     if direction == Direction.BUY:
-
         candidates = [
             price
             for _, price in lows
             if price < entry
         ]
-
         if candidates:
-
             structural_low = max(
                 candidates
             )
-
             return (
                 structural_low
                 - atr * SL_ATR_BUFFER
             )
-
-        return (
-            entry - atr
-        )
-
+        return entry - atr
     if direction == Direction.SELL:
-
         candidates = [
             price
             for _, price in highs
             if price > entry
         ]
-
         if candidates:
-
             structural_high = min(
                 candidates
             )
-
             return (
                 structural_high
                 + atr * SL_ATR_BUFFER
             )
-
-        return (
-            entry + atr
-        )
-
+        return entry + atr
     return 0.0
-
-
 # ============================================================
 # TAKE PROFIT
 # ============================================================
-
 def _build_take_profit(
     direction: Direction,
     entry: float,
     stop_loss: float,
     candles: list[Candle],
 ) -> float:
-
     risk = abs(
         entry - stop_loss
     )
-
     if risk <= 0:
         return 0.0
-
     minimum_reward = (
         risk * CONFIG.MINIMUM_RR
     )
-
     highs = _swing_highs(
         candles
     )
-
     lows = _swing_lows(
         candles
     )
-
     if direction == Direction.BUY:
-
         candidates = [
             price
             for _, price in highs
             if price > entry
         ]
-
         if candidates:
-
             logical_target = min(
                 candidates
             )
-
             if (
-                logical_target
-                - entry
+                logical_target - entry
                 >= minimum_reward
             ):
                 return logical_target
-
-        return (
-            entry + minimum_reward
-        )
-
+        return entry + minimum_reward
     if direction == Direction.SELL:
-
         candidates = [
             price
             for _, price in lows
             if price < entry
         ]
-
         if candidates:
-
             logical_target = max(
                 candidates
             )
-
             if (
-                entry
-                - logical_target
+                entry - logical_target
                 >= minimum_reward
             ):
                 return logical_target
-
-        return (
-            entry - minimum_reward
-        )
-
+        return entry - minimum_reward
     return 0.0
-
-
 # ============================================================
 # SCORE
 # ============================================================
-
 def _calculate_final_score(
     trend: TrendContext,
     zone: Zone,
@@ -1666,9 +1557,7 @@ def _calculate_final_score(
     spread_ok: bool = True,
     session_ok: bool = True,
 ) -> float:
-
     try:
-
         score = calculate_score(
             trend=trend,
             zone=zone,
@@ -1677,16 +1566,12 @@ def _calculate_final_score(
             spread_ok=spread_ok,
             session_ok=session_ok,
         )
-
         return round(
             _safe_float(score),
             2,
         )
-
     except TypeError:
-
         try:
-
             score = calculate_score(
                 trend,
                 zone,
@@ -1695,137 +1580,116 @@ def _calculate_final_score(
                 spread_ok,
                 session_ok,
             )
-
             return round(
                 _safe_float(score),
                 2,
             )
-
         except Exception:
             return 0.0
-
     except Exception:
         return 0.0
-
-
 # ============================================================
 # ANALYSE PRINCIPALE
 # ============================================================
-
 def analyze_market(
     symbol: str = "XAU/USD",
 ) -> dict:
-
     result = _empty_result(
         symbol
     )
-
     # --------------------------------------------------------
-    # 1. CHARGEMENT DES DONNÉES
+    # 1. H4 / H1 / M15 : CACHE LONG
     # --------------------------------------------------------
-
     try:
-
         h4_candles = _load_candles(
             symbol,
             "H4",
             100,
         )
-
         h1_candles = _load_candles(
             symbol,
             "H1",
             100,
         )
-
         m15_candles = _load_candles(
             symbol,
             "M15",
             120,
         )
-
+        # ----------------------------------------------------
+        # M5 : RAFRAÎCHI À CHAQUE ANALYSE
+        # ----------------------------------------------------
         m5_candles = _load_candles(
             symbol,
             "M5",
             120,
         )
-
-        current_price = _safe_float(
-            get_latest_price(symbol)
-        )
-
     except Exception as exc:
-
         result.update(
             {
                 "status": "WAIT",
                 "reason": (
                     "Données marché "
-                    "temporairement "
-                    f"indisponibles : {exc}"
+                    "temporairement indisponibles : "
+                    f"{exc}"
                 ),
             }
         )
-
         return result
-
     if (
         not h4_candles
         or not h1_candles
         or not m15_candles
+        or not m5_candles
     ):
-
         result.update(
             {
                 "status": "WAIT",
                 "reason": (
-                    "Données H4/H1/M15 "
+                    "Données H4/H1/M15/M5 "
                     "insuffisantes."
                 ),
             }
         )
-
         return result
-
+    # --------------------------------------------------------
+    # PRIX ACTUEL = DERNIÈRE M5
+    # --------------------------------------------------------
+    current_price = _safe_float(
+        m5_candles[-1].close
+    )
     if current_price <= 0:
-
-        current_price = (
-            m15_candles[-1].close
+        result.update(
+            {
+                "status": "WAIT",
+                "reason": "Prix M5 invalide.",
+            }
         )
-
+        return result
     # --------------------------------------------------------
     # 2. DIRECTIONS
     # --------------------------------------------------------
-
-    h4_direction = (
-        _structure_direction(
-            h4_candles
-        )
+    h4_direction = _structure_direction(
+        h4_candles
     )
-
-    h1_direction = (
-        _structure_direction(
-            h1_candles
-        )
+    h1_direction = _structure_direction(
+        h1_candles
     )
-
-    m15_direction = (
-        _structure_direction(
-            m15_candles
-        )
+    m15_direction = _structure_direction(
+        m15_candles
     )
-
+    m5_direction = _structure_direction(
+        m5_candles
+    )
     result["trend"] = {
         "H4": h4_direction,
         "H1": h1_direction,
         "M15": m15_direction,
-        "M5": Direction.NEUTRAL,
+        "M5": m5_direction,
     }
-
     # --------------------------------------------------------
     # 3. ALIGNEMENT PRINCIPAL
     # --------------------------------------------------------
-
     primary_direction = (
         get_primary_direction(
             h4_direction,
@@ -1833,16 +1697,10 @@ def analyze_market(
             m15_direction,
         )
     )
-
-    result[
-        "direction"
-    ] = primary_direction
-
-    if (
+    result["direction"] = (
         primary_direction
-        == Direction.NEUTRAL
-    ):
-
+    )
+    if primary_direction == Direction.NEUTRAL:
         result.update(
             {
                 "status": "WAIT",
@@ -1851,27 +1709,50 @@ def analyze_market(
                     "non confirmé : "
                     f"H4={h4_direction.value}, "
                     f"H1={h1_direction.value}, "
-                    f"M15={m15_direction.value}."
+                    f"M15={m15_direction.value}. "
+                    "Le M5 ne peut pas "
+                    "remplacer H4/H1/M15."
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
     # 4. CONTEXTE TENDANCE
     # --------------------------------------------------------
-
     trend = TrendContext(
         h4=primary_direction,
         h4_strength=1.0,
     )
-
     # --------------------------------------------------------
-    # 5. SETUP PRICE ACTION
+    # 5. NIVEAU CLÉ
     # --------------------------------------------------------
-
-    setup = (
+    level_type, key_level = (
+        _find_key_level(
+            direction=primary_direction,
+            h1_candles=h1_candles,
+            m15_candles=m15_candles,
+            current_price=current_price,
+        )
+    )
+    if (
+        level_type == "NONE"
+        or key_level <= 0
+    ):
+        result.update(
+            {
+                "status": "WAIT",
+                "reason": (
+                    "H4 + H1 + M15 alignés "
+                    "mais aucune zone clé "
+                    "valide n'est disponible."
+                ),
+            }
+        )
+        return result
+    # --------------------------------------------------------
+    # 6. SETUP CLASSIQUE M15
+    # --------------------------------------------------------
+    classic_setup = (
         build_price_action_setup(
             direction=primary_direction,
             h1_candles=h1_candles,
@@ -1879,96 +1760,97 @@ def analyze_market(
             current_price=current_price,
         )
     )
-
-    if not setup["ready"]:
-
-        reason_parts: list[str] = []
-
-        if setup[
-            "level_type"
-        ] == "NONE":
-
-            reason_parts.append(
-                "zone clé non identifiée"
+    # --------------------------------------------------------
+    # 7. SNIPER M5
+    # --------------------------------------------------------
+    sniper_setup = (
+        build_m5_sniper_setup(
+            direction=primary_direction,
+            zone_level_type=level_type,
+            key_level=key_level,
+            m5_candles=m5_candles,
+            current_price=current_price,
+        )
+    )
+    # --------------------------------------------------------
+    # CHOIX DU SETUP
+    # --------------------------------------------------------
+    use_sniper = False
+    selected_setup = None
+    if classic_setup.get("ready"):
+        selected_setup = classic_setup
+    elif sniper_setup.get("ready"):
+        selected_setup = sniper_setup
+        use_sniper = True
+    else:
+        classic_reason = "setup M15 incomplet"
+        sniper_reason = sniper_setup.get(
+            "reason",
+            "SNIPER M5 non confirmé",
+        )
+        if (
+            not classic_setup.get(
+                "breakout_confirmed"
             )
-
-        elif not setup[
-            "breakout_confirmed"
-        ]:
-
-            reason_parts.append(
-                "cassure non confirmée"
+        ):
+            classic_reason = (
+                "cassure M15 non confirmée"
             )
-
-        elif not setup[
+        elif not classic_setup.get(
             "retest_confirmed"
-        ]:
-
-            reason_parts.append(
-                "retest non confirmé"
+        ):
+            classic_reason = (
+                "retest M15 non confirmé"
             )
-
-        elif not setup[
+        elif not classic_setup.get(
             "rejection_confirmed"
-        ]:
-
-            reason_parts.append(
-                "rejet non confirmé"
+        ):
+            classic_reason = (
+                "rejet M15 non confirmé"
             )
-
-        elif not setup[
+        elif not classic_setup.get(
             "candle_confirmation"
-        ]:
-
-            reason_parts.append(
-                "bougie de confirmation absente"
+        ):
+            classic_reason = (
+                "confirmation M15 absente"
             )
-
-        elif not setup[
+        elif not classic_setup.get(
             "entry_valid"
-        ]:
-
-            reason_parts.append(
-                "entrée trop éloignée de la zone"
+        ):
+            classic_reason = (
+                "entrée M15 trop éloignée"
             )
-
-        else:
-
-            reason_parts.append(
-                "setup incomplet"
-            )
-
         result.update(
             {
                 "status": "WAIT",
                 "reason": (
-                    "Tendance H4/H1/M15 "
-                    "alignée mais setup "
-                    "price action incomplet : "
-                    + ", ".join(
-                        reason_parts
-                    )
+                    "H4 + H1 + M15 alignés. "
+                    f"Setup classique : "
+                    f"{classic_reason}. "
+                    f"SNIPER M5 : "
+                    f"{sniper_reason}"
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 6. ZONE
+    # 8. ZONE
     # --------------------------------------------------------
-
-    zone = (
-        build_zone_from_setup(
+    if use_sniper:
+        zone = build_zone_from_level(
             direction=primary_direction,
-            setup=setup,
+            level_type=level_type,
+            key_level=key_level,
+            m15_candles=m15_candles,
+        )
+    else:
+        zone = build_zone_from_setup(
+            direction=primary_direction,
+            setup=selected_setup,
             h1_candles=h1_candles,
             m15_candles=m15_candles,
         )
-    )
-
     if zone is None:
-
         result.update(
             {
                 "status": "WAIT",
@@ -1977,47 +1859,31 @@ def analyze_market(
                 ),
             }
         )
-
         return result
-
-    result[
-        "zone"
-    ] = zone
-
+    result["zone"] = zone
     # --------------------------------------------------------
-    # 7. M5 SECONDAIRE
+    # 9. CONFIRMATION M5
     # --------------------------------------------------------
-
-    confirmation = (
-        build_m5_confirmation(
-            direction=primary_direction,
-            m5_candles=m5_candles,
-            zone=zone,
-        )
+    confirmation = build_m5_confirmation(
+        direction=primary_direction,
+        m5_candles=m5_candles,
+        zone=zone,
     )
-
-    result[
-        "confirmation"
-    ] = confirmation
-
-    result[
-        "m5_confirmed"
-    ] = confirmation.valid
-
-    # IMPORTANT :
-    # M5 n'est jamais utilisé comme condition
-    # bloquante pour un setup H4/H1/M15 valide.
-
+    result["confirmation"] = confirmation
+    result["m5_confirmed"] = (
+        confirmation.valid
+    )
+    result["sniper"] = use_sniper
+    result["sniper_setup"] = (
+        sniper_setup.get("ready", False)
+    )
     # --------------------------------------------------------
-    # 8. ENTRÉE
+    # 10. ENTRÉE
     # --------------------------------------------------------
-
     entry = _safe_float(
-        setup.get("entry")
+        selected_setup.get("entry")
     )
-
     if entry <= 0:
-
         result.update(
             {
                 "status": "WAIT",
@@ -2026,129 +1892,103 @@ def analyze_market(
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 9. STOP LOSS
+    # 11. SL
     # --------------------------------------------------------
-
-    stop_loss = (
-        _build_structural_stop(
-            direction=primary_direction,
-            entry=entry,
-            candles=m15_candles,
-        )
+    # Pour un sniper M5, le SL est construit
+    # sur la structure M5.
+    stop_candles = (
+        m5_candles
+        if use_sniper
+        else m15_candles
     )
-
+    stop_loss = _build_structural_stop(
+        direction=primary_direction,
+        entry=entry,
+        candles=stop_candles,
+    )
     if stop_loss <= 0:
-
         result.update(
             {
                 "status": "REJECT",
                 "reason": (
                     "Impossible de construire "
-                    "un stop loss structurel."
+                    "le SL structurel."
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 10. TAKE PROFIT
+    # 12. TP
     # --------------------------------------------------------
-
-    take_profit = (
-        _build_take_profit(
-            direction=primary_direction,
-            entry=entry,
-            stop_loss=stop_loss,
-            candles=m15_candles,
-        )
+    target_candles = (
+        m15_candles
+        if use_sniper
+        else m15_candles
     )
-
+    take_profit = _build_take_profit(
+        direction=primary_direction,
+        entry=entry,
+        stop_loss=stop_loss,
+        candles=target_candles,
+    )
     if take_profit <= 0:
-
         result.update(
             {
                 "status": "REJECT",
                 "reason": (
                     "Impossible de construire "
-                    "un take profit logique."
+                    "le TP logique."
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 11. GÉOMÉTRIE
+    # 13. GÉOMÉTRIE
     # --------------------------------------------------------
-
     if primary_direction == Direction.BUY:
-
         geometry_valid = (
             stop_loss
             < entry
             < take_profit
         )
-
     elif primary_direction == Direction.SELL:
-
         geometry_valid = (
             stop_loss
             > entry
             > take_profit
         )
-
     else:
-
         geometry_valid = False
-
     if not geometry_valid:
-
         result.update(
             {
                 "status": "REJECT",
                 "reason": (
                     "Géométrie "
-                    "Entry / SL / TP "
-                    "invalide."
+                    "Entry / SL / TP invalide."
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 12. RR
+    # 14. RR
     # --------------------------------------------------------
-
     rr = calculate_rr(
         entry=entry,
         stop_loss=stop_loss,
         take_profit=take_profit,
     )
-
-    result[
-        "entry"
-    ] = entry
-
-    result[
-        "stop_loss"
-    ] = stop_loss
-
-    result[
-        "take_profit"
-    ] = take_profit
-
-    result[
-        "rr"
-    ] = rr
-
+    result.update(
+        {
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "rr": rr,
+        }
+    )
     if rr < CONFIG.MINIMUM_RR:
-
         result.update(
             {
                 "status": "REJECT",
@@ -2159,80 +1999,55 @@ def analyze_market(
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 13. MARCHÉ OUVERT
+    # 15. MARCHÉ
     # --------------------------------------------------------
-
     try:
-
         market_open = bool(
             is_market_open(symbol)
         )
-
     except Exception:
-
         market_open = True
-
     if not market_open:
-
         result.update(
             {
                 "status": "WAIT",
-                "reason": (
-                    "Marché fermé."
-                ),
+                "reason": "Marché fermé.",
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 14. CALENDRIER ÉCONOMIQUE
+    # 16. NEWS
     # --------------------------------------------------------
-
     news_blocked = False
     news_reason = None
-
     try:
-
         news_result = economic_filter(
             symbol
         )
-
         if isinstance(
             news_result,
             tuple,
         ):
-
             news_blocked = bool(
                 news_result[0]
             )
-
             if len(news_result) > 1:
                 news_reason = (
                     news_result[1]
                 )
-
         else:
-
             news_blocked = bool(
                 news_result
             )
-
     except Exception:
-
         news_blocked = False
         news_reason = None
-
     result[
         "news_blocked"
     ] = news_blocked
-
     if news_blocked:
-
         result.update(
             {
                 "status": "WAIT",
@@ -2244,69 +2059,55 @@ def analyze_market(
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 15. SCORE
+    # 17. SCORE
     # --------------------------------------------------------
-
-    score = (
-        _calculate_final_score(
-            trend=trend,
-            zone=zone,
-            confirmation=confirmation,
-            rr=rr,
-            spread_ok=True,
-            session_ok=True,
-        )
+    score = _calculate_final_score(
+        trend=trend,
+        zone=zone,
+        confirmation=confirmation,
+        rr=rr,
+        spread_ok=True,
+        session_ok=True,
     )
-
-    result[
-        "score"
-    ] = score
-
-    # --------------------------------------------------------
-    # 16. SEUIL SCORE
-    # --------------------------------------------------------
-
-    try:
-
-        score_valid = (
-            should_send_signal(
-                score,
-                threshold=(
-                    CONFIG.SIGNAL_THRESHOLD
-                ),
-            )
+    # Bonus strict pour un vrai sniper M5.
+    #
+    # Le bonus ne permet PAS de créer un signal
+    # si les conditions de base ne sont pas présentes.
+    if use_sniper:
+        score = min(
+            100.0,
+            score + 5.0,
         )
-
+    result["score"] = round(
+        score,
+        2,
+    )
+    # --------------------------------------------------------
+    # 18. SEUIL
+    # --------------------------------------------------------
+    try:
+        score_valid = should_send_signal(
+            score,
+            threshold=CONFIG.SIGNAL_THRESHOLD,
+        )
     except TypeError:
-
         try:
-
-            score_valid = (
-                should_send_signal(
-                    score
-                )
+            score_valid = should_send_signal(
+                score
             )
-
         except Exception:
-
             score_valid = (
                 score
                 >= CONFIG.SIGNAL_THRESHOLD
             )
-
     except Exception:
-
         score_valid = (
             score
             >= CONFIG.SIGNAL_THRESHOLD
         )
-
     if not score_valid:
-
         result.update(
             {
                 "status": "REJECT",
@@ -2317,36 +2118,27 @@ def analyze_market(
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 17. VALIDATION FINALE
+    # 19. VALIDATION FINALE
     # --------------------------------------------------------
-
     try:
-
         signal_engine = SignalEngine()
-
-        signal = (
-            signal_engine.build_signal(
-                symbol=symbol,
-                trend=trend,
-                zone=zone,
-                confirmation=confirmation,
-                entry=entry,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                spread_ok=True,
-                session_ok=True,
-                h4_direction=h4_direction,
-                h1_direction=h1_direction,
-                m15_direction=m15_direction,
-            )
+        signal = signal_engine.build_signal(
+            symbol=symbol,
+            trend=trend,
+            zone=zone,
+            confirmation=confirmation,
+            entry=entry,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            spread_ok=True,
+            session_ok=True,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
         )
-
     except Exception as exc:
-
         result.update(
             {
                 "status": "REJECT",
@@ -2357,11 +2149,8 @@ def analyze_market(
                 ),
             }
         )
-
         return result
-
     if signal is None:
-
         result.update(
             {
                 "status": "REJECT",
@@ -2371,56 +2160,50 @@ def analyze_market(
                 ),
             }
         )
-
         return result
-
     # --------------------------------------------------------
-    # 18. SIGNAL ACTIF
+    # 20. SIGNAL ACTIF
     # --------------------------------------------------------
-
+    if use_sniper:
+        final_reason = (
+            "🔥 SNIPER M5 VALIDÉ : "
+            "H4 + H1 + M15 alignés, "
+            "niveau clé validé, "
+            "cassure M5 + retest M5 + "
+            "rejet M5 + confirmation M5, "
+            "entrée précise, "
+            "SL structurel et RR valide."
+        )
+    else:
+        final_reason = (
+            "Signal validé : "
+            "H4 + H1 + M15 alignés, "
+            "zone clé identifiée, "
+            "cassure + retest + rejet "
+            "+ confirmation validés."
+        )
     result.update(
         {
             "status": "ACTIVE",
-            "reason": (
-                "Signal validé : "
-                "H4 + H1 + M15 alignés, "
-                "zone clé identifiée, "
-                "cassure + retest + rejet "
-                "+ confirmation validés."
-            ),
+            "reason": final_reason,
             "signal": signal,
         }
     )
-
     return result
-
-
 # ============================================================
 # ALIASES COMPATIBILITÉ
 # ============================================================
-
 def analyser_marche(
     symbol: str = "XAU/USD",
 ) -> dict:
-    """
-    Alias français.
-    """
     return analyze_market(symbol)
-
-
 def analyser_marche_complet(
     symbol: str = "XAU/USD",
 ) -> dict:
-    """
-    Alias de compatibilité.
-    """
     return analyze_market(symbol)
-
-
 # ============================================================
 # EXPORTS
 # ============================================================
-
 __all__ = [
     "analyze_market",
     "analyser_marche",
@@ -2428,6 +2211,10 @@ __all__ = [
     "is_primary_alignment_valid",
     "get_primary_direction",
     "build_price_action_setup",
+    "build_m5_sniper_setup",
     "build_zone_from_setup",
+    "build_zone_from_level",
     "build_m5_confirmation",
+    "clear_pipeline_cache",
+    "clear_symbol_pipeline_cache",
 ]
