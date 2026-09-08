@@ -2,7 +2,11 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timezone
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,7 +21,10 @@ from signals.monitor import SignalMonitor
 # LOGGING
 # ============================================================
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format=(
+        "%(asctime)s - %(name)s - "
+        "%(levelname)s - %(message)s"
+    ),
     level=logging.INFO,
 )
 logger = logging.getLogger("NOVA_TRADE_AI")
@@ -59,6 +66,21 @@ SIGNAL_COOLDOWN_SECONDS = int(
         "14400",
     )
 )
+# IMPORTANT :
+# On espace fortement les analyses afin d'éviter
+# une rafale de requêtes Twelve Data.
+#
+# Avant : 2 secondes
+# Maintenant : 15 secondes
+#
+# Avec 13 marchés, cela permet d'étaler
+# le cycle au lieu de faire une rafale.
+SCAN_SYMBOL_DELAY_SECONDS = int(
+    os.getenv(
+        "SCAN_SYMBOL_DELAY_SECONDS",
+        "15",
+    )
+)
 # ============================================================
 # MÉMOIRE ANTI-DOUBLON
 # ============================================================
@@ -67,6 +89,20 @@ last_sent_signals = {}
 # TÂCHE DU SCANNER
 # ============================================================
 scanner_task = None
+# ============================================================
+# VERROU D'ANALYSE
+# ============================================================
+# Empêche :
+#
+# scanner automatique
+#        +
+# analyse manuelle
+#
+# de lancer deux analyses simultanément.
+#
+# Cela protège également Twelve Data contre
+# les requêtes concurrentes.
+analysis_lock = asyncio.Lock()
 # ============================================================
 # TRACKER DES SIGNAUX
 # ============================================================
@@ -82,7 +118,8 @@ async def send_monitor_notification(
     message: str,
 ):
     """
-    Envoie une notification générée par le SignalMonitor.
+    Envoie une notification générée
+    par le SignalMonitor.
     """
     global telegram_application
     if telegram_application is None:
@@ -137,7 +174,9 @@ def main_menu():
             ),
         ],
     ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        keyboard
+    )
 # ============================================================
 # MENU MARCHÉS
 # ============================================================
@@ -164,7 +203,9 @@ def market_menu():
             )
         ]
     )
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        keyboard
+    )
 # ============================================================
 # FORMATAGE PRIX
 # ============================================================
@@ -206,7 +247,7 @@ def format_score(value):
     ):
         return "0.00"
 # ============================================================
-# FORMATAGE NEWS ÉCONOMIQUES
+# FORMATAGE NEWS
 # ============================================================
 def format_news(news) -> str:
     if isinstance(news, dict):
@@ -232,16 +273,24 @@ def format_news(news) -> str:
                 "⚠️ NEWS HIGH IMPACT À PROXIMITÉ"
             )
         if status == "CLEAR":
-            return "🟢 AUCUNE NEWS HIGH IMPACT"
+            return (
+                "🟢 AUCUNE NEWS HIGH IMPACT"
+            )
         if status == "DISABLED":
-            return "⚪ FILTRE NEWS DÉSACTIVÉ"
+            return (
+                "⚪ FILTRE NEWS DÉSACTIVÉ"
+            )
         if checked:
             if status:
                 return f"🟡 {status}"
-            return "🟡 VÉRIFICATION EFFECTUÉE"
+            return (
+                "🟡 VÉRIFICATION EFFECTUÉE"
+            )
         return "🟡 NON VÉRIFIÉE"
     if isinstance(news, str):
-        normalized = news.strip().upper()
+        normalized = (
+            news.strip().upper()
+        )
         if normalized in {
             "",
             "NOT CHECKED",
@@ -253,7 +302,9 @@ def format_news(news) -> str:
             "NO NEWS",
             "NO HIGH IMPACT NEWS",
         }:
-            return "🟢 AUCUNE NEWS HIGH IMPACT"
+            return (
+                "🟢 AUCUNE NEWS HIGH IMPACT"
+            )
         if normalized in {
             "BLOCKED",
             "HIGH IMPACT",
@@ -453,7 +504,10 @@ def format_analysis(
 def is_valid_automatic_signal(
     result: dict,
 ) -> bool:
-    if not isinstance(result, dict):
+    if not isinstance(
+        result,
+        dict,
+    ):
         return False
     status = str(
         result.get(
@@ -471,18 +525,24 @@ def is_valid_automatic_signal(
         "score",
         0,
     )
-    trade = result.get(
-        "trade",
-        {},
-    ) or {}
+    trade = (
+        result.get(
+            "trade",
+            {},
+        )
+        or {}
+    )
     rr = trade.get(
         "rr",
         0,
     )
-    trend = result.get(
-        "trend",
-        {},
-    ) or {}
+    trend = (
+        result.get(
+            "trend",
+            {},
+        )
+        or {}
+    )
     h4 = str(
         trend.get(
             "H4",
@@ -517,7 +577,10 @@ def is_valid_automatic_signal(
     ):
         return False
     try:
-        if float(score) < CONFIG.SIGNAL_THRESHOLD:
+        if (
+            float(score)
+            < CONFIG.SIGNAL_THRESHOLD
+        ):
             return False
     except (
         TypeError,
@@ -525,7 +588,10 @@ def is_valid_automatic_signal(
     ):
         return False
     try:
-        if float(rr) < CONFIG.MINIMUM_RR:
+        if (
+            float(rr)
+            < CONFIG.MINIMUM_RR
+        ):
             return False
     except (
         TypeError,
@@ -586,6 +652,24 @@ def mark_signal_as_sent(
     last_sent_signals[key] = (
         datetime.now(timezone.utc)
     )
+# ============================================================
+# ANALYSE PROTÉGÉE
+# ============================================================
+async def protected_analyze(
+    symbol: str,
+) -> dict:
+    """
+    Exécute une analyse en garantissant
+    qu'une seule analyse est active à la fois.
+    Cela évite qu'une analyse manuelle
+    et le scanner automatique sollicitent
+    Twelve Data simultanément.
+    """
+    async with analysis_lock:
+        return await asyncio.to_thread(
+            analyze_market,
+            symbol,
+        )
 # ============================================================
 # ENVOI AU CANAL / CHAT
 # ============================================================
@@ -668,9 +752,8 @@ async def scan_symbol(
             "Scan automatique : %s",
             symbol,
         )
-        result = await asyncio.to_thread(
-            analyze_market,
-            symbol,
+        result = await protected_analyze(
+            symbol
         )
         if not isinstance(
             result,
@@ -713,7 +796,9 @@ async def scan_symbol(
         else:
             logger.info(
                 "Pas de signal : %s | "
-                "direction=%s | status=%s | score=%s",
+                "direction=%s | "
+                "status=%s | "
+                "score=%s",
                 symbol,
                 result.get(
                     "direction"
@@ -741,10 +826,17 @@ async def automatic_scan_loop(
         "Scanner automatique démarré."
     )
     logger.info(
-        "Intervalle : %s secondes",
+        "Intervalle entre cycles : %s secondes",
         SCAN_INTERVAL_SECONDS,
     )
+    logger.info(
+        "Délai entre marchés : %s secondes",
+        SCAN_SYMBOL_DELAY_SECONDS,
+    )
     while True:
+        cycle_started = time_now = (
+            datetime.now(timezone.utc)
+        )
         try:
             if not AUTO_SIGNAL_ENABLED:
                 logger.info(
@@ -760,12 +852,37 @@ async def automatic_scan_loop(
                 logger.info(
                     "========== NOUVEAU SCAN =========="
                 )
-                for symbol in ALL_SYMBOLS:
+                total_symbols = len(
+                    ALL_SYMBOLS
+                )
+                for index, symbol in enumerate(
+                    ALL_SYMBOLS,
+                    start=1,
+                ):
+                    logger.info(
+                        "SCAN %s/%s : %s",
+                        index,
+                        total_symbols,
+                        symbol,
+                    )
                     await scan_symbol(
                         application,
                         symbol,
                     )
-                    await asyncio.sleep(2)
+                    # ------------------------------------------------
+                    # Pause entre les marchés
+                    # ------------------------------------------------
+                    #
+                    # IMPORTANT :
+                    # cette pause est volontaire.
+                    #
+                    # Elle réduit fortement les rafales
+                    # vers Twelve Data.
+                    #
+                    if index < total_symbols:
+                        await asyncio.sleep(
+                            SCAN_SYMBOL_DELAY_SECONDS
+                        )
                 logger.info(
                     "========== SCAN TERMINÉ =========="
                 )
@@ -779,8 +896,23 @@ async def automatic_scan_loop(
                 "Erreur boucle scanner : %s",
                 exc,
             )
+        # --------------------------------------------------------
+        # Respect de l'intervalle entre cycles
+        # --------------------------------------------------------
+        elapsed = (
+            datetime.now(timezone.utc)
+            - cycle_started
+        ).total_seconds()
+        remaining = max(
+            0,
+            SCAN_INTERVAL_SECONDS - elapsed,
+        )
+        logger.info(
+            "Prochain scan dans %.0f secondes.",
+            remaining,
+        )
         await asyncio.sleep(
-            SCAN_INTERVAL_SECONDS
+            remaining
         )
 # ============================================================
 # INITIALISATION
@@ -806,10 +938,6 @@ async def post_init(
             "Scanner automatique déjà actif."
         )
         return
-    # IMPORTANT :
-    # asyncio.create_task() est utilisé ici au lieu de
-    # application.create_task() car post_init est appelé
-    # avant que Application soit officiellement RUNNING.
     scanner_task = asyncio.create_task(
         automatic_scan_loop(
             application
@@ -955,6 +1083,8 @@ async def about(
         f"{channel_status}\n"
         f"Intervalle scan : "
         f"{SCAN_INTERVAL_SECONDS}s\n"
+        f"Délai entre marchés : "
+        f"{SCAN_SYMBOL_DELAY_SECONDS}s\n"
         f"Intervalle suivi : "
         f"{CONFIG.TRACKING_INTERVAL_SECONDS}s",
         reply_markup=main_menu(),
@@ -1008,6 +1138,8 @@ async def status(
         f"{len(ALL_SYMBOLS)}\n"
         f"Intervalle scan : "
         f"{SCAN_INTERVAL_SECONDS}s\n"
+        f"Délai entre marchés : "
+        f"{SCAN_SYMBOL_DELAY_SECONDS}s\n"
         f"Intervalle suivi : "
         f"{CONFIG.TRACKING_INTERVAL_SECONDS}s\n"
         f"Exécution automatique : "
@@ -1050,7 +1182,9 @@ async def run_analysis_message(
         message is None
         and update.callback_query
     ):
-        message = update.callback_query.message
+        message = (
+            update.callback_query.message
+        )
     if message is None:
         return
     await message.reply_text(
@@ -1059,9 +1193,8 @@ async def run_analysis_message(
         "⏳ Calcul des confluences..."
     )
     try:
-        result = await asyncio.to_thread(
-            analyze_market,
-            symbol,
+        result = await protected_analyze(
+            symbol
         )
         text = format_analysis(
             result
@@ -1070,17 +1203,23 @@ async def run_analysis_message(
             [
                 InlineKeyboardButton(
                     "🔄 REANALYSER",
-                    callback_data=f"analyse:{symbol}",
+                    callback_data=(
+                        f"analyse:{symbol}"
+                    ),
                 )
             ],
             [
                 InlineKeyboardButton(
                     "📊 AUTRE MARCHÉ",
-                    callback_data="menu_analyse",
+                    callback_data=(
+                        "menu_analyse"
+                    ),
                 ),
                 InlineKeyboardButton(
                     "🏠 MENU",
-                    callback_data="menu_main",
+                    callback_data=(
+                        "menu_main"
+                    ),
                 ),
             ],
         ]
@@ -1141,7 +1280,8 @@ async def button_handler(
             "🟢 News : FILTRE DE SÉCURITÉ\n"
             "🟢 Signal Tracker : ACTIF\n"
             "🟢 Signal Monitor : ACTIF\n"
-            f"📡 Signaux suivis : {active_count}\n"
+            f"📡 Signaux suivis : "
+            f"{active_count}\n"
             f"🟢 Scanner : "
             f"{'ACTIF' if AUTO_SIGNAL_ENABLED else 'ARRÊTÉ'}\n"
             f"Canal : "
@@ -1152,6 +1292,8 @@ async def button_handler(
             f"{CONFIG.MINIMUM_RR}\n"
             f"Intervalle scan : "
             f"{SCAN_INTERVAL_SECONDS}s\n"
+            f"Délai entre marchés : "
+            f"{SCAN_SYMBOL_DELAY_SECONDS}s\n"
             f"Intervalle suivi : "
             f"{CONFIG.TRACKING_INTERVAL_SECONDS}s",
             reply_markup=main_menu(),
@@ -1219,9 +1361,8 @@ async def button_handler(
             "⏳ Patiente quelques secondes."
         )
         try:
-            result = await asyncio.to_thread(
-                analyze_market,
-                symbol,
+            result = await protected_analyze(
+                symbol
             )
             text = format_analysis(
                 result
@@ -1230,19 +1371,25 @@ async def button_handler(
                 [
                     InlineKeyboardButton(
                         "🔄 REANALYSER",
-                        callback_data=f"analyse:{symbol}",
+                        callback_data=(
+                            f"analyse:{symbol}"
+                        ),
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         "📊 AUTRE MARCHÉ",
-                        callback_data="menu_analyse",
+                        callback_data=(
+                            "menu_analyse"
+                        ),
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         "🏠 MENU",
-                        callback_data="menu_main",
+                        callback_data=(
+                            "menu_main"
+                        ),
                     )
                 ],
             ]
@@ -1274,9 +1421,15 @@ def create_application() -> Application:
         )
     application = (
         Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
+        .token(
+            TELEGRAM_BOT_TOKEN
+        )
+        .post_init(
+            post_init
+        )
+        .post_shutdown(
+            post_shutdown
+        )
         .build()
     )
     application.add_handler(
@@ -1340,6 +1493,10 @@ def run_bot():
     logger.info(
         "Intervalle suivi : %s secondes",
         CONFIG.TRACKING_INTERVAL_SECONDS,
+    )
+    logger.info(
+        "Délai entre marchés : %s secondes",
+        SCAN_SYMBOL_DELAY_SECONDS,
     )
     logger.info(
         "TELEGRAM_CHAT_ID : %s",
