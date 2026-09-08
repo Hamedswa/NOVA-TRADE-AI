@@ -2,34 +2,19 @@
 NOVA TRADE AI
 market_data.py
 
-MOTEUR CENTRAL DES DONNÉES DE MARCHÉ
+Moteur central de récupération des données marché.
 
-Architecture :
-
-    FOREX / XAU
-        ↓
-    Twelve Data
-        ↓
-    Cache intelligent
-
-    CRYPTO
-        ↓
-    Binance
-        ↓
-    Cache intelligent
-        ↓
-    Twelve Data = fallback
-
-Timeframes :
-    H4  → refresh toutes les 8 heures
-    H1  → refresh toutes les 2 heures
-    M15 → refresh toutes les 30 minutes
-    M5  → refresh toutes les 1 minute
-
-D1 n'est PAS utilisé par NOVA TRADE AI.
+- Forex / XAU -> Twelve Data
+- Crypto -> Binance
+- Fallback Crypto -> Twelve Data
+- Cache par symbole + timeframe
+- Protection contre les appels Twelve Data trop rapprochés
+- Cache H4 : 8h
+- Cache H1 : 2h
+- Cache M15 : 30min
+- Cache M5 : 1min
+- Thread-safe
 """
-
-from __future__ import annotations
 
 import json
 import os
@@ -37,7 +22,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -45,41 +30,20 @@ from core.models import Candle
 
 
 # ============================================================
-# TWELVE DATA
+# CONFIGURATION API
 # ============================================================
 
-TWELVE_DATA_URL = (
-    "https://api.twelvedata.com/time_series"
-)
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
-TWELVE_REQUEST_TIMEOUT = 15
+TWELVE_TIMEOUT = 15
+BINANCE_TIMEOUT = 10
 
 TWELVE_MAX_RETRIES = 3
-
-TWELVE_RETRY_DELAYS = (
-    5,
-    15,
-    30,
-)
-
-
-# ============================================================
-# BINANCE
-# ============================================================
-
-BINANCE_KLINES_URL = (
-    "https://api.binance.com/api/v3/klines"
-)
-
-BINANCE_REQUEST_TIMEOUT = 10
-
 BINANCE_MAX_RETRIES = 3
 
-BINANCE_RETRY_DELAYS = (
-    2,
-    5,
-    10,
-)
+TWELVE_RETRY_DELAYS = (5, 15, 30)
+BINANCE_RETRY_DELAYS = (2, 5, 10)
 
 
 # ============================================================
@@ -100,28 +64,20 @@ BINANCE_INTERVAL_MAP = {
     "M5": "5m",
 }
 
-VALID_TIMEFRAMES = set(
-    TIMEFRAME_MAP.keys()
-)
-
 
 # ============================================================
-# CACHE TTL
+# CACHE
 # ============================================================
 
-CACHE_TTL_SECONDS = {
+CACHE_TTL = {
     "H4": 8 * 60 * 60,
     "H1": 2 * 60 * 60,
     "M15": 30 * 60,
     "M5": 60,
 }
 
-
-# ============================================================
-# CACHE STALE
-# ============================================================
-
-STALE_CACHE_MAX_AGE_SECONDS = {
+# Tolérance maximale avant de considérer les données obsolètes.
+STALE_MAX_AGE = {
     "H4": 8 * 60 * 60,
     "H1": 2 * 60 * 60,
     "M15": 30 * 60,
@@ -129,79 +85,52 @@ STALE_CACHE_MAX_AGE_SECONDS = {
 }
 
 
-_CACHE_LOCK = Lock()
+# ============================================================
+# LIMITATION DES APPELS
+# ============================================================
 
-_CANDLE_CACHE: Dict[
-    Tuple[str, str, int],
-    Dict[str, object],
+# Twelve Data est volontairement protégé.
+# Le but est d'éviter que 13 symboles x 4 TF
+# déclenchent immédiatement trop de requêtes.
+
+TWELVE_MIN_REQUEST_INTERVAL = 2.0
+
+_last_twelve_request = 0.0
+
+_rate_lock = Lock()
+_cache_lock = Lock()
+
+
+# ============================================================
+# CACHE INTERNE
+# ============================================================
+
+_candle_cache: Dict[
+    Tuple[str, str],
+    Dict[str, Any],
 ] = {}
-
-
-# ============================================================
-# RATE LIMIT TWELVE DATA
-# ============================================================
-
-_RATE_LIMIT_LOCK = Lock()
-
-_RATE_LIMIT_UNTIL = 0.0
-
-
-# ============================================================
-# RATE LIMIT BINANCE
-# ============================================================
-
-_BINANCE_RATE_LIMIT_LOCK = Lock()
-
-_BINANCE_RATE_LIMIT_UNTIL = 0.0
 
 
 # ============================================================
 # STATISTIQUES
 # ============================================================
 
-_STATS_LOCK = Lock()
-
-_STATS = {
-    "api_requests": 0,
-
-    "twelve_requests": 0,
-    "binance_requests": 0,
-
-    "successful_requests": 0,
-
-    "twelve_successful_requests": 0,
-    "binance_successful_requests": 0,
-
+_stats = {
     "cache_hits": 0,
-    "stale_cache_hits": 0,
-
-    "twelve_rate_limit_hits": 0,
-    "binance_rate_limit_hits": 0,
-
-    "fallback_to_twelve": 0,
-
-    "errors": 0,
+    "cache_misses": 0,
+    "twelve_requests": 0,
+    "twelve_errors": 0,
+    "binance_requests": 0,
+    "binance_errors": 0,
+    "fallbacks": 0,
 }
 
 
 # ============================================================
-# SYMBOLES CRYPTO
+# SYMBOLS CRYPTO
 # ============================================================
 
-CRYPTO_SYMBOLS = {
-    "BTC/USD",
-    "ETH/USD",
-    "SOL/USD",
-    "BNB/USD",
-    "XRP/USD",
-}
-
-
-# ============================================================
-# MAPPING CRYPTO -> BINANCE
-# ============================================================
-
-BINANCE_SYMBOL_MAP = {
+CRYPTO_SYMBOL_MAP = {
     "BTC/USD": "BTCUSDT",
     "ETH/USD": "ETHUSDT",
     "SOL/USD": "SOLUSDT",
@@ -211,1473 +140,542 @@ BINANCE_SYMBOL_MAP = {
 
 
 # ============================================================
-# API KEY TWELVE DATA
+# UTILITAIRES
 # ============================================================
 
-def _get_twelve_data_api_key() -> str:
-    """
-    Récupère la clé Twelve Data.
-
-    Variable Railway :
-        TWELVE_DATA_API_KEY
-    """
-
-    key = os.getenv(
-        "TWELVE_DATA_API_KEY",
-        "",
-    ).strip()
-
-    if not key:
-        raise RuntimeError(
-            "Variable d'environnement "
-            "TWELVE_DATA_API_KEY absente."
-        )
-
-    return key
+def _normalize_symbol(symbol: str) -> str:
+    return str(symbol or "").strip().upper()
 
 
-# ============================================================
-# API KEY BINANCE
-# ============================================================
+def _normalize_timeframe(timeframe: str) -> str:
+    tf = str(timeframe or "").strip().upper()
 
-def _get_binance_api_key() -> str:
-    """
-    Récupère éventuellement la clé Binance.
+    aliases = {
+        "4H": "H4",
+        "1H": "H1",
+        "15M": "M15",
+        "5M": "M5",
+        "15MIN": "M15",
+        "5MIN": "M5",
+        "60MIN": "H1",
+        "240MIN": "H4",
+    }
 
-    Les données publiques Binance
-    n'exigent pas cette clé.
-    """
+    tf = aliases.get(tf, tf)
 
-    return os.getenv(
-        "BINANCE_API_KEY",
-        "",
-    ).strip()
-
-
-def _get_binance_api_secret() -> str:
-    """
-    Récupère éventuellement le secret Binance.
-    """
-
-    return os.getenv(
-        "BINANCE_API_SECRET",
-        "",
-    ).strip()
-
-
-# ============================================================
-# TIMEFRAME
-# ============================================================
-
-def _normalize_timeframe(
-    timeframe: str,
-) -> str:
-    """
-    Normalise un timeframe.
-
-    Exemples :
-
-        h4  -> H4
-        H1  -> H1
-        m15 -> M15
-        m5  -> M5
-    """
-
-    if not isinstance(
-        timeframe,
-        str,
-    ):
-        raise ValueError(
-            "Le timeframe doit être "
-            "une chaîne de caractères."
-        )
-
-    normalized = timeframe.strip().upper()
-
-    if normalized not in VALID_TIMEFRAMES:
+    if tf not in TIMEFRAME_MAP:
         raise ValueError(
             f"Timeframe invalide : {timeframe}. "
-            f"Valeurs autorisées : "
-            f"{sorted(VALID_TIMEFRAMES)}"
+            f"Valeurs autorisées : {list(TIMEFRAME_MAP.keys())}"
         )
 
-    return normalized
+    return tf
 
 
-# ============================================================
-# TYPE DE MARCHÉ
-# ============================================================
-
-def _is_crypto_symbol(
-    symbol: str,
-) -> bool:
-    """
-    Détermine si le symbole appartient
-    à l'univers crypto de NOVA.
-    """
-
-    normalized = (
-        symbol.strip().upper()
-    )
-
-    return normalized in CRYPTO_SYMBOLS
+def _is_crypto_symbol(symbol: str) -> bool:
+    return _normalize_symbol(symbol) in CRYPTO_SYMBOL_MAP
 
 
-# ============================================================
-# TIMESTAMP TWELVE DATA
-# ============================================================
-
-def _parse_timestamp(
-    value: str,
-) -> datetime:
-    """
-    Convertit un timestamp Twelve Data
-    en datetime UTC.
-    """
-
-    if not isinstance(
-        value,
-        str,
-    ):
-        raise ValueError(
-            f"Timestamp invalide : {value}"
-        )
-
-    value = value.strip()
-
-    formats = (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-    )
-
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(
-                value,
-                fmt,
-            )
-
-            return dt.replace(
-                tzinfo=timezone.utc
-            )
-
-        except ValueError:
-            continue
-
-    raise ValueError(
-        f"Format de timestamp inconnu : "
-        f"{value}"
-    )
-
-
-# ============================================================
-# TIMESTAMP BINANCE
-# ============================================================
-
-def _parse_binance_timestamp(
-    value: int,
-) -> datetime:
-    """
-    Binance retourne les timestamps
-    en millisecondes Unix.
-    """
-
-    return datetime.fromtimestamp(
-        float(value) / 1000.0,
-        tz=timezone.utc,
-    )
-
-
-# ============================================================
-# CACHE KEY
-# ============================================================
-
-def _cache_key(
-    symbol: str,
-    timeframe: str,
-    outputsize: int,
-) -> Tuple[str, str, int]:
-
+def _get_twelve_data_api_key() -> Optional[str]:
     return (
-        symbol.strip().upper(),
-        timeframe.strip().upper(),
-        int(outputsize),
+        os.getenv("TWELVE_DATA_API_KEY")
+        or os.getenv("TWELVE_DATA_KEY")
     )
 
 
+def _get_binance_api_key() -> Optional[str]:
+    return os.getenv("BINANCE_API_KEY")
+
+
+def _get_binance_api_secret() -> Optional[str]:
+    return os.getenv("BINANCE_API_SECRET")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _timestamp_to_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    text = str(value).strip()
+
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        dt = datetime.fromisoformat(text)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        return dt.astimezone(timezone.utc)
+
+    except Exception:
+        pass
+
+    try:
+        return datetime.fromtimestamp(
+            float(value),
+            tz=timezone.utc,
+        )
+    except Exception:
+        return _utc_now()
+
+
 # ============================================================
-# CACHE READ
+# CACHE
 # ============================================================
+
+def _cache_key(symbol: str, timeframe: str) -> Tuple[str, str]:
+    return (
+        _normalize_symbol(symbol),
+        _normalize_timeframe(timeframe),
+    )
+
 
 def _get_cached_candles(
     symbol: str,
     timeframe: str,
-    outputsize: int,
-    allow_stale: bool = False,
 ) -> Optional[List[Candle]]:
-    """
-    Retourne les candles du cache.
-    """
 
-    key = _cache_key(
-        symbol,
-        timeframe,
-        outputsize,
-    )
-
+    key = _cache_key(symbol, timeframe)
     now = time.time()
 
-    with _CACHE_LOCK:
+    with _cache_lock:
+        item = _candle_cache.get(key)
 
-        cached = _CANDLE_CACHE.get(key)
-
-        if cached is None:
+        if not item:
+            _stats["cache_misses"] += 1
             return None
 
-        timestamp = float(
-            cached.get(
-                "timestamp",
-                0.0,
-            )
-        )
+        created_at = float(item.get("created_at", 0))
+        candles = item.get("candles")
 
-        candles = cached.get(
-            "candles"
-        )
+        ttl = CACHE_TTL[timeframe]
 
-        if not isinstance(
-            candles,
-            list,
+        if (
+            candles
+            and now - created_at < ttl
         ):
-            return None
-
-        age = max(
-            0.0,
-            now - timestamp,
-        )
-
-        ttl = CACHE_TTL_SECONDS.get(
-            timeframe,
-            60,
-        )
-
-        # ----------------------------------------------------
-        # CACHE FRAIS
-        # ----------------------------------------------------
-
-        if age <= ttl:
-
-            with _STATS_LOCK:
-                _STATS[
-                    "cache_hits"
-                ] += 1
-
+            _stats["cache_hits"] += 1
             return list(candles)
 
-        # ----------------------------------------------------
-        # CACHE STALE
-        # ----------------------------------------------------
+        _stats["cache_misses"] += 1
 
-        if allow_stale:
-
-            stale_limit = (
-                STALE_CACHE_MAX_AGE_SECONDS.get(
-                    timeframe,
-                    300,
-                )
-            )
-
-            if age <= stale_limit:
-
-                with _STATS_LOCK:
-                    _STATS[
-                        "stale_cache_hits"
-                    ] += 1
-
-                return list(candles)
+        # On garde les données temporairement si elles
+        # ne sont pas encore trop anciennes.
+        if (
+            candles
+            and now - created_at < STALE_MAX_AGE[timeframe]
+        ):
+            return list(candles)
 
     return None
 
 
-# ============================================================
-# CACHE WRITE
-# ============================================================
-
 def _set_cached_candles(
     symbol: str,
     timeframe: str,
-    outputsize: int,
     candles: List[Candle],
 ) -> None:
 
-    key = _cache_key(
-        symbol,
-        timeframe,
-        outputsize,
-    )
+    key = _cache_key(symbol, timeframe)
 
-    with _CACHE_LOCK:
-
-        _CANDLE_CACHE[key] = {
+    with _cache_lock:
+        _candle_cache[key] = {
             "candles": list(candles),
-            "timestamp": time.time(),
+            "created_at": time.time(),
         }
 
 
-# ============================================================
-# CLEAR CACHE
-# ============================================================
-
 def clear_cache() -> None:
-    """
-    Vide complètement le cache marché.
-    """
-
-    with _CACHE_LOCK:
-        _CANDLE_CACHE.clear()
-
-
-def clear_symbol_cache(
-    symbol: str,
-) -> None:
-    """
-    Supprime tout le cache d'un symbole.
-    """
-
-    normalized = (
-        symbol.strip().upper()
-    )
-
-    with _CACHE_LOCK:
-
-        keys_to_delete = [
-            key
-            for key in _CANDLE_CACHE
-            if key[0] == normalized
-        ]
-
-        for key in keys_to_delete:
-            del _CANDLE_CACHE[key]
+    with _cache_lock:
+        _candle_cache.clear()
 
 
 # ============================================================
-# TWELVE RATE LIMIT
+# RATE LIMIT TWELVE DATA
 # ============================================================
 
-def _is_twelve_rate_limited() -> bool:
+def _wait_for_twelve_rate_limit() -> None:
+    global _last_twelve_request
 
-    with _RATE_LIMIT_LOCK:
-        return (
-            time.time()
-            < _RATE_LIMIT_UNTIL
-        )
+    with _rate_lock:
+        now = time.monotonic()
 
+        elapsed = now - _last_twelve_request
 
-def _remaining_twelve_rate_limit_seconds() -> int:
-
-    with _RATE_LIMIT_LOCK:
-
-        remaining = (
-            _RATE_LIMIT_UNTIL
-            - time.time()
-        )
-
-    return max(
-        0,
-        int(round(remaining)),
-    )
-
-
-def _activate_twelve_rate_limit(
-    seconds: int,
-) -> None:
-
-    global _RATE_LIMIT_UNTIL
-
-    with _RATE_LIMIT_LOCK:
-
-        new_until = (
-            time.time()
-            + max(1, seconds)
-        )
-
-        if new_until > _RATE_LIMIT_UNTIL:
-            _RATE_LIMIT_UNTIL = new_until
-
-
-def _clear_twelve_rate_limit() -> None:
-
-    global _RATE_LIMIT_UNTIL
-
-    with _RATE_LIMIT_LOCK:
-        _RATE_LIMIT_UNTIL = 0.0
-
-
-# ============================================================
-# BINANCE RATE LIMIT
-# ============================================================
-
-def _is_binance_rate_limited() -> bool:
-
-    with _BINANCE_RATE_LIMIT_LOCK:
-        return (
-            time.time()
-            < _BINANCE_RATE_LIMIT_UNTIL
-        )
-
-
-def _remaining_binance_rate_limit_seconds() -> int:
-
-    with _BINANCE_RATE_LIMIT_LOCK:
-
-        remaining = (
-            _BINANCE_RATE_LIMIT_UNTIL
-            - time.time()
-        )
-
-    return max(
-        0,
-        int(round(remaining)),
-    )
-
-
-def _activate_binance_rate_limit(
-    seconds: int,
-) -> None:
-
-    global _BINANCE_RATE_LIMIT_UNTIL
-
-    with _BINANCE_RATE_LIMIT_LOCK:
-
-        new_until = (
-            time.time()
-            + max(1, seconds)
-        )
-
-        if (
-            new_until
-            > _BINANCE_RATE_LIMIT_UNTIL
-        ):
-            _BINANCE_RATE_LIMIT_UNTIL = (
-                new_until
+        if elapsed < TWELVE_MIN_REQUEST_INTERVAL:
+            wait_time = (
+                TWELVE_MIN_REQUEST_INTERVAL
+                - elapsed
             )
 
+            time.sleep(wait_time)
 
-def _clear_binance_rate_limit() -> None:
-
-    global _BINANCE_RATE_LIMIT_UNTIL
-
-    with _BINANCE_RATE_LIMIT_LOCK:
-        _BINANCE_RATE_LIMIT_UNTIL = 0.0
+        _last_twelve_request = time.monotonic()
 
 
 # ============================================================
-# TWELVE API ERROR
+# ERROR API
 # ============================================================
 
-def _parse_api_error(
-    response: requests.Response,
-) -> str:
-    """
-    Extrait un message Twelve Data
-    sans exposer la clé API.
-    """
+def _extract_api_error(response: requests.Response) -> str:
 
     try:
-
         data = response.json()
 
-        if isinstance(
-            data,
-            dict,
-        ):
+        if isinstance(data, dict):
+            if data.get("message"):
+                return str(data["message"])
 
-            message = data.get(
-                "message"
-            )
-
-            if message:
-                return str(message)
-
-            code = data.get(
-                "code"
-            )
-
-            if code:
-                return (
-                    f"Code API : {code}"
+            if data.get("status") == "error":
+                return str(
+                    data.get(
+                        "message",
+                        "Erreur API inconnue",
+                    )
                 )
 
     except Exception:
         pass
 
-    text = response.text.strip()
-
-    if text:
-        return text[:300]
-
     return (
-        f"HTTP {response.status_code}"
+        f"HTTP {response.status_code}: "
+        f"{response.text[:300]}"
     )
 
 
 # ============================================================
-# TWELVE DATA REQUEST
+# TWELVE DATA
 # ============================================================
 
 def _request_twelve_candles(
     symbol: str,
     timeframe: str,
-    outputsize: int,
+    outputsize: int = 300,
 ) -> List[Candle]:
-    """
-    Récupère les candles via Twelve Data.
-    """
 
-    timeframe = _normalize_timeframe(
-        timeframe
-    )
+    api_key = _get_twelve_data_api_key()
 
-    interval = TIMEFRAME_MAP[
-        timeframe
-    ]
+    if not api_key:
+        raise RuntimeError(
+            "TWELVE_DATA_API_KEY non configurée."
+        )
 
-    api_key = (
-        _get_twelve_data_api_key()
-    )
+    interval = TIMEFRAME_MAP[timeframe]
 
     params = {
-        "symbol": symbol.strip().upper(),
+        "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
         "apikey": api_key,
+        "format": "JSON",
     }
 
-    last_error: Optional[
-        Exception
-    ] = None
+    last_error = None
 
-    for attempt in range(
-        TWELVE_MAX_RETRIES
-    ):
-
-        if _is_twelve_rate_limited():
-
-            remaining = (
-                _remaining_twelve_rate_limit_seconds()
-            )
-
-            raise RuntimeError(
-                "Limite Twelve Data active. "
-                f"Réessayer dans environ "
-                f"{remaining}s."
-            )
+    for attempt in range(TWELVE_MAX_RETRIES):
 
         try:
+            _wait_for_twelve_rate_limit()
 
-            with _STATS_LOCK:
-
-                _STATS[
-                    "api_requests"
-                ] += 1
-
-                _STATS[
-                    "twelve_requests"
-                ] += 1
+            _stats["twelve_requests"] += 1
 
             response = requests.get(
                 TWELVE_DATA_URL,
                 params=params,
-                timeout=TWELVE_REQUEST_TIMEOUT,
+                timeout=TWELVE_TIMEOUT,
             )
 
-            # ------------------------------------------------
-            # 429
-            # ------------------------------------------------
+            if response.status_code != 200:
+                raise RuntimeError(
+                    _extract_api_error(response)
+                )
 
-            if response.status_code == 429:
+            data = response.json()
 
-                with _STATS_LOCK:
-                    _STATS[
-                        "twelve_rate_limit_hits"
-                    ] += 1
-
-                retry_after = (
-                    response.headers.get(
-                        "Retry-After"
+            if data.get("status") == "error":
+                raise RuntimeError(
+                    str(
+                        data.get(
+                            "message",
+                            "Erreur Twelve Data",
+                        )
                     )
                 )
+
+            values = data.get("values", [])
+
+            if not values:
+                raise RuntimeError(
+                    "Twelve Data n'a retourné aucun chandelier."
+                )
+
+            candles: List[Candle] = []
+
+            for item in reversed(values):
 
                 try:
-                    retry_seconds = int(
-                        retry_after
-                    )
-
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    retry_seconds = (
-                        TWELVE_RETRY_DELAYS[
-                            min(
-                                attempt,
-                                len(
-                                    TWELVE_RETRY_DELAYS
-                                ) - 1,
-                            )
-                        ]
-                    )
-
-                retry_seconds = min(
-                    max(
-                        retry_seconds,
-                        5,
-                    ),
-                    60,
-                )
-
-                _activate_twelve_rate_limit(
-                    retry_seconds
-                )
-
-                last_error = RuntimeError(
-                    "Limite Twelve Data atteinte."
-                )
-
-                if attempt < (
-                    TWELVE_MAX_RETRIES - 1
-                ):
-
-                    time.sleep(
-                        retry_seconds
-                    )
-
-                    continue
-
-                raise last_error
-
-            # ------------------------------------------------
-            # HTTP 4xx
-            # ------------------------------------------------
-
-            if (
-                400
-                <= response.status_code
-                < 500
-            ):
-
-                message = (
-                    _parse_api_error(
-                        response
-                    )
-                )
-
-                raise RuntimeError(
-                    "Erreur Twelve Data "
-                    f"HTTP {response.status_code}: "
-                    f"{message}"
-                )
-
-            # ------------------------------------------------
-            # HTTP 5xx
-            # ------------------------------------------------
-
-            if response.status_code >= 500:
-
-                last_error = RuntimeError(
-                    "Erreur serveur Twelve Data "
-                    f"HTTP {response.status_code}"
-                )
-
-                if attempt < (
-                    TWELVE_MAX_RETRIES - 1
-                ):
-
-                    delay = (
-                        TWELVE_RETRY_DELAYS[
-                            min(
-                                attempt,
-                                len(
-                                    TWELVE_RETRY_DELAYS
-                                ) - 1,
-                            )
-                        ]
-                    )
-
-                    time.sleep(delay)
-
-                    continue
-
-                raise last_error
-
-            # ------------------------------------------------
-            # JSON
-            # ------------------------------------------------
-
-            try:
-
-                data = response.json()
-
-            except json.JSONDecodeError as exc:
-
-                last_error = RuntimeError(
-                    "Réponse Twelve Data "
-                    "invalide."
-                )
-
-                if attempt < (
-                    TWELVE_MAX_RETRIES - 1
-                ):
-
-                    delay = (
-                        TWELVE_RETRY_DELAYS[
-                            min(
-                                attempt,
-                                len(
-                                    TWELVE_RETRY_DELAYS
-                                ) - 1,
-                            )
-                        ]
-                    )
-
-                    time.sleep(delay)
-
-                    continue
-
-                raise last_error from exc
-
-            # ------------------------------------------------
-            # API ERROR
-            # ------------------------------------------------
-
-            if isinstance(
-                data,
-                dict,
-            ):
-
-                status = str(
-                    data.get(
-                        "status",
-                        "",
-                    )
-                ).lower()
-
-                if status == "error":
-
-                    message = data.get(
-                        "message",
-                        "Erreur inconnue.",
-                    )
-
-                    raise RuntimeError(
-                        "Twelve Data : "
-                        f"{message}"
-                    )
-
-            values = data.get(
-                "values"
-            )
-
-            if not isinstance(
-                values,
-                list,
-            ):
-
-                raise RuntimeError(
-                    "Twelve Data n'a retourné "
-                    "aucune donnée candle."
-                )
-
-            # ------------------------------------------------
-            # PARSING
-            # ------------------------------------------------
-
-            candles: List[
-                Candle
-            ] = []
-
-            for item in values:
-
-                if not isinstance(
-                    item,
-                    dict,
-                ):
-                    continue
-
-                try:
-
-                    timestamp = (
-                        _parse_timestamp(
-                            item["datetime"]
+                    candles.append(
+                        Candle(
+                            timestamp=_timestamp_to_datetime(
+                                item.get("datetime")
+                            ),
+                            open=float(item["open"]),
+                            high=float(item["high"]),
+                            low=float(item["low"]),
+                            close=float(item["close"]),
+                            volume=float(
+                                item.get("volume", 0) or 0
+                            ),
                         )
                     )
 
-                    candle = Candle(
-                        timestamp=timestamp,
-                        open=float(
-                            item["open"]
-                        ),
-                        high=float(
-                            item["high"]
-                        ),
-                        low=float(
-                            item["low"]
-                        ),
-                        close=float(
-                            item["close"]
-                        ),
-                        volume=float(
-                            item.get(
-                                "volume",
-                                0.0,
-                            )
-                        ),
-                    )
-
-                    candles.append(
-                        candle
-                    )
-
-                except (
-                    KeyError,
-                    TypeError,
-                    ValueError,
-                ):
+                except Exception:
                     continue
 
             if not candles:
-
                 raise RuntimeError(
-                    "Aucune candle exploitable "
-                    "dans la réponse Twelve Data."
+                    "Impossible de convertir les chandeliers Twelve Data."
                 )
-
-            candles.sort(
-                key=lambda candle:
-                candle.timestamp
-            )
-
-            _clear_twelve_rate_limit()
-
-            with _STATS_LOCK:
-
-                _STATS[
-                    "successful_requests"
-                ] += 1
-
-                _STATS[
-                    "twelve_successful_requests"
-                ] += 1
 
             return candles
 
-        except requests.RequestException as exc:
-
-            last_error = RuntimeError(
-                "Erreur réseau Twelve Data : "
-                f"{exc}"
-            )
-
-            if attempt < (
-                TWELVE_MAX_RETRIES - 1
-            ):
-
-                delay = (
-                    TWELVE_RETRY_DELAYS[
-                        min(
-                            attempt,
-                            len(
-                                TWELVE_RETRY_DELAYS
-                            ) - 1,
-                        )
-                    ]
-                )
-
-                time.sleep(delay)
-
-                continue
-
-            raise last_error from exc
-
-        except RuntimeError:
-            raise
-
         except Exception as exc:
 
-            last_error = RuntimeError(
-                f"Erreur données Twelve Data : "
-                f"{exc}"
-            )
+            last_error = exc
+            _stats["twelve_errors"] += 1
 
-            if attempt < (
-                TWELVE_MAX_RETRIES - 1
-            ):
-
-                delay = (
-                    TWELVE_RETRY_DELAYS[
-                        min(
-                            attempt,
-                            len(
-                                TWELVE_RETRY_DELAYS
-                            ) - 1,
-                        )
-                    ]
-                )
+            if attempt < TWELVE_MAX_RETRIES - 1:
+                delay = TWELVE_RETRY_DELAYS[
+                    min(
+                        attempt,
+                        len(TWELVE_RETRY_DELAYS) - 1,
+                    )
+                ]
 
                 time.sleep(delay)
 
-                continue
-
-            raise last_error from exc
-
-    if last_error:
-        raise last_error
-
     raise RuntimeError(
-        "Impossible de récupérer les "
-        "données Twelve Data."
+        f"Twelve Data : {last_error}"
     )
 
 
 # ============================================================
-# BINANCE REQUEST
+# BINANCE
 # ============================================================
 
 def _request_binance_candles(
     symbol: str,
     timeframe: str,
-    outputsize: int,
+    limit: int = 300,
 ) -> List[Candle]:
-    """
-    Récupère les candles publiques Binance.
-    """
 
-    timeframe = _normalize_timeframe(
-        timeframe
-    )
-
-    binance_symbol = (
-        BINANCE_SYMBOL_MAP.get(
-            symbol.strip().upper()
-        )
+    binance_symbol = CRYPTO_SYMBOL_MAP.get(
+        _normalize_symbol(symbol)
     )
 
     if not binance_symbol:
-
-        raise RuntimeError(
-            f"Symbole crypto non supporté "
-            f"par Binance : {symbol}"
+        raise ValueError(
+            f"Symbole crypto Binance inconnu : {symbol}"
         )
 
-    interval = (
-        BINANCE_INTERVAL_MAP[
-            timeframe
-        ]
-    )
-
-    limit = min(
-        max(
-            int(outputsize),
-            1,
-        ),
-        1000,
-    )
+    interval = BINANCE_INTERVAL_MAP[timeframe]
 
     params = {
         "symbol": binance_symbol,
         "interval": interval,
-        "limit": limit,
+        "limit": min(limit, 1000),
     }
 
-    last_error: Optional[
-        Exception
-    ] = None
+    last_error = None
 
-    for attempt in range(
-        BINANCE_MAX_RETRIES
-    ):
-
-        if _is_binance_rate_limited():
-
-            remaining = (
-                _remaining_binance_rate_limit_seconds()
-            )
-
-            raise RuntimeError(
-                "Limite Binance active. "
-                f"Réessayer dans environ "
-                f"{remaining}s."
-            )
+    for attempt in range(BINANCE_MAX_RETRIES):
 
         try:
 
-            with _STATS_LOCK:
-
-                _STATS[
-                    "api_requests"
-                ] += 1
-
-                _STATS[
-                    "binance_requests"
-                ] += 1
+            _stats["binance_requests"] += 1
 
             response = requests.get(
                 BINANCE_KLINES_URL,
                 params=params,
-                timeout=BINANCE_REQUEST_TIMEOUT,
+                timeout=BINANCE_TIMEOUT,
             )
 
-            # ------------------------------------------------
-            # RATE LIMIT
-            # ------------------------------------------------
-
-            if response.status_code in (
-                418,
-                429,
-            ):
-
-                with _STATS_LOCK:
-                    _STATS[
-                        "binance_rate_limit_hits"
-                    ] += 1
-
-                retry_after = (
-                    response.headers.get(
-                        "Retry-After"
-                    )
-                )
-
-                try:
-                    retry_seconds = int(
-                        retry_after
-                    )
-
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-                    retry_seconds = (
-                        BINANCE_RETRY_DELAYS[
-                            min(
-                                attempt,
-                                len(
-                                    BINANCE_RETRY_DELAYS
-                                ) - 1,
-                            )
-                        ]
-                    )
-
-                retry_seconds = min(
-                    max(
-                        retry_seconds,
-                        2,
-                    ),
-                    60,
-                )
-
-                _activate_binance_rate_limit(
-                    retry_seconds
-                )
-
-                last_error = RuntimeError(
-                    "Limite Binance atteinte."
-                )
-
-                if attempt < (
-                    BINANCE_MAX_RETRIES - 1
-                ):
-
-                    time.sleep(
-                        retry_seconds
-                    )
-
-                    continue
-
-                raise last_error
-
-            # ------------------------------------------------
-            # HTTP ERROR
-            # ------------------------------------------------
-
-            if (
-                response.status_code
-                >= 400
-            ):
-
-                try:
-
-                    error_data = (
-                        response.json()
-                    )
-
-                    message = error_data.get(
-                        "msg",
-                        response.text[:300],
-                    )
-
-                except Exception:
-
-                    message = response.text[
-                        :300
-                    ]
-
+            if response.status_code != 200:
                 raise RuntimeError(
-                    "Erreur Binance "
-                    f"HTTP {response.status_code}: "
-                    f"{message}"
+                    _extract_api_error(response)
                 )
 
-            # ------------------------------------------------
-            # JSON
-            # ------------------------------------------------
+            data = response.json()
 
-            try:
-
-                data = response.json()
-
-            except json.JSONDecodeError as exc:
-
-                last_error = RuntimeError(
-                    "Réponse Binance "
-                    "invalide."
-                )
-
-                if attempt < (
-                    BINANCE_MAX_RETRIES - 1
-                ):
-
-                    delay = (
-                        BINANCE_RETRY_DELAYS[
-                            min(
-                                attempt,
-                                len(
-                                    BINANCE_RETRY_DELAYS
-                                ) - 1,
-                            )
-                        ]
-                    )
-
-                    time.sleep(delay)
-
-                    continue
-
-                raise last_error from exc
-
-            if not isinstance(
-                data,
-                list,
-            ):
-
+            if not isinstance(data, list) or not data:
                 raise RuntimeError(
-                    "Binance n'a retourné "
-                    "aucune donnée candle."
+                    "Binance n'a retourné aucun chandelier."
                 )
 
-            # ------------------------------------------------
-            # PARSING
-            # ------------------------------------------------
-
-            candles: List[
-                Candle
-            ] = []
+            candles: List[Candle] = []
 
             for item in data:
 
-                if not isinstance(
-                    item,
-                    list,
-                ):
-                    continue
-
-                if len(item) < 6:
-                    continue
-
                 try:
 
-                    timestamp = (
-                        _parse_binance_timestamp(
-                            int(item[0])
+                    timestamp_ms = int(item[0])
+
+                    candles.append(
+                        Candle(
+                            timestamp=datetime.fromtimestamp(
+                                timestamp_ms / 1000,
+                                tz=timezone.utc,
+                            ),
+                            open=float(item[1]),
+                            high=float(item[2]),
+                            low=float(item[3]),
+                            close=float(item[4]),
+                            volume=float(item[5]),
                         )
                     )
 
-                    candle = Candle(
-                        timestamp=timestamp,
-                        open=float(item[1]),
-                        high=float(item[2]),
-                        low=float(item[3]),
-                        close=float(item[4]),
-                        volume=float(item[5]),
-                    )
-
-                    candles.append(
-                        candle
-                    )
-
-                except (
-                    TypeError,
-                    ValueError,
-                    IndexError,
-                ):
+                except Exception:
                     continue
 
             if not candles:
-
                 raise RuntimeError(
-                    "Aucune candle exploitable "
-                    "dans la réponse Binance."
+                    "Impossible de convertir les chandeliers Binance."
                 )
-
-            candles.sort(
-                key=lambda candle:
-                candle.timestamp
-            )
-
-            _clear_binance_rate_limit()
-
-            with _STATS_LOCK:
-
-                _STATS[
-                    "successful_requests"
-                ] += 1
-
-                _STATS[
-                    "binance_successful_requests"
-                ] += 1
 
             return candles
 
-        except requests.RequestException as exc:
-
-            last_error = RuntimeError(
-                "Erreur réseau Binance : "
-                f"{exc}"
-            )
-
-            if attempt < (
-                BINANCE_MAX_RETRIES - 1
-            ):
-
-                delay = (
-                    BINANCE_RETRY_DELAYS[
-                        min(
-                            attempt,
-                            len(
-                                BINANCE_RETRY_DELAYS
-                            ) - 1,
-                        )
-                    ]
-                )
-
-                time.sleep(delay)
-
-                continue
-
-            raise last_error from exc
-
-        except RuntimeError:
-            raise
-
         except Exception as exc:
 
-            last_error = RuntimeError(
-                f"Erreur données Binance : "
-                f"{exc}"
-            )
+            last_error = exc
+            _stats["binance_errors"] += 1
 
-            if attempt < (
-                BINANCE_MAX_RETRIES - 1
-            ):
+            if attempt < BINANCE_MAX_RETRIES - 1:
 
-                delay = (
-                    BINANCE_RETRY_DELAYS[
-                        min(
-                            attempt,
-                            len(
-                                BINANCE_RETRY_DELAYS
-                            ) - 1,
-                        )
-                    ]
-                )
+                delay = BINANCE_RETRY_DELAYS[
+                    min(
+                        attempt,
+                        len(BINANCE_RETRY_DELAYS) - 1,
+                    )
+                ]
 
                 time.sleep(delay)
 
-                continue
-
-            raise last_error from exc
-
-    if last_error:
-        raise last_error
-
     raise RuntimeError(
-        "Impossible de récupérer les "
-        "données Binance."
+        f"Binance : {last_error}"
     )
 
 
 # ============================================================
-# ROUTEUR MARKET DATA
+# REQUÊTE MARCHÉ
 # ============================================================
 
 def _request_market_candles(
     symbol: str,
     timeframe: str,
-    outputsize: int,
+    outputsize: int = 300,
 ) -> List[Candle]:
-    """
-    Route automatiquement la requête.
 
-    Crypto :
-        Binance
-        ↓
-        Twelve Data fallback
+    symbol = _normalize_symbol(symbol)
+    timeframe = _normalize_timeframe(timeframe)
 
-    Forex/XAU :
-        Twelve Data
-    """
+    # --------------------------------------------------------
+    # CRYPTO
+    # --------------------------------------------------------
 
-    normalized_symbol = (
-        symbol.strip().upper()
-    )
-
-    # ========================================================
-    # CRYPTO -> BINANCE
-    # ========================================================
-
-    if _is_crypto_symbol(
-        normalized_symbol
-    ):
+    if _is_crypto_symbol(symbol):
 
         try:
-
             return _request_binance_candles(
-                symbol=normalized_symbol,
-                timeframe=timeframe,
-                outputsize=outputsize,
+                symbol,
+                timeframe,
+                outputsize,
             )
 
         except Exception:
 
-            with _STATS_LOCK:
-                _STATS[
-                    "fallback_to_twelve"
-                ] += 1
+            _stats["fallbacks"] += 1
 
+            # Fallback Twelve Data
             return _request_twelve_candles(
-                symbol=normalized_symbol,
-                timeframe=timeframe,
-                outputsize=outputsize,
+                symbol,
+                timeframe,
+                outputsize,
             )
 
-    # ========================================================
-    # FOREX / XAU -> TWELVE DATA
-    # ========================================================
+    # --------------------------------------------------------
+    # FOREX / XAU
+    # --------------------------------------------------------
 
     return _request_twelve_candles(
-        symbol=normalized_symbol,
-        timeframe=timeframe,
-        outputsize=outputsize,
+        symbol,
+        timeframe,
+        outputsize,
     )
 
 
 # ============================================================
-# GET CANDLES
+# API PRINCIPALE
 # ============================================================
 
 def get_candles(
     symbol: str,
     timeframe: str,
-    outputsize: int = 300,
+    limit: int = 300,
+    force_refresh: bool = False,
 ) -> List[Candle]:
-    """
-    Fonction principale utilisée par NOVA.
 
-    Ordre :
+    symbol = _normalize_symbol(symbol)
+    timeframe = _normalize_timeframe(timeframe)
 
-        1. Cache frais
-        2. Source adaptée
-        3. Fallback
-        4. Cache stale exceptionnel
-    """
+    if not force_refresh:
 
-    if not symbol or not isinstance(
-        symbol,
-        str,
-    ):
-
-        raise ValueError(
-            "Symbole invalide."
+        cached = _get_cached_candles(
+            symbol,
+            timeframe,
         )
 
-    timeframe = _normalize_timeframe(
-        timeframe
-    )
-
-    if outputsize <= 0:
-
-        raise ValueError(
-            "outputsize doit être "
-            "supérieur à 0."
-        )
-
-    # ========================================================
-    # CACHE FRAIS
-    # ========================================================
-
-    cached = _get_cached_candles(
-        symbol,
-        timeframe,
-        outputsize,
-        allow_stale=False,
-    )
-
-    if cached is not None:
-        return cached
-
-    # ========================================================
-    # API
-    # ========================================================
+        if cached:
+            return cached[-limit:]
 
     try:
 
-        candles = (
-            _request_market_candles(
-                symbol=symbol,
-                timeframe=timeframe,
-                outputsize=outputsize,
+        candles = _request_market_candles(
+            symbol,
+            timeframe,
+            max(limit, 300),
+        )
+
+        if candles:
+            _set_cached_candles(
+                symbol,
+                timeframe,
+                candles,
             )
-        )
 
-        _set_cached_candles(
-            symbol,
-            timeframe,
-            outputsize,
-            candles,
-        )
+        return candles[-limit:]
 
-        return candles
+    except Exception:
 
-    except Exception as primary_error:
+        # Dernière tentative : utiliser le cache
+        # même si celui-ci est ancien.
+        key = _cache_key(symbol, timeframe)
 
-        with _STATS_LOCK:
-            _STATS[
-                "errors"
-            ] += 1
+        with _cache_lock:
+            item = _candle_cache.get(key)
 
-        # ====================================================
-        # CACHE STALE
-        # ====================================================
+            if item and item.get("candles"):
+                return list(
+                    item["candles"]
+                )[-limit:]
 
-        stale = _get_cached_candles(
-            symbol,
-            timeframe,
-            outputsize,
-            allow_stale=True,
-        )
-
-        if stale is not None:
-            return stale
-
-        raise primary_error
+        raise
 
 
 # ============================================================
@@ -1686,97 +684,79 @@ def get_candles(
 
 def get_latest_price(
     symbol: str,
-) -> float:
-    """
-    Retourne le dernier prix disponible.
+) -> Optional[float]:
 
-    Le prix utilisé par NOVA provient du M5.
-    """
+    symbol = _normalize_symbol(symbol)
 
-    candles = get_candles(
-        symbol=symbol,
-        timeframe="M5",
-        outputsize=2,
-    )
+    try:
 
-    if not candles:
-
-        raise RuntimeError(
-            f"Aucun prix disponible "
-            f"pour {symbol}."
+        candles = get_candles(
+            symbol,
+            "M5",
+            limit=2,
         )
 
-    return float(
-        candles[-1].close
-    )
+        if candles:
+            return float(
+                candles[-1].close
+            )
 
+    except Exception:
+        pass
 
-# ============================================================
-# ALIAS COMPATIBILITÉ
-# ============================================================
+    return None
+
 
 def get_price(
     symbol: str,
-) -> float:
-    """
-    Alias conservé pour les anciens modules.
-    """
-
-    return get_latest_price(
-        symbol
-    )
+) -> Optional[float]:
+    return get_latest_price(symbol)
 
 
 # ============================================================
 # STATISTIQUES
 # ============================================================
 
-def get_market_data_stats(
-) -> Dict[str, int]:
-    """
-    Retourne les statistiques du moteur
-    de données.
-    """
+def get_stats() -> Dict[str, Any]:
 
-    with _STATS_LOCK:
-        return dict(_STATS)
+    with _cache_lock:
+
+        cache_entries = len(
+            _candle_cache
+        )
+
+        stats = dict(_stats)
+
+        stats["cache_entries"] = cache_entries
+
+        stats["cached_symbols"] = sorted(
+            {
+                key[0]
+                for key in _candle_cache.keys()
+            }
+        )
+
+        return stats
+
+
+def reset_stats() -> None:
+
+    with _cache_lock:
+
+        for key in _stats:
+            _stats[key] = 0
 
 
 # ============================================================
-# RESET STATISTIQUES
+# OBJET MODULE
 # ============================================================
 
-def reset_market_data_stats() -> None:
-    """
-    Réinitialise les statistiques.
-    """
-
-    with _STATS_LOCK:
-
-        for key in _STATS:
-            _STATS[key] = 0
-
-
-# ============================================================
-# OBJET GLOBAL DE COMPATIBILITÉ
-# ============================================================
-
-"""
-Certains modules de NOVA TRADE AI utilisent :
-
-    from market_data import market_data
-
-On expose donc le module lui-même sous le nom
-"market_data".
-
-Ainsi :
-
-    market_data.get_candles(...)
-    market_data.get_latest_price(...)
-    market_data.get_price(...)
-    market_data.get_market_data_stats(...)
-
-fonctionnent directement.
-"""
+# Permet au pipeline d'utiliser :
+#
+# from market_data import market_data
+#
+# puis :
+#
+# market_data.get_candles(...)
 
 market_data = sys.modules[__name__]
