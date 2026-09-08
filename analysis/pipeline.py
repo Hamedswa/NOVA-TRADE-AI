@@ -1,152 +1,95 @@
 """
 NOVA TRADE AI
 analysis/pipeline.py
-
-PIPELINE PRINCIPAL D'ANALYSE
-
+Pipeline principal d'analyse multi-timeframe.
 Architecture :
-
-    Données
-        ↓
-    Nettoyage / réduction du bruit
-        ↓
-    H4 + H1 + M15
-        ↓
-    Alignement principal
-        ↓
-    Recherche MULTI-ZONES
-        ↓
-    Breakout
-        ↓
-    Momentum / vitesse du breakout
-        ↓
-    Retest
-        ↓
-    Rejection
-        ↓
-    Confirmation candle M15
-        ↓
-    Volatilité / ATR
-        ↓
-    Liquidité / M5
-        ↓
-    M5 = confirmation secondaire NON BLOQUANTE
-        ↓
-    SL / TP / RR
-        ↓
-    Score >= 60
-        ↓
-    News / marché
-        ↓
-    Signal final
-
-RÈGLES :
-
-    - H4 + H1 + M15 doivent être parfaitement alignés.
-    - D1 n'est PAS utilisé.
-    - M5 est secondaire et NON BLOQUANT.
-    - Score minimum : 60.
-    - RR minimum : 2.0.
-    - Aucun signal forcé.
-    - Plusieurs zones candidates sont testées.
-    - Breakout absent = WAIT.
-    - Retest absent = WAIT.
-    - Rejection absente = WAIT.
-    - Confirmation candle absente = WAIT.
-    - Momentum insuffisant = WAIT.
-    - Crypto indépendante de Twelve Data.
+    H4
+     ↓
+    BIAIS / CONTEXTE GLOBAL
+     ↓
+    H1
+     ↓
+    STRUCTURE
+     ↓
+    M15
+     ↓
+    CONTEXTE / ZONES / LIQUIDITÉ
+     ↓
+    M5
+     ↓
+    TIMING D'ENTRÉE
+IMPORTANT :
+- H4 est une préférence directionnelle, PAS un blocage absolu.
+- H1/M15 servent à déterminer la structure et le scénario.
+- M5 est une confirmation secondaire et non bloquante.
+- Aucun signal n'est forcé.
+- Score minimum = CONFIG.SIGNAL_THRESHOLD (60 par défaut).
+- RR minimum = CONFIG.MINIMUM_RR (2.0 par défaut).
+- D1 n'est pas utilisé.
+- Le moteur de scoring est la source du score final.
 """
-
 from __future__ import annotations
-
-import logging
-import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-
-logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# IMPORTS
-# ============================================================================
-
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+# ============================================================
+# CONFIG
+# ============================================================
 try:
     from config import CONFIG
 except Exception:
     CONFIG = None
-
-
+# ============================================================
+# MARKET DATA
+# ============================================================
 try:
     from market_data import market_data
 except Exception:
     market_data = None
-
-
+# ============================================================
+# RISK
+# ============================================================
 try:
     from risk.risk_manager import calculate_rr
 except Exception:
-
     def calculate_rr(
         entry: float,
         stop_loss: float,
         take_profit: float,
     ) -> float:
-
-        risk = abs(
-            float(entry) - float(stop_loss)
-        )
-
-        reward = abs(
-            float(take_profit) - float(entry)
-        )
-
+        risk = abs(float(entry) - float(stop_loss))
         if risk <= 0:
             return 0.0
-
-        return reward / risk
-
-
+        reward = abs(float(take_profit) - float(entry))
+        return round(reward / risk, 2)
+# ============================================================
+# SIGNAL ENGINE
+# ============================================================
 try:
     from signals.signal_engine import build_signal
 except Exception:
     build_signal = None
-
-
+# ============================================================
+# SCORING ENGINE
+# ============================================================
 try:
     from scoring.scoring_engine import calculate_score
 except Exception:
-
     try:
         from scoring import calculate_score
     except Exception:
         calculate_score = None
-
-
+# ============================================================
+# ECONOMIC FILTER
+# ============================================================
 try:
     from economic_calendar import economic_filter
 except Exception:
     economic_filter = None
-
-
-# ============================================================================
+# ============================================================
 # CONSTANTES
-# ============================================================================
-
-TIMEFRAMES: Tuple[str, ...] = (
-    "H4",
-    "H1",
-    "M15",
-    "M5",
-)
-
-PRIMARY_TIMEFRAMES: Tuple[str, ...] = (
-    "H4",
-    "H1",
-    "M15",
-)
-
+# ============================================================
+TIMEFRAMES = ("H4", "H1", "M15", "M5")
+PRIMARY_TIMEFRAMES = ("H4", "H1", "M15")
 CRYPTO_SYMBOLS = {
     "BTC/USD",
     "ETH/USD",
@@ -154,2139 +97,1345 @@ CRYPTO_SYMBOLS = {
     "BNB/USD",
     "XRP/USD",
 }
-
 DIRECTIONS = {
     "BUY",
     "SELL",
     "NEUTRAL",
 }
-
 MINIMUM_CANDLES = 20
-
-# Nombre maximum de zones à examiner
-MAX_ZONE_CANDIDATES = 8
-
-# Nombre de bougies M15 utilisées pour rechercher un breakout
-BREAKOUT_LOOKBACK = 8
-
-# Nombre de bougies maximum après breakout pour rechercher le retest
-RETEST_LOOKBACK = 12
-
-# Tolérance de regroupement des niveaux
+MAX_ZONE_CANDIDATES = 12
+BREAKOUT_LOOKBACK = 12
+RETEST_LOOKBACK = 16
 LEVEL_CLUSTER_PERCENT = 0.0005
-
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-def _safe_float(
-    value: Any,
-    default: float = 0.0,
-) -> float:
-
+SWING_LOOKBACK = 2
+# ============================================================
+# UTILITAIRES
+# ============================================================
+def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-
-        number = float(value)
-
-        if not math.isfinite(number):
+        if value is None:
             return default
-
-        return number
-
+        result = float(value)
+        if result != result:
+            return default
+        return result
     except Exception:
         return default
-
-
-def _normalize_direction(
-    value: Any,
-) -> str:
-
+def _normalize_direction(value: Any) -> str:
     if value is None:
         return "NEUTRAL"
-
-    text = str(
-        value
-    ).strip().upper()
-
+    text = str(value).upper().strip()
     aliases = {
         "LONG": "BUY",
-        "SHORT": "SELL",
         "BULLISH": "BUY",
+        "UP": "BUY",
+        "SHORT": "SELL",
         "BEARISH": "SELL",
-        "HAUSSIER": "BUY",
-        "BAISSIER": "SELL",
+        "DOWN": "SELL",
         "FLAT": "NEUTRAL",
-        "NONE": "NEUTRAL",
-        "N/A": "NEUTRAL",
+        "SIDEWAYS": "NEUTRAL",
+        "RANGE": "NEUTRAL",
     }
-
-    text = aliases.get(
-        text,
-        text,
-    )
-
+    text = aliases.get(text, text)
     if text not in DIRECTIONS:
         return "NEUTRAL"
-
     return text
-
-
-def _is_crypto_symbol(
-    symbol: str,
-) -> bool:
-
-    normalized = str(
-        symbol or ""
-    ).strip().upper()
-
-    return normalized in CRYPTO_SYMBOLS
-
-
+def _is_crypto_symbol(symbol: str) -> bool:
+    return str(symbol).upper().strip() in CRYPTO_SYMBOLS
 def _utc_now() -> datetime:
-
-    return datetime.now(
-        timezone.utc
-    )
-
-
-# ============================================================================
-# TWELVE DATA
-# ============================================================================
-
-def _get_twelve_data_status() -> Dict[str, Any]:
-
-    if market_data is None:
-
-        return {
-            "available": True,
-            "cooldown": 0,
-        }
-
-    try:
-
-        getter = getattr(
-            market_data,
-            "get_provider_status",
-            None,
-        )
-
-        if callable(getter):
-
-            status = getter()
-
-            if isinstance(
-                status,
-                dict,
-            ):
-
-                twelve = status.get(
-                    "twelve_data",
-                    status,
-                )
-
-                if isinstance(
-                    twelve,
-                    dict,
-                ):
-
-                    available = twelve.get(
-                        "available",
-                        twelve.get(
-                            "is_available",
-                            True,
-                        ),
-                    )
-
-                    cooldown = twelve.get(
-                        "cooldown",
-                        twelve.get(
-                            "cooldown_seconds",
-                            0,
-                        ),
-                    )
-
-                    return {
-                        "available": bool(
-                            available
-                        ),
-                        "cooldown": max(
-                            0,
-                            int(
-                                _safe_float(
-                                    cooldown,
-                                    0,
-                                )
-                            ),
-                        ),
-                    }
-
-        available_fn = getattr(
-            market_data,
-            "twelve_data_available",
-            None,
-        )
-
-        if callable(
-            available_fn
-        ):
-
-            available = bool(
-                available_fn()
-            )
-
-            cooldown = 0
-
-            cooldown_fn = getattr(
-                market_data,
-                "get_twelve_data_cooldown",
-                None,
-            )
-
-            if callable(
-                cooldown_fn
-            ):
-
-                cooldown = max(
-                    0,
-                    int(
-                        _safe_float(
-                            cooldown_fn(),
-                            0,
-                        )
-                    ),
-                )
-
-            return {
-                "available": available,
-                "cooldown": cooldown,
-            }
-
-    except Exception as exc:
-
-        logger.debug(
-            "Statut Twelve Data inaccessible : %s",
-            exc,
-        )
-
-    return {
-        "available": True,
-        "cooldown": 0,
-    }
-
-
-def _twelve_data_ready(
-    symbol: str,
-) -> Tuple[bool, str]:
-
-    # Crypto = Coinbase uniquement.
-    if _is_crypto_symbol(
-        symbol
-    ):
-        return True, ""
-
-    status = _get_twelve_data_status()
-
-    available = bool(
-        status.get(
-            "available",
-            True,
-        )
-    )
-
-    cooldown = max(
-        0,
-        int(
-            _safe_float(
-                status.get(
-                    "cooldown",
-                    0,
-                ),
-                0,
-            )
-        ),
-    )
-
-    if not available:
-
-        if cooldown > 0:
-
-            return (
-                False,
-                (
-                    "Twelve Data temporairement limité "
-                    f"— cooldown {cooldown}s"
-                ),
-            )
-
-        return (
-            False,
-            "Twelve Data temporairement indisponible",
-        )
-
-    return True, ""
-
-
-# ============================================================================
-# DONNÉES
-# ============================================================================
-
-def _extract_candles(
-    symbol: str,
-    timeframe: str,
-) -> List[Any]:
-
-    if market_data is None:
-
-        logger.error(
-            "DATA %s %s : market_data indisponible",
-            symbol,
-            timeframe,
-        )
-
+    return datetime.now(timezone.utc)
+# ============================================================
+# EXTRACTION CANDLES
+# ============================================================
+def _extract_candles(raw: Any) -> List[Any]:
+    if raw is None:
         return []
-
-    try:
-
-        getter = getattr(
-            market_data,
-            "get_candles",
-            None,
-        )
-
-        if not callable(
-            getter
+    if isinstance(raw, dict):
+        for key in (
+            "candles",
+            "data",
+            "values",
+            "results",
+            "items",
         ):
-
-            logger.error(
-                "DATA %s %s : get_candles indisponible",
-                symbol,
-                timeframe,
-            )
-
-            return []
-
-        candles = None
-
-        try:
-
-            candles = getter(
-                symbol,
-                timeframe,
-            )
-
-        except TypeError:
-            pass
-
-        if candles is None:
-
-            try:
-
-                candles = getter(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                )
-
-            except TypeError:
-                pass
-
-        if candles is None:
-
-            try:
-
-                candles = getter(
-                    symbol=symbol,
-                    interval=timeframe,
-                )
-
-            except TypeError:
-                pass
-
-        if candles is None:
-
-            if not _is_crypto_symbol(
-                symbol
-            ):
-
-                ready, reason = (
-                    _twelve_data_ready(
-                        symbol
-                    )
-                )
-
-                if not ready:
-
-                    logger.warning(
-                        "%s",
-                        reason,
-                    )
-
-                    return []
-
-            logger.warning(
-                "DATA %s %s : aucune donnée disponible.",
-                symbol,
-                timeframe,
-            )
-
-            return []
-
-        if isinstance(
-            candles,
-            dict,
-        ):
-
-            found = False
-
-            for key in (
-                "candles",
-                "data",
-                "values",
-                "results",
-            ):
-
-                value = candles.get(
-                    key
-                )
-
-                if isinstance(
-                    value,
-                    list,
-                ):
-
-                    candles = value
-                    found = True
-                    break
-
-            if not found:
-
-                logger.warning(
-                    (
-                        "DATA %s %s : "
-                        "réponse fournisseur sans chandeliers."
-                    ),
-                    symbol,
-                    timeframe,
-                )
-
-                return []
-
-        if not isinstance(
-            candles,
-            (list, tuple),
-        ):
-
-            logger.warning(
-                (
-                    "DATA %s %s : "
-                    "format de données invalide."
-                ),
-                symbol,
-                timeframe,
-            )
-
-            return []
-
-        result = list(
-            candles
-        )
-
-        if not result:
-
-            if not _is_crypto_symbol(
-                symbol
-            ):
-
-                ready, reason = (
-                    _twelve_data_ready(
-                        symbol
-                    )
-                )
-
-                if not ready:
-
-                    logger.warning(
-                        "%s",
-                        reason,
-                    )
-
-                    return []
-
-            logger.warning(
-                "DATA %s %s : aucune donnée disponible.",
-                symbol,
-                timeframe,
-            )
-
-            return []
-
-        logger.info(
-            "DATA %s %s : %s bougies reçues.",
-            symbol,
-            timeframe,
-            len(result),
-        )
-
-        return result
-
-    except Exception as exc:
-
-        if not _is_crypto_symbol(
-            symbol
-        ):
-
-            ready, reason = (
-                _twelve_data_ready(
-                    symbol
-                )
-            )
-
-            if not ready:
-
-                logger.warning(
-                    "%s",
-                    reason,
-                )
-
-                return []
-
-        logger.error(
-            "DATA %s %s erreur : %s",
-            symbol,
-            timeframe,
-            exc,
-        )
-
+            value = raw.get(key)
+            if isinstance(value, list):
+                return value
         return []
-
-
-def _validate_candles(
-    candles: Sequence[Any],
-    minimum: int = MINIMUM_CANDLES,
-) -> bool:
-
-    if candles is None:
-        return False
-
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    return []
+def _validate_candles(candles: Iterable[Any]) -> bool:
     try:
-        return len(candles) >= minimum
+        return len(list(candles)) >= MINIMUM_CANDLES
     except Exception:
         return False
-
-
-# ============================================================================
+# ============================================================
 # OHLC
-# ============================================================================
-
-def _candle_value(
-    candle: Any,
-    key: str,
-    default: float = 0.0,
-) -> float:
-
-    if candle is None:
-        return default
-
+# ============================================================
+def _get_value(candle: Any, key: str, default: float = 0.0) -> float:
+    if isinstance(candle, dict):
+        return _safe_float(candle.get(key), default)
     try:
-
-        if isinstance(
-            candle,
-            dict,
-        ):
-
-            value = candle.get(
-                key
-            )
-
-            if value is None:
-                value = candle.get(
-                    key.lower()
-                )
-
-            if value is None:
-                value = candle.get(
-                    key.upper()
-                )
-
-            return _safe_float(
-                value,
-                default,
-            )
-
-        value = getattr(
-            candle,
-            key,
-            None,
-        )
-
-        return _safe_float(
-            value,
-            default,
-        )
-
+        return _safe_float(getattr(candle, key), default)
     except Exception:
         return default
-
-
 def _open(candle: Any) -> float:
-
-    return _candle_value(
-        candle,
-        "open",
-    )
-
-
-def _close(candle: Any) -> float:
-
-    return _candle_value(
-        candle,
-        "close",
-    )
-
-
+    return _get_value(candle, "open")
 def _high(candle: Any) -> float:
-
-    return _candle_value(
-        candle,
-        "high",
-    )
-
-
+    return _get_value(candle, "high")
 def _low(candle: Any) -> float:
-
-    return _candle_value(
-        candle,
-        "low",
-    )
-
-
-# ============================================================================
+    return _get_value(candle, "low")
+def _close(candle: Any) -> float:
+    return _get_value(candle, "close")
+def _timestamp(candle: Any) -> Any:
+    if isinstance(candle, dict):
+        return candle.get("datetime") or candle.get("timestamp")
+    return getattr(candle, "timestamp", None)
+# ============================================================
 # ATR
-# ============================================================================
-
+# ============================================================
 def _calculate_atr(
-    candles: Sequence[Any],
+    candles: List[Any],
     period: int = 14,
 ) -> float:
-
-    if not candles or len(candles) < 2:
+    if len(candles) < 2:
         return 0.0
-
     true_ranges: List[float] = []
-
-    previous_close: Optional[float] = None
-
-    for candle in candles:
-
-        high = _high(candle)
-        low = _low(candle)
-        close = _close(candle)
-
-        if high <= 0 or low <= 0:
-            continue
-
-        if previous_close is None:
-
-            tr = high - low
-
-        else:
-
-            tr = max(
-                high - low,
-                abs(
-                    high - previous_close
-                ),
-                abs(
-                    low - previous_close
-                ),
-            )
-
-        if tr >= 0:
-            true_ranges.append(
-                tr
-            )
-
-        previous_close = close
-
+    start = max(1, len(candles) - period)
+    for index in range(start, len(candles)):
+        current = candles[index]
+        previous = candles[index - 1]
+        high = _high(current)
+        low = _low(current)
+        previous_close = _close(previous)
+        tr = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close),
+        )
+        if tr > 0:
+            true_ranges.append(tr)
     if not true_ranges:
         return 0.0
-
-    values = true_ranges[-period:]
-
-    return sum(values) / len(values)
-
-
-# ============================================================================
+    return sum(true_ranges) / len(true_ranges)
+# ============================================================
 # SWINGS
-# ============================================================================
-
+# ============================================================
 def _swing_highs(
-    candles: Sequence[Any],
-    lookback: int = 2,
-) -> List[float]:
-
-    highs: List[float] = []
-
-    if len(candles) < (
-        lookback * 2 + 1
-    ):
-        return highs
-
+    candles: List[Any],
+    lookback: int = SWING_LOOKBACK,
+) -> List[int]:
+    result: List[int] = []
+    if len(candles) < (lookback * 2) + 1:
+        return result
     for i in range(
         lookback,
         len(candles) - lookback,
     ):
-
-        current = _high(
-            candles[i]
-        )
-
-        if current <= 0:
-            continue
-
-        valid = True
-
-        for j in range(
-            i - lookback,
-            i + lookback + 1,
-        ):
-
-            if j == i:
-                continue
-
-            if _high(
-                candles[j]
-            ) >= current:
-
-                valid = False
-                break
-
-        if valid:
-            highs.append(
-                current
-            )
-
-    return highs
-
-
+        current_high = _high(candles[i])
+        left = [
+            _high(candles[j])
+            for j in range(i - lookback, i)
+        ]
+        right = [
+            _high(candles[j])
+            for j in range(i + 1, i + lookback + 1)
+        ]
+        if all(current_high >= value for value in left + right):
+            result.append(i)
+    return result
 def _swing_lows(
-    candles: Sequence[Any],
-    lookback: int = 2,
-) -> List[float]:
-
-    lows: List[float] = []
-
-    if len(candles) < (
-        lookback * 2 + 1
-    ):
-        return lows
-
+    candles: List[Any],
+    lookback: int = SWING_LOOKBACK,
+) -> List[int]:
+    result: List[int] = []
+    if len(candles) < (lookback * 2) + 1:
+        return result
     for i in range(
         lookback,
         len(candles) - lookback,
     ):
-
-        current = _low(
-            candles[i]
-        )
-
-        if current <= 0:
-            continue
-
-        valid = True
-
-        for j in range(
-            i - lookback,
-            i + lookback + 1,
-        ):
-
-            if j == i:
-                continue
-
-            if _low(
-                candles[j]
-            ) <= current:
-
-                valid = False
-                break
-
-        if valid:
-            lows.append(
-                current
-            )
-
-    return lows
-
-
-# ============================================================================
+        current_low = _low(candles[i])
+        left = [
+            _low(candles[j])
+            for j in range(i - lookback, i)
+        ]
+        right = [
+            _low(candles[j])
+            for j in range(i + 1, i + lookback + 1)
+        ]
+        if all(current_low <= value for value in left + right):
+            result.append(i)
+    return result
+# ============================================================
 # STRUCTURE
-# ============================================================================
-
+# ============================================================
 def _structure_direction(
-    candles: Sequence[Any],
+    candles: List[Any],
 ) -> str:
-
-    if not candles or len(candles) < 10:
-        return "NEUTRAL"
-
-    highs = _swing_highs(
-        candles,
-        lookback=2,
-    )
-
-    lows = _swing_lows(
-        candles,
-        lookback=2,
-    )
-
-    if len(highs) < 2 or len(lows) < 2:
-        return "NEUTRAL"
-
-    last_high = highs[-1]
-    previous_high = highs[-2]
-
-    last_low = lows[-1]
-    previous_low = lows[-2]
-
-    if (
-        last_high > previous_high
-        and last_low > previous_low
-    ):
+    highs = _swing_highs(candles)
+    lows = _swing_lows(candles)
+    bullish = 0
+    bearish = 0
+    if len(highs) >= 2:
+        h1 = _high(candles[highs[-2]])
+        h2 = _high(candles[highs[-1]])
+        if h2 > h1:
+            bullish += 1
+        elif h2 < h1:
+            bearish += 1
+    if len(lows) >= 2:
+        l1 = _low(candles[lows[-2]])
+        l2 = _low(candles[lows[-1]])
+        if l2 > l1:
+            bullish += 1
+        elif l2 < l1:
+            bearish += 1
+    if bullish > bearish:
         return "BUY"
-
-    if (
-        last_high < previous_high
-        and last_low < previous_low
-    ):
+    if bearish > bullish:
         return "SELL"
-
     return "NEUTRAL"
-
-
-# ============================================================================
-# ALIGNEMENT
-# ============================================================================
-
-def _primary_alignment(
-    h4_direction: str,
-    h1_direction: str,
-    m15_direction: str,
-) -> str:
-
-    h4 = _normalize_direction(
-        h4_direction
-    )
-
-    h1 = _normalize_direction(
-        h1_direction
-    )
-
-    m15 = _normalize_direction(
-        m15_direction
-    )
-
-    if (
-        h4 == "NEUTRAL"
-        or h1 == "NEUTRAL"
-        or m15 == "NEUTRAL"
-    ):
-        return "NEUTRAL"
-
-    if h4 == h1 == m15:
-        return h4
-
-    return "NEUTRAL"
-
-
-# ============================================================================
-# ZONES CANDIDATES
-# ============================================================================
-
-def _build_zone_candidates(
-    candles: Sequence[Any],
+def _detect_bos(
+    candles: List[Any],
     direction: str,
-    max_zones: int = MAX_ZONE_CANDIDATES,
-) -> List[Tuple[float, float]]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    if not candles:
-        return []
-
-    recent = list(
-        candles
-    )[-80:]
-
-    candidates: List[float] = []
-
-    if direction == "BUY":
-
-        # BUY = recherche de résistances à casser.
-        candidates.extend(
-            _swing_highs(
-                recent,
-                lookback=2,
-            )
-        )
-
-        candidates.extend(
-            _high(c)
-            for c in recent[-25:]
-            if _high(c) > 0
-        )
-
-    elif direction == "SELL":
-
-        # SELL = recherche de supports à casser.
-        candidates.extend(
-            _swing_lows(
-                recent,
-                lookback=2,
-            )
-        )
-
-        candidates.extend(
-            _low(c)
-            for c in recent[-25:]
-            if _low(c) > 0
-        )
-
-    clean: List[float] = []
-
-    for value in candidates:
-
-        value = _safe_float(
-            value
-        )
-
-        if value <= 0:
-            continue
-
-        tolerance = max(
-            abs(value)
-            * LEVEL_CLUSTER_PERCENT,
-            1e-8,
-        )
-
-        if not any(
-            abs(
-                value - existing
-            ) <= tolerance
-            for existing in clean
-        ):
-
-            clean.append(
-                value
-            )
-
-    current_price = _close(
-        recent[-1]
-    )
-
-    if current_price > 0:
-
-        clean.sort(
-            key=lambda x: abs(
-                x - current_price
-            )
-        )
-
-    else:
-
-        clean.reverse()
-
-    clean = clean[
-        :max_zones
-    ]
-
-    zones: List[
-        Tuple[float, float]
-    ] = []
-
-    for level in clean:
-
-        width = max(
-            abs(level) * 0.0005,
-            1e-8,
-        )
-
-        zones.append(
-            (
-                level - width,
-                level + width,
-            )
-        )
-
-    return zones
-
-
-# ============================================================================
-# BREAKOUT DÉTAILLÉ
-# ============================================================================
-
-def _find_breakout(
-    candles: Sequence[Any],
-    direction: str,
-    level_low: float,
-    level_high: float,
-) -> Optional[int]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    if not candles:
-        return None
-
-    if (
-        level_low <= 0
-        or level_high <= 0
-    ):
-        return None
-
-    start = max(
-        0,
-        len(candles)
-        - BREAKOUT_LOOKBACK,
-    )
-
-    for index in range(
-        start,
-        len(candles),
-    ):
-
-        candle = candles[index]
-
-        close_price = _close(
-            candle
-        )
-
-        open_price = _open(
-            candle
-        )
-
-        if (
-            close_price <= 0
-            or open_price <= 0
-        ):
-            continue
-
-        if direction == "BUY":
-
-            if (
-                close_price
-                > level_high
-            ):
-
-                return index
-
-        elif direction == "SELL":
-
-            if (
-                close_price
-                < level_low
-            ):
-
-                return index
-
-    return None
-
-
-def _breakout_confirmed(
-    candles: Sequence[Any],
-    direction: str,
-    level_low: float,
-    level_high: float,
 ) -> bool:
-
+    direction = _normalize_direction(direction)
+    if len(candles) < 8:
+        return False
+    recent = candles[-1]
+    highs = _swing_highs(candles[:-1])
+    lows = _swing_lows(candles[:-1])
+    if direction == "BUY" and highs:
+        level = _high(candles[highs[-1]])
+        return _close(recent) > level
+    if direction == "SELL" and lows:
+        level = _low(candles[lows[-1]])
+        return _close(recent) < level
+    return False
+def _detect_choch(
+    candles: List[Any],
+    direction: str,
+) -> bool:
+    direction = _normalize_direction(direction)
+    if len(candles) < 12:
+        return False
+    previous_direction = _structure_direction(candles[:-5])
+    current_direction = _structure_direction(candles)
+    if current_direction != direction:
+        return False
+    if previous_direction == "NEUTRAL":
+        return False
+    return previous_direction != current_direction
+# ============================================================
+# LIQUIDITY
+# ============================================================
+def _detect_liquidity_sweep(
+    candles: List[Any],
+    direction: str,
+) -> Dict[str, Any]:
+    direction = _normalize_direction(direction)
+    result = {
+        "detected": False,
+        "quality": 0.0,
+        "level": 0.0,
+        "type": "NONE",
+    }
+    if len(candles) < 6:
+        return result
+    current = candles[-1]
+    recent = candles[-6:-1]
+    previous_high = max(
+        (_high(c) for c in recent),
+        default=0.0,
+    )
+    previous_low = min(
+        (_low(c) for c in recent),
+        default=0.0,
+    )
+    current_high = _high(current)
+    current_low = _low(current)
+    current_close = _close(current)
+    if direction == "SELL":
+        swept = current_high > previous_high
+        rejection = current_close < previous_high
+        if swept and rejection:
+            wick = current_high - max(
+                _open(current),
+                current_close,
+            )
+            body = abs(
+                current_close - _open(current)
+            )
+            quality = 60.0
+            if wick > body:
+                quality += 20.0
+            if current_close < _open(current):
+                quality += 20.0
+            result.update(
+                detected=True,
+                quality=min(100.0, quality),
+                level=previous_high,
+                type="BUY_SIDE_LIQUIDITY_SWEEP",
+            )
+    elif direction == "BUY":
+        swept = current_low < previous_low
+        rejection = current_close > previous_low
+        if swept and rejection:
+            wick = min(
+                _open(current),
+                current_close,
+            ) - current_low
+            body = abs(
+                current_close - _open(current)
+            )
+            quality = 60.0
+            if wick > body:
+                quality += 20.0
+            if current_close > _open(current):
+                quality += 20.0
+            result.update(
+                detected=True,
+                quality=min(100.0, quality),
+                level=previous_low,
+                type="SELL_SIDE_LIQUIDITY_SWEEP",
+            )
+    return result
+# ============================================================
+# DISPLACEMENT
+# ============================================================
+def _detect_displacement(
+    candles: List[Any],
+    direction: str,
+    atr: float,
+) -> Dict[str, Any]:
+    direction = _normalize_direction(direction)
+    result = {
+        "valid": False,
+        "direction": direction,
+        "atr_ratio": 0.0,
+        "body_ratio": 0.0,
+        "strength": 0.0,
+    }
+    if not candles or atr <= 0:
+        return result
+    current = candles[-1]
+    candle_range = max(
+        0.0,
+        _high(current) - _low(current),
+    )
+    body = abs(
+        _close(current) - _open(current)
+    )
+    if candle_range <= 0:
+        return result
+    body_ratio = body / candle_range
+    atr_ratio = candle_range / atr
+    directional = (
+        direction == "BUY"
+        and _close(current) > _open(current)
+    ) or (
+        direction == "SELL"
+        and _close(current) < _open(current)
+    )
+    strength = min(
+        100.0,
+        (
+            min(1.0, body_ratio) * 50.0
+            + min(2.0, atr_ratio) / 2.0 * 50.0
+        ),
+    )
+    valid = (
+        directional
+        and body_ratio >= 0.55
+        and atr_ratio >= 0.80
+    )
+    result.update(
+        valid=valid,
+        atr_ratio=round(atr_ratio, 4),
+        body_ratio=round(body_ratio, 4),
+        strength=round(strength, 2),
+    )
+    return result
+# ============================================================
+# ORDER BLOCK
+# ============================================================
+def _detect_order_block(
+    candles: List[Any],
+    direction: str,
+    displacement: Dict[str, Any],
+) -> Dict[str, Any]:
+    direction = _normalize_direction(direction)
+    result = {
+        "present": False,
+        "fresh": False,
+        "mitigated": False,
+        "displacement_origin": False,
+        "direction": direction,
+        "low": 0.0,
+        "high": 0.0,
+    }
+    if len(candles) < 5:
+        return result
+    search_start = max(0, len(candles) - 8)
+    for i in range(
+        len(candles) - 2,
+        search_start - 1,
+        -1,
+    ):
+        candle = candles[i]
+        bullish_candle = _close(candle) > _open(candle)
+        bearish_candle = _close(candle) < _open(candle)
+        if direction == "BUY" and bearish_candle:
+            result.update(
+                present=True,
+                fresh=True,
+                displacement_origin=bool(
+                    displacement.get("valid")
+                ),
+                low=_low(candle),
+                high=_high(candle),
+            )
+            break
+        if direction == "SELL" and bullish_candle:
+            result.update(
+                present=True,
+                fresh=True,
+                displacement_origin=bool(
+                    displacement.get("valid")
+                ),
+                low=_low(candle),
+                high=_high(candle),
+            )
+            break
+    if result["present"]:
+        zone_low = result["low"]
+        zone_high = result["high"]
+        for candle in candles[-3:]:
+            if (
+                _low(candle) <= zone_high
+                and _high(candle) >= zone_low
+            ):
+                result["mitigated"] = True
+                result["fresh"] = False
+    return result
+# ============================================================
+# FVG / IMBALANCE
+# ============================================================
+def _detect_fvg(
+    candles: List[Any],
+    direction: str,
+    atr: float,
+) -> Dict[str, Any]:
+    direction = _normalize_direction(direction)
+    result = {
+        "present": False,
+        "fresh": False,
+        "filled": False,
+        "atr_ratio": 0.0,
+        "low": 0.0,
+        "high": 0.0,
+    }
+    if len(candles) < 3 or atr <= 0:
+        return result
+    a = candles[-3]
+    b = candles[-2]
+    c = candles[-1]
+    if direction == "BUY":
+        gap_low = _high(a)
+        gap_high = _low(c)
+        if gap_high > gap_low:
+            size = gap_high - gap_low
+            result.update(
+                present=True,
+                fresh=True,
+                atr_ratio=round(size / atr, 4),
+                low=gap_low,
+                high=gap_high,
+            )
+            if _low(b) <= gap_high:
+                result["filled"] = True
+                result["fresh"] = False
+    elif direction == "SELL":
+        gap_low = _high(c)
+        gap_high = _low(a)
+        if gap_high > gap_low:
+            size = gap_high - gap_low
+            result.update(
+                present=True,
+                fresh=True,
+                atr_ratio=round(size / atr, 4),
+                low=gap_low,
+                high=gap_high,
+            )
+            if _high(b) >= gap_low:
+                result["filled"] = True
+                result["fresh"] = False
+    return result
+# ============================================================
+# PREMIUM / DISCOUNT
+# ============================================================
+def _premium_discount(
+    candles: List[Any],
+    price: float,
+) -> Dict[str, Any]:
+    result = {
+        "zone": "EQUILIBRIUM",
+        "ratio": 0.5,
+        "valid": False,
+    }
+    if len(candles) < 5:
+        return result
+    highs = [
+        _high(c)
+        for c in candles[-30:]
+    ]
+    lows = [
+        _low(c)
+        for c in candles[-30:]
+    ]
+    if not highs or not lows:
+        return result
+    structural_high = max(highs)
+    structural_low = min(lows)
+    if structural_high <= structural_low:
+        return result
+    ratio = (
+        price - structural_low
+    ) / (
+        structural_high - structural_low
+    )
+    ratio = max(0.0, min(1.0, ratio))
+    if ratio < 0.45:
+        zone = "DISCOUNT"
+    elif ratio > 0.55:
+        zone = "PREMIUM"
+    else:
+        zone = "EQUILIBRIUM"
+    result.update(
+        zone=zone,
+        ratio=round(ratio, 4),
+        valid=zone != "EQUILIBRIUM",
+    )
+    return result
+# ============================================================
+# SUPPORT / RESISTANCE
+# ============================================================
+def _build_support_resistance(
+    candles: List[Any],
+    direction: str,
+    price: float,
+) -> Dict[str, Any]:
+    direction = _normalize_direction(direction)
+    highs = _swing_highs(candles)
+    lows = _swing_lows(candles)
+    candidates: List[Tuple[str, float, int]] = []
+    for index in highs[-8:]:
+        candidates.append(
+            (
+                "RESISTANCE",
+                _high(candles[index]),
+                index,
+            )
+        )
+    for index in lows[-8:]:
+        candidates.append(
+            (
+                "SUPPORT",
+                _low(candles[index]),
+                index,
+            )
+        )
+    if not candidates:
+        return {
+            "type": "NONE",
+            "level": price,
+            "strength": 0.0,
+            "reactions": 0,
+            "breakout": False,
+            "retest": False,
+            "rejection": False,
+        }
+    if direction == "BUY":
+        valid = [
+            c for c in candidates
+            if c[0] == "RESISTANCE"
+        ]
+    elif direction == "SELL":
+        valid = [
+            c for c in candidates
+            if c[0] == "SUPPORT"
+        ]
+    else:
+        valid = candidates
+    if not valid:
+        valid = candidates
+    selected = min(
+        valid,
+        key=lambda item: abs(item[1] - price),
+    )
+    level_type, level, index = selected
+    tolerance = max(
+        abs(level) * LEVEL_CLUSTER_PERCENT,
+        1e-8,
+    )
+    reactions = 0
+    for candle in candles:
+        if (
+            abs(_high(candle) - level) <= tolerance
+            or abs(_low(candle) - level) <= tolerance
+        ):
+            reactions += 1
+    recent_closes = [
+        _close(c)
+        for c in candles[-BREAKOUT_LOOKBACK:]
+    ]
+    if level_type == "RESISTANCE":
+        breakout = any(
+            close > level + tolerance
+            for close in recent_closes
+        )
+    else:
+        breakout = any(
+            close < level - tolerance
+            for close in recent_closes
+        )
+    retest = False
+    rejection = False
+    for candle in candles[-RETEST_LOOKBACK:]:
+        touched = (
+            _low(candle) <= level + tolerance
+            and _high(candle) >= level - tolerance
+        )
+        if not touched:
+            continue
+        retest = True
+        body = abs(
+            _close(candle) - _open(candle)
+        )
+        upper_wick = (
+            _high(candle)
+            - max(_open(candle), _close(candle))
+        )
+        lower_wick = (
+            min(_open(candle), _close(candle))
+            - _low(candle)
+        )
+        if level_type == "RESISTANCE":
+            rejection = (
+                upper_wick >= body
+                and _close(candle) <= _open(candle)
+            )
+        else:
+            rejection = (
+                lower_wick >= body
+                and _close(candle) >= _open(candle)
+            )
+        if rejection:
+            break
+    strength = min(
+        100.0,
+        25.0
+        + min(30.0, reactions * 7.5)
+        + (20.0 if breakout else 0.0)
+        + (15.0 if retest else 0.0)
+        + (10.0 if rejection else 0.0),
+    )
+    return {
+        "type": level_type,
+        "level": level,
+        "strength": round(strength, 2),
+        "reactions": reactions,
+        "breakout": breakout,
+        "retest": retest,
+        "rejection": rejection,
+        "distance": abs(price - level),
+    }
+# ============================================================
+# ZONES
+# ============================================================
+def _build_zone_candidates(
+    candles: List[Any],
+    direction: str,
+    atr: float,
+) -> List[Dict[str, Any]]:
+    direction = _normalize_direction(direction)
+    zones: List[Dict[str, Any]] = []
+    if not candles:
+        return zones
+    highs = _swing_highs(candles)
+    lows = _swing_lows(candles)
+    if direction == "BUY":
+        levels = [
+            _high(candles[i])
+            for i in highs[-MAX_ZONE_CANDIDATES:]
+        ]
+    elif direction == "SELL":
+        levels = [
+            _low(candles[i])
+            for i in lows[-MAX_ZONE_CANDIDATES:]
+        ]
+    else:
+        levels = (
+            [_high(candles[i]) for i in highs[-6:]]
+            + [_low(candles[i]) for i in lows[-6:]]
+        )
+    if not levels:
+        return zones
+    zone_width = max(
+        atr * 0.15,
+        abs(levels[-1]) * LEVEL_CLUSTER_PERCENT,
+    )
+    for level in levels:
+        if level <= 0:
+            continue
+        duplicate = False
+        for existing in zones:
+            if abs(
+                existing["level"] - level
+            ) <= zone_width:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        if direction == "BUY":
+            level_type = "RESISTANCE"
+        elif direction == "SELL":
+            level_type = "SUPPORT"
+        else:
+            level_type = "NONE"
+        zones.append(
+            {
+                "low": level - zone_width,
+                "high": level + zone_width,
+                "level": level,
+                "level_type": level_type,
+                "direction": direction,
+            }
+        )
+    return zones[:MAX_ZONE_CANDIDATES]
+# ============================================================
+# BREAKOUT
+# ============================================================
+def _find_breakout(
+    candles: List[Any],
+    zone: Dict[str, Any],
+    direction: str,
+) -> Optional[int]:
+    direction = _normalize_direction(direction)
+    start = max(
+        1,
+        len(candles) - BREAKOUT_LOOKBACK,
+    )
+    for i in range(start, len(candles)):
+        candle = candles[i]
+        if direction == "BUY":
+            if _close(candle) > zone["high"]:
+                return i
+        elif direction == "SELL":
+            if _close(candle) < zone["low"]:
+                return i
+    return None
+def _breakout_confirmed(
+    candles: List[Any],
+    zone: Dict[str, Any],
+    direction: str,
+) -> bool:
     return (
         _find_breakout(
             candles,
+            zone,
             direction,
-            level_low,
-            level_high,
         )
         is not None
     )
-
-
-# ============================================================================
-# MOMENTUM / VITESSE DU BREAKOUT
-# ============================================================================
-
+# ============================================================
+# BREAKOUT MOMENTUM
+# ============================================================
 def _analyze_breakout_momentum(
-    candles: Sequence[Any],
-    direction: str,
+    candles: List[Any],
     breakout_index: Optional[int],
-    atr: float = 0.0,
+    direction: str,
+    atr: float,
 ) -> Dict[str, Any]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
+    result = {
+        "valid": False,
+        "body_ratio": 0.0,
+        "atr_ratio": 0.0,
+        "speed": 0.0,
+        "expansion": False,
+    }
+    direction = _normalize_direction(direction)
     if (
-        not candles
-        or breakout_index is None
+        breakout_index is None
         or breakout_index < 0
         or breakout_index >= len(candles)
+        or atr <= 0
     ):
-
-        return {
-            "valid": False,
-            "speed": 0.0,
-            "body_ratio": 0.0,
-            "range_ratio": 0.0,
-            "expansion": False,
-            "breakout_index": None,
-        }
-
-    candle = candles[
-        breakout_index
-    ]
-
-    open_price = _open(
-        candle
-    )
-
-    close_price = _close(
-        candle
-    )
-
-    high = _high(
-        candle
-    )
-
-    low = _low(
-        candle
-    )
-
+        return result
+    candle = candles[breakout_index]
     candle_range = (
-        high - low
+        _high(candle) - _low(candle)
     )
-
     body = abs(
-        close_price - open_price
+        _close(candle) - _open(candle)
     )
-
     if candle_range <= 0:
-
-        return {
-            "valid": False,
-            "speed": 0.0,
-            "body_ratio": 0.0,
-            "range_ratio": 0.0,
-            "expansion": False,
-            "breakout_index": breakout_index,
-        }
-
-    body_ratio = (
-        body / candle_range
-    )
-
-    # ATR
-    range_ratio = 0.0
-
-    if atr > 0:
-
-        range_ratio = (
-            candle_range / atr
-        )
-
-    # Vitesse = déplacement sur les 3 dernières
-    # bougies avant le breakout.
-    speed = 0.0
-
-    start_index = max(
-        0,
-        breakout_index - 3,
-    )
-
-    previous_close = _close(
-        candles[start_index]
-    )
-
-    if previous_close > 0:
-
-        speed = abs(
-            close_price
-            - previous_close
-        ) / previous_close
-
-    candle_direction = "NEUTRAL"
-
-    if close_price > open_price:
-        candle_direction = "BUY"
-
-    elif close_price < open_price:
-        candle_direction = "SELL"
-
+        return result
+    body_ratio = body / candle_range
+    atr_ratio = candle_range / atr
     directional = (
-        candle_direction == direction
+        direction == "BUY"
+        and _close(candle) > _open(candle)
+    ) or (
+        direction == "SELL"
+        and _close(candle) < _open(candle)
     )
-
-    # Expansion :
-    # le breakout doit au minimum présenter
-    # une bougie suffisamment active.
-    expansion = (
-        range_ratio >= 0.50
-    )
-
-    # Validation raisonnable :
-    # direction + corps correct + amplitude minimale.
+    speed = 0.0
+    if breakout_index >= 3:
+        previous_close = _close(
+            candles[breakout_index - 3]
+        )
+        if previous_close > 0:
+            speed = abs(
+                _close(candle) - previous_close
+            ) / previous_close
+    expansion = atr_ratio >= 1.0
     valid = (
         directional
         and body_ratio >= 0.40
-        and expansion
+        and atr_ratio >= 0.60
     )
-
-    return {
-        "valid": bool(valid),
-        "speed": round(
-            speed,
-            8,
-        ),
-        "body_ratio": round(
-            body_ratio,
-            4,
-        ),
-        "range_ratio": round(
-            range_ratio,
-            4,
-        ),
-        "expansion": bool(
-            expansion
-        ),
-        "direction": candle_direction,
-        "breakout_index": breakout_index,
-    }
-
-
-# ============================================================================
-# RETEST APRÈS BREAKOUT
-# ============================================================================
-
+    result.update(
+        valid=valid,
+        body_ratio=round(body_ratio, 4),
+        atr_ratio=round(atr_ratio, 4),
+        speed=round(speed, 6),
+        expansion=expansion,
+    )
+    return result
+# ============================================================
+# RETEST
+# ============================================================
 def _find_retest(
-    candles: Sequence[Any],
-    direction: str,
-    level_low: float,
-    level_high: float,
+    candles: List[Any],
+    zone: Dict[str, Any],
     breakout_index: Optional[int],
 ) -> Optional[int]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    if (
-        not candles
-        or breakout_index is None
-    ):
+    if breakout_index is None:
         return None
-
-    if (
-        breakout_index < 0
-        or breakout_index >= len(candles)
-    ):
-        return None
-
-    zone_width = abs(
-        level_high - level_low
-    )
-
-    tolerance = max(
-        zone_width * 1.5,
-        1e-8,
-    )
-
-    start = (
-        breakout_index + 1
-    )
-
+    start = breakout_index + 1
     end = min(
         len(candles),
-        start + RETEST_LOOKBACK,
+        breakout_index + RETEST_LOOKBACK + 1,
     )
-
-    if start >= end:
-        return None
-
-    for index in range(
-        start,
-        end,
-    ):
-
-        candle = candles[index]
-
-        high = _high(candle)
-        low = _low(candle)
-
-        if (
-            high <= 0
-            or low <= 0
-        ):
-            continue
-
-        # Le prix doit revenir dans / proche
-        # de la zone après le breakout.
-        overlaps = (
-            high
-            >= level_low - tolerance
-            and low
-            <= level_high + tolerance
+    zone_low = zone["low"]
+    zone_high = zone["high"]
+    width = max(
+        zone_high - zone_low,
+        1e-8,
+    )
+    tolerance = width * 1.5
+    for i in range(start, end):
+        candle = candles[i]
+        touched = (
+            _low(candle) <= zone_high + tolerance
+            and _high(candle) >= zone_low - tolerance
         )
-
-        if not overlaps:
-            continue
-
-        close_price = _close(
-            candle
-        )
-
-        if direction == "BUY":
-
-            # Le retest doit tester la zone
-            # et conserver une clôture acceptable.
-            if (
-                low
-                <= level_high + tolerance
-                and close_price > 0
-            ):
-                return index
-
-        elif direction == "SELL":
-
-            if (
-                high
-                >= level_low - tolerance
-                and close_price > 0
-            ):
-                return index
-
+        if touched:
+            return i
     return None
-
-
 def _retest_confirmed(
-    candles: Sequence[Any],
-    direction: str,
-    level_low: float,
-    level_high: float,
-    breakout_index: Optional[int] = None,
+    candles: List[Any],
+    zone: Dict[str, Any],
+    breakout_index: Optional[int],
 ) -> bool:
-
-    if breakout_index is None:
-
-        breakout_index = _find_breakout(
-            candles,
-            direction,
-            level_low,
-            level_high,
-        )
-
     return (
         _find_retest(
             candles,
-            direction,
-            level_low,
-            level_high,
+            zone,
             breakout_index,
         )
         is not None
     )
-
-
-# ============================================================================
-# REJECTION APRÈS RETEST
-# ============================================================================
-
+# ============================================================
+# REJECTION
+# ============================================================
 def _find_rejection(
-    candles: Sequence[Any],
-    direction: str,
+    candles: List[Any],
+    zone: Dict[str, Any],
     retest_index: Optional[int],
+    direction: str,
 ) -> Optional[int]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    if (
-        not candles
-        or retest_index is None
-    ):
+    if retest_index is None:
         return None
-
-    # On analyse les bougies qui suivent le retest.
-    start = max(
-        retest_index,
-        0,
-    )
-
+    direction = _normalize_direction(direction)
     end = min(
         len(candles),
         retest_index + 4,
     )
-
-    for index in range(
-        start,
+    zone_low = zone["low"]
+    zone_high = zone["high"]
+    for i in range(
+        retest_index,
         end,
     ):
-
-        candle = candles[index]
-
-        open_price = _open(
-            candle
+        candle = candles[i]
+        touched = (
+            _low(candle) <= zone_high
+            and _high(candle) >= zone_low
         )
-
-        close_price = _close(
-            candle
-        )
-
-        high = _high(
-            candle
-        )
-
-        low = _low(
-            candle
-        )
-
-        if (
-            open_price <= 0
-            or close_price <= 0
-            or high <= 0
-            or low <= 0
-        ):
+        if not touched:
             continue
-
         body = abs(
-            close_price - open_price
+            _close(candle) - _open(candle)
         )
-
-        upper_wick = max(
-            0.0,
-            high
-            - max(
-                open_price,
-                close_price,
-            ),
-        )
-
-        lower_wick = max(
-            0.0,
-            min(
-                open_price,
-                close_price,
+        if body <= 0:
+            body = max(
+                _high(candle) - _low(candle),
+                1e-8,
             )
-            - low,
+        upper_wick = (
+            _high(candle)
+            - max(_open(candle), _close(candle))
         )
-
+        lower_wick = (
+            min(_open(candle), _close(candle))
+            - _low(candle)
+        )
         if direction == "BUY":
-
             if (
-                close_price >= open_price
-                and lower_wick >= body
+                _close(candle) >= _open(candle)
+                and lower_wick >= body * 0.75
             ):
-                return index
-
+                return i
         elif direction == "SELL":
-
             if (
-                close_price <= open_price
-                and upper_wick >= body
+                _close(candle) <= _open(candle)
+                and upper_wick >= body * 0.75
             ):
-                return index
-
+                return i
     return None
-
-
 def _rejection_confirmed(
-    candles: Sequence[Any],
+    candles: List[Any],
+    zone: Dict[str, Any],
+    retest_index: Optional[int],
     direction: str,
 ) -> bool:
-
-    if not candles:
-        return False
-
-    index = len(candles) - 1
-
     return (
         _find_rejection(
             candles,
+            zone,
+            retest_index,
             direction,
-            index,
         )
         is not None
     )
-
-
-# ============================================================================
-# CANDLE CONFIRMATION
-# ============================================================================
-
+# ============================================================
+# BOUGIE M15
+# ============================================================
 def _candle_confirmation_at(
-    candles: Sequence[Any],
+    candle: Any,
     direction: str,
-    index: Optional[int],
 ) -> bool:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    if (
-        not candles
-        or index is None
-        or index < 0
-        or index >= len(candles)
-    ):
-        return False
-
-    candle = candles[
-        index
-    ]
-
-    open_price = _open(
-        candle
-    )
-
-    close_price = _close(
-        candle
-    )
-
-    high = _high(
-        candle
-    )
-
-    low = _low(
-        candle
-    )
-
+    direction = _normalize_direction(direction)
     candle_range = (
-        high - low
+        _high(candle) - _low(candle)
     )
-
     if candle_range <= 0:
         return False
-
-    body = abs(
-        close_price - open_price
-    )
-
     body_ratio = (
-        body / candle_range
+        abs(_close(candle) - _open(candle))
+        / candle_range
     )
-
     if direction == "BUY":
-
         return (
-            close_price > open_price
+            _close(candle) > _open(candle)
             and body_ratio >= 0.50
         )
-
     if direction == "SELL":
-
         return (
-            close_price < open_price
+            _close(candle) < _open(candle)
             and body_ratio >= 0.50
         )
-
     return False
-
-
 def _candle_confirmation(
-    candles: Sequence[Any],
+    candles: List[Any],
     direction: str,
 ) -> bool:
-
     if not candles:
         return False
-
     return _candle_confirmation_at(
-        candles,
+        candles[-1],
         direction,
-        len(candles) - 1,
     )
-
-
-# ============================================================================
-# VALIDATION COMPLÈTE D'UNE ZONE
-# ============================================================================
-
+# ============================================================
+# ÉVALUATION ZONE
+# ============================================================
 def _evaluate_zone(
-    candles: Sequence[Any],
+    candles: List[Any],
+    zone: Dict[str, Any],
     direction: str,
-    level_low: float,
-    level_high: float,
     atr: float,
 ) -> Dict[str, Any]:
-
-    result: Dict[str, Any] = {
-        "low": level_low,
-        "high": level_high,
-        "key_level": (
-            level_low + level_high
-        ) / 2,
-        "breakout_confirmed": False,
-        "breakout_index": None,
-        "momentum_valid": False,
-        "momentum": {},
-        "retest_confirmed": False,
-        "retest_index": None,
-        "rejection_confirmed": False,
-        "rejection_index": None,
-        "candle_confirmation": False,
-        "complete": False,
-        "stage": "ZONE",
-    }
-
-    # ------------------------------------------------------------------
-    # 1. BREAKOUT
-    # ------------------------------------------------------------------
-
     breakout_index = _find_breakout(
         candles,
+        zone,
         direction,
-        level_low,
-        level_high,
     )
-
     if breakout_index is None:
-
-        result["stage"] = (
-            "WAIT_BREAKOUT"
-        )
-
-        return result
-
-    result[
-        "breakout_confirmed"
-    ] = True
-
-    result[
-        "breakout_index"
-    ] = breakout_index
-
-    # ------------------------------------------------------------------
-    # 2. MOMENTUM
-    # ------------------------------------------------------------------
-
-    momentum = _analyze_breakout_momentum(
-        candles,
-        direction,
-        breakout_index,
-        atr,
-    )
-
-    result[
-        "momentum"
-    ] = momentum
-
-    result[
-        "momentum_valid"
-    ] = bool(
-        momentum.get(
-            "valid",
-            False,
-        )
-    )
-
-    if not result[
-        "momentum_valid"
-    ]:
-
-        result["stage"] = (
-            "WAIT_MOMENTUM"
-        )
-
-        return result
-
-    # ------------------------------------------------------------------
-    # 3. RETEST
-    # ------------------------------------------------------------------
-
-    retest_index = _find_retest(
-        candles,
-        direction,
-        level_low,
-        level_high,
-        breakout_index,
-    )
-
-    if retest_index is None:
-
-        result["stage"] = (
-            "WAIT_RETEST"
-        )
-
-        return result
-
-    result[
-        "retest_confirmed"
-    ] = True
-
-    result[
-        "retest_index"
-    ] = retest_index
-
-    # ------------------------------------------------------------------
-    # 4. REJECTION
-    # ------------------------------------------------------------------
-
-    rejection_index = _find_rejection(
-        candles,
-        direction,
-        retest_index,
-    )
-
-    if rejection_index is None:
-
-        result["stage"] = (
-            "WAIT_REJECTION"
-        )
-
-        return result
-
-    result[
-        "rejection_confirmed"
-    ] = True
-
-    result[
-        "rejection_index"
-    ] = rejection_index
-
-    # ------------------------------------------------------------------
-    # 5. CANDLE CONFIRMATION
-    # ------------------------------------------------------------------
-
-    # La confirmation doit arriver après le retest.
-    confirmation_index = (
-        len(candles) - 1
-    )
-
-    if confirmation_index < retest_index:
-
-        result["stage"] = (
-            "WAIT_CANDLE"
-        )
-
-        return result
-
-    candle_confirmation = (
-        _candle_confirmation_at(
-            candles,
-            direction,
-            confirmation_index,
-        )
-    )
-
-    if not candle_confirmation:
-
-        result["stage"] = (
-            "WAIT_CANDLE"
-        )
-
-        return result
-
-    result[
-        "candle_confirmation"
-    ] = True
-
-    result["confirmation_index"] = (
-        confirmation_index
-    )
-
-    result["complete"] = True
-
-    result["stage"] = (
-        "COMPLETE"
-    )
-
-    return result
-
-
-# ============================================================================
-# M5
-# ============================================================================
-
-def _m5_confirmation(
-    candles: Sequence[Any],
-    direction: str,
-) -> Dict[str, Any]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    if not candles:
-
         return {
-            "valid": False,
-            "direction": "NEUTRAL",
-            "micro_bos": False,
-            "liquidity_sweep": False,
-            "retest": False,
-            "rejection": False,
+            **zone,
+            "stage": "NO_BREAKOUT",
+            "breakout_confirmed": False,
+            "breakout_index": None,
+            "momentum": {},
+            "retest_confirmed": False,
+            "retest_index": None,
+            "rejection_confirmed": False,
+            "rejection_index": None,
             "candle_confirmation": False,
         }
-
-    m5_direction = _structure_direction(
-        candles
+    momentum = _analyze_breakout_momentum(
+        candles,
+        breakout_index,
+        direction,
+        atr,
     )
-
+    retest_index = _find_retest(
+        candles,
+        zone,
+        breakout_index,
+    )
+    if retest_index is None:
+        return {
+            **zone,
+            "stage": "BREAKOUT",
+            "breakout_confirmed": True,
+            "breakout_index": breakout_index,
+            "momentum": momentum,
+            "retest_confirmed": False,
+            "retest_index": None,
+            "rejection_confirmed": False,
+            "rejection_index": None,
+            "candle_confirmation": False,
+        }
+    rejection_index = _find_rejection(
+        candles,
+        zone,
+        retest_index,
+        direction,
+    )
     candle_confirmation = (
         _candle_confirmation(
             candles,
             direction,
         )
     )
-
-    rejection = (
-        _rejection_confirmed(
+    if rejection_index is None:
+        return {
+            **zone,
+            "stage": "RETEST",
+            "breakout_confirmed": True,
+            "breakout_index": breakout_index,
+            "momentum": momentum,
+            "retest_confirmed": True,
+            "retest_index": retest_index,
+            "rejection_confirmed": False,
+            "rejection_index": None,
+            "candle_confirmation": candle_confirmation,
+        }
+    if not candle_confirmation:
+        return {
+            **zone,
+            "stage": "REJECTION",
+            "breakout_confirmed": True,
+            "breakout_index": breakout_index,
+            "momentum": momentum,
+            "retest_confirmed": True,
+            "retest_index": retest_index,
+            "rejection_confirmed": True,
+            "rejection_index": rejection_index,
+            "candle_confirmation": False,
+        }
+    return {
+        **zone,
+        "stage": "COMPLETE",
+        "breakout_confirmed": True,
+        "breakout_index": breakout_index,
+        "momentum": momentum,
+        "retest_confirmed": True,
+        "retest_index": retest_index,
+        "rejection_confirmed": True,
+        "rejection_index": rejection_index,
+        "candle_confirmation": True,
+    }
+# ============================================================
+# SCÉNARIO DE MARCHÉ
+# ============================================================
+def _determine_scenario(
+    h4: str,
+    h1: str,
+    m15: str,
+    m5: str,
+) -> Dict[str, Any]:
+    h4 = _normalize_direction(h4)
+    h1 = _normalize_direction(h1)
+    m15 = _normalize_direction(m15)
+    m5 = _normalize_direction(m5)
+    directions = [
+        h4,
+        h1,
+        m15,
+        m5,
+    ]
+    buy_count = directions.count("BUY")
+    sell_count = directions.count("SELL")
+    # --------------------------------------------------------
+    # CONTINUATION
+    # --------------------------------------------------------
+    if (
+        h4 == h1 == m15
+        and h4 in {"BUY", "SELL"}
+    ):
+        return {
+            "type": "CONTINUATION",
+            "direction": h4,
+            "h4_preference": h4,
+            "confidence": 90.0,
+        }
+    # --------------------------------------------------------
+    # CORRECTION DANS LA TENDANCE H4
+    # --------------------------------------------------------
+    if (
+        h4 in {"BUY", "SELL"}
+        and h1 == h4
+        and m15 != h4
+    ):
+        return {
+            "type": "CORRECTION",
+            "direction": h4,
+            "h4_preference": h4,
+            "correction_direction": m15,
+            "confidence": 80.0,
+        }
+    # --------------------------------------------------------
+    # REVERSAL / CHANGEMENT DE STRUCTURE
+    # --------------------------------------------------------
+    if (
+        h4 in {"BUY", "SELL"}
+        and h1 != h4
+        and m15 != h4
+        and m15 == h1
+        and h1 in {"BUY", "SELL"}
+    ):
+        return {
+            "type": "POTENTIAL_REVERSAL",
+            "direction": h1,
+            "h4_preference": h4,
+            "confidence": 65.0,
+        }
+    # --------------------------------------------------------
+    # CONTRE-TENDANCE
+    # --------------------------------------------------------
+    if (
+        h4 in {"BUY", "SELL"}
+        and h1 == m15
+        and h1 in {"BUY", "SELL"}
+        and h1 != h4
+    ):
+        return {
+            "type": "COUNTER_TREND",
+            "direction": h1,
+            "h4_preference": h4,
+            "confidence": 55.0,
+        }
+    # --------------------------------------------------------
+    # DOMINATION COURT TERME
+    # --------------------------------------------------------
+    if (
+        buy_count >= 3
+        and sell_count <= 1
+    ):
+        return {
+            "type": "SHORT_TERM_BULLISH",
+            "direction": "BUY",
+            "h4_preference": h4,
+            "confidence": 60.0,
+        }
+    if (
+        sell_count >= 3
+        and buy_count <= 1
+    ):
+        return {
+            "type": "SHORT_TERM_BEARISH",
+            "direction": "SELL",
+            "h4_preference": h4,
+            "confidence": 60.0,
+        }
+    # --------------------------------------------------------
+    # RANGE / INDETERMINÉ
+    # --------------------------------------------------------
+    return {
+        "type": "RANGE",
+        "direction": "NEUTRAL",
+        "h4_preference": h4,
+        "confidence": 0.0,
+    }
+# ============================================================
+# M5
+# ============================================================
+def _m5_confirmation(
+    candles: List[Any],
+    direction: str,
+    atr: float,
+) -> Dict[str, Any]:
+    direction = _normalize_direction(direction)
+    result = {
+        "direction": direction,
+        "retest": False,
+        "rejection": False,
+        "liquidity_sweep": False,
+        "liquidity_quality": 0.0,
+        "micro_bos": False,
+        "candle_confirmation": False,
+        "displacement": False,
+        "valid": False,
+    }
+    if not candles:
+        return result
+    structure = _structure_direction(candles)
+    result["micro_bos"] = (
+        structure == direction
+    )
+    result["candle_confirmation"] = (
+        _candle_confirmation(
             candles,
             direction,
         )
     )
-
-    recent = list(
-        candles
-    )[-5:]
-
-    micro_bos = (
-        m5_direction == direction
+    sweep = _detect_liquidity_sweep(
+        candles,
+        direction,
     )
-
-    liquidity_sweep = False
-
-    if len(recent) >= 3:
-
-        previous_lows = [
-            _low(c)
-            for c in recent[:-1]
-            if _low(c) > 0
-        ]
-
-        previous_highs = [
-            _high(c)
-            for c in recent[:-1]
-            if _high(c) > 0
-        ]
-
-        current = recent[-1]
-
-        if (
-            direction == "BUY"
-            and previous_lows
-        ):
-
-            liquidity_sweep = (
-                _low(current)
-                < min(previous_lows)
-                and _close(current)
-                > min(previous_lows)
-            )
-
-        elif (
-            direction == "SELL"
-            and previous_highs
-        ):
-
-            liquidity_sweep = (
-                _high(current)
-                > max(previous_highs)
-                and _close(current)
-                < max(previous_highs)
-            )
-
-    retest = (
-        rejection
-        or liquidity_sweep
+    result["liquidity_sweep"] = bool(
+        sweep["detected"]
     )
-
-    valid = (
-        candle_confirmation
+    result["liquidity_quality"] = _safe_float(
+        sweep["quality"]
+    )
+    current = candles[-1]
+    body = abs(
+        _close(current) - _open(current)
+    )
+    upper_wick = (
+        _high(current)
+        - max(_open(current), _close(current))
+    )
+    lower_wick = (
+        min(_open(current), _close(current))
+        - _low(current)
+    )
+    if direction == "BUY":
+        result["rejection"] = (
+            lower_wick >= max(body, 1e-8)
+        )
+    elif direction == "SELL":
+        result["rejection"] = (
+            upper_wick >= max(body, 1e-8)
+        )
+    result["displacement"] = bool(
+        _detect_displacement(
+            candles,
+            direction,
+            atr,
+        ).get("valid")
+    )
+    # M5 ne bloque PAS le signal.
+    result["valid"] = (
+        result["candle_confirmation"]
         and (
-            micro_bos
-            or liquidity_sweep
+            result["micro_bos"]
+            or result["liquidity_sweep"]
         )
     )
-
-    return {
-        "valid": bool(valid),
-        "direction": m5_direction,
-        "micro_bos": bool(
-            micro_bos
-        ),
-        "liquidity_sweep": bool(
-            liquidity_sweep
-        ),
-        "retest": bool(
-            retest
-        ),
-        "rejection": bool(
-            rejection
-        ),
-        "candle_confirmation": bool(
-            candle_confirmation
-        ),
-    }
-
-
-# ============================================================================
+    return result
+# ============================================================
 # SL / TP
-# ============================================================================
-
+# ============================================================
 def _build_sl_tp(
-    candles: Sequence[Any],
+    candles: List[Any],
     direction: str,
     entry: float,
     atr: float,
 ) -> Tuple[float, float]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    entry = _safe_float(
-        entry
-    )
-
-    atr = _safe_float(
-        atr
-    )
-
-    if entry <= 0:
-        return 0.0, 0.0
-
+    direction = _normalize_direction(direction)
     if atr <= 0:
-        atr = entry * 0.001
-
-    recent = list(
-        candles
-    )[-20:]
-
+        atr = max(
+            abs(entry) * 0.001,
+            1e-8,
+        )
+    recent = candles[-20:]
     if direction == "BUY":
-
-        lows = [
-            _low(c)
-            for c in recent
-            if _low(c) > 0
-        ]
-
-        if lows:
-
-            structural_sl = min(
-                lows
-            )
-
-            sl = min(
-                structural_sl,
-                entry - atr * 0.5,
-            )
-
-        else:
-
-            sl = entry - atr
-
-        risk = (
-            entry - sl
+        structural_sl = min(
+            (_low(c) for c in recent),
+            default=entry - atr,
         )
-
-        if risk <= 0:
-
-            risk = atr
-            sl = entry - risk
-
-        tp = (
-            entry
-            + risk * 2.5
+        atr_sl = entry - (0.75 * atr)
+        stop_loss = min(
+            structural_sl,
+            atr_sl,
         )
-
-        return sl, tp
-
-    if direction == "SELL":
-
-        highs = [
-            _high(c)
-            for c in recent
-            if _high(c) > 0
-        ]
-
-        if highs:
-
-            structural_sl = max(
-                highs
-            )
-
-            sl = max(
-                structural_sl,
-                entry + atr * 0.5,
-            )
-
-        else:
-
-            sl = entry + atr
-
-        risk = (
-            sl - entry
+        risk = abs(
+            entry - stop_loss
         )
-
-        if risk <= 0:
-
-            risk = atr
-            sl = entry + risk
-
-        tp = (
-            entry
-            - risk * 2.5
+        take_profit = entry + (risk * 2.5)
+    elif direction == "SELL":
+        structural_sl = max(
+            (_high(c) for c in recent),
+            default=entry + atr,
         )
-
-        return sl, tp
-
-    return 0.0, 0.0
-
-
-# ============================================================================
-# GEOMETRIE
-# ============================================================================
-
+        atr_sl = entry + (0.75 * atr)
+        stop_loss = max(
+            structural_sl,
+            atr_sl,
+        )
+        risk = abs(
+            entry - stop_loss
+        )
+        take_profit = entry - (risk * 2.5)
+    else:
+        return (
+            entry,
+            entry,
+        )
+    return (
+        round(stop_loss, 8),
+        round(take_profit, 8),
+    )
 def _validate_geometry(
     direction: str,
     entry: float,
     stop_loss: float,
     take_profit: float,
 ) -> bool:
-
-    direction = _normalize_direction(
-        direction
-    )
-
+    direction = _normalize_direction(direction)
     if direction == "BUY":
-
         return (
-            stop_loss
-            < entry
-            < take_profit
+            stop_loss < entry
+            and take_profit > entry
         )
-
     if direction == "SELL":
-
         return (
-            stop_loss
-            > entry
-            > take_profit
+            stop_loss > entry
+            and take_profit < entry
         )
-
     return False
-
-
-# ============================================================================
-# SCORE FALLBACK
-# ============================================================================
-
-def _fallback_score(
-    direction: str,
-    h4_direction: str,
-    h1_direction: str,
-    m15_direction: str,
-    m5: Dict[str, Any],
-    rr: float,
-    momentum: Dict[str, Any],
-    zone: Dict[str, Any],
-) -> float:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    score = 0.0
-
-    # H4
-    if _normalize_direction(
-        h4_direction
-    ) == direction:
-        score += 20
-
-    # H1
-    if _normalize_direction(
-        h1_direction
-    ) == direction:
-        score += 20
-
-    # M15
-    if _normalize_direction(
-        m15_direction
-    ) == direction:
-        score += 20
-
-    # Zone complète
-    if zone.get(
-        "breakout_confirmed"
-    ):
-        score += 2
-
-    if zone.get(
-        "retest_confirmed"
-    ):
-        score += 2
-
-    if zone.get(
-        "rejection_confirmed"
-    ):
-        score += 2
-
-    if zone.get(
-        "candle_confirmation"
-    ):
-        score += 2
-
-    if zone.get(
-        "structure_confirmed"
-    ):
-        score += 2
-
-    # Momentum
-    if momentum.get(
-        "valid"
-    ):
-        score += 5
-
-    if momentum.get(
-        "expansion"
-    ):
-        score += 5
-
-    # M5 secondaire
-    if m5.get(
-        "retest"
-    ):
-        score += 3
-
-    if m5.get(
-        "candle_confirmation"
-    ):
-        score += 3
-
-    if m5.get(
-        "liquidity_sweep"
-    ):
-        score += 4
-
-    # RR
-    if rr >= 2.0:
-        score += 5
-
-    return min(
-        100.0,
-        round(
-            score,
-            2,
-        ),
-    )
-
-
+# ============================================================
+# SCORE
+# ============================================================
 def _calculate_final_score(
-    *,
     symbol: str,
     direction: str,
     h4_direction: str,
@@ -2295,1045 +1444,724 @@ def _calculate_final_score(
     m5: Dict[str, Any],
     rr: float,
     zone: Dict[str, Any],
-    momentum: Dict[str, Any],
+    scenario: Dict[str, Any],
+    liquidity: Dict[str, Any],
+    displacement: Dict[str, Any],
+    order_block: Dict[str, Any],
+    fvg: Dict[str, Any],
+    premium_discount: Dict[str, Any],
+    support_resistance: Dict[str, Any],
+    atr: float,
 ) -> float:
-
-    if calculate_score is not None:
-
-        try:
-
-            result = calculate_score(
-                symbol=symbol,
-                direction=direction,
-                h4_direction=h4_direction,
-                h1_direction=h1_direction,
-                m15_direction=m15_direction,
-                m5_confirmation=m5,
-                rr=rr,
-                zone=zone,
-            )
-
-            if isinstance(
-                result,
-                dict,
-            ):
-
-                value = result.get(
-                    "score",
-                    result.get(
-                        "total",
-                        0,
-                    ),
-                )
-
-                return max(
-                    0.0,
-                    min(
-                        100.0,
-                        _safe_float(
-                            value,
-                            0,
-                        ),
-                    ),
-                )
-
-            return max(
-                0.0,
-                min(
-                    100.0,
-                    _safe_float(
-                        result,
-                        0,
-                    ),
-                ),
-            )
-
-        except TypeError:
-            pass
-
-        except Exception as exc:
-
-            logger.debug(
-                "Scoring engine indisponible %s : %s",
-                symbol,
-                exc,
-            )
-
-    return _fallback_score(
-        direction=direction,
-        h4_direction=h4_direction,
-        h1_direction=h1_direction,
-        m15_direction=m15_direction,
-        m5=m5,
-        rr=rr,
-        momentum=momentum,
-        zone=zone,
-    )
-
-
-# ============================================================================
+    if calculate_score is None:
+        return 0.0
+    # On enrichit la zone pour que le nouveau
+    # scoring_engine puisse réellement utiliser
+    # les différents facteurs.
+    enriched_zone = {
+        **zone,
+        "direction": direction,
+        "order_block": bool(
+            order_block.get("present")
+        ),
+        "order_block_fresh": bool(
+            order_block.get("fresh")
+        ),
+        "order_block_mitigated": bool(
+            order_block.get("mitigated")
+        ),
+        "order_block_displacement_origin": bool(
+            order_block.get("displacement_origin")
+        ),
+        "fvg": bool(
+            fvg.get("present")
+        ),
+        "fvg_fresh": bool(
+            fvg.get("fresh")
+        ),
+        "fvg_filled": bool(
+            fvg.get("filled")
+        ),
+        "fvg_atr_ratio": _safe_float(
+            fvg.get("atr_ratio")
+        ),
+        "premium_discount": premium_discount.get(
+            "zone",
+            "EQUILIBRIUM",
+        ),
+        "premium_discount_ratio": _safe_float(
+            premium_discount.get("ratio")
+        ),
+        "support_resistance": support_resistance,
+        "sr_type": support_resistance.get(
+            "type",
+            "NONE",
+        ),
+        "sr_strength": _safe_float(
+            support_resistance.get("strength")
+        ),
+        "sr_reactions": _safe_float(
+            support_resistance.get("reactions")
+        ),
+        "sr_breakout": bool(
+            support_resistance.get("breakout")
+        ),
+        "sr_retest": bool(
+            support_resistance.get("retest")
+        ),
+        "sr_rejection": bool(
+            support_resistance.get("rejection")
+        ),
+        "liquidity_sweep": bool(
+            liquidity.get("detected")
+        ),
+        "liquidity_quality": _safe_float(
+            liquidity.get("quality")
+        ),
+        "displacement_valid": bool(
+            displacement.get("valid")
+        ),
+        "displacement_direction": displacement.get(
+            "direction",
+            direction,
+        ),
+        "displacement_atr_ratio": _safe_float(
+            displacement.get("atr_ratio")
+        ),
+        "scenario": scenario.get(
+            "type",
+            "RANGE",
+        ),
+    }
+    try:
+        score = calculate_score(
+            symbol=symbol,
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            m5_confirmation=m5,
+            confirmation=m5,
+            rr=rr,
+            zone=enriched_zone,
+            liquidity=liquidity,
+            displacement=displacement,
+            order_block=order_block,
+            fvg=fvg,
+            premium_discount=premium_discount,
+            support_resistance=support_resistance,
+            atr=atr,
+            scenario=scenario,
+        )
+        return max(
+            0.0,
+            min(
+                100.0,
+                _safe_float(score),
+            ),
+        )
+    except Exception:
+        return 0.0
+# ============================================================
 # NEWS
-# ============================================================================
-
+# ============================================================
 def _check_news(
     symbol: str,
-) -> Tuple[bool, Optional[str]]:
-
+) -> Dict[str, Any]:
     if economic_filter is None:
-        return False, None
-
+        return {
+            "blocked": False,
+            "reason": "",
+        }
     try:
-
-        result = economic_filter(
-            symbol
-        )
-
-        if isinstance(
-            result,
-            tuple,
-        ):
-
+        result = economic_filter(symbol)
+        if isinstance(result, bool):
+            return {
+                "blocked": result,
+                "reason": (
+                    "Filtre économique actif."
+                    if result
+                    else ""
+                ),
+            }
+        if isinstance(result, dict):
             blocked = bool(
-                result[0]
+                result.get("blocked")
+                or result.get("is_blocked")
+                or result.get("danger")
             )
-
-            reason = (
-                result[1]
-                if len(result) > 1
-                else None
-            )
-
-            return blocked, reason
-
-        return bool(result), None
-
-    except Exception as exc:
-
-        logger.warning(
-            "NEWS %s : filtre indisponible : %s",
-            symbol,
-            exc,
-        )
-
-        return False, None
-
-
-# ============================================================================
-# MARCHÉ
-# ============================================================================
-
+            return {
+                "blocked": blocked,
+                "reason": str(
+                    result.get(
+                        "reason",
+                        "",
+                    )
+                ),
+            }
+        return {
+            "blocked": False,
+            "reason": "",
+        }
+    except Exception:
+        # Le filtre news ne doit pas faire
+        # planter le moteur d'analyse.
+        return {
+            "blocked": False,
+            "reason": "",
+        }
+# ============================================================
+# MARKET OPEN
+# ============================================================
 def _market_open(
     symbol: str,
 ) -> bool:
-
     if market_data is None:
         return True
-
-    for name in (
-        "is_market_open",
-        "market_is_open",
-    ):
-
-        checker = getattr(
+    try:
+        method = getattr(
             market_data,
-            name,
+            "is_market_open",
             None,
         )
-
-        if callable(checker):
-
-            try:
-
-                return bool(
-                    checker(symbol)
-                )
-
-            except TypeError:
-
-                try:
-
-                    return bool(
-                        checker()
-                    )
-
-                except Exception:
-                    pass
-
-            except Exception:
-                pass
-
+        if callable(method):
+            return bool(
+                method(symbol)
+            )
+    except Exception:
+        pass
     return True
-
-
-# ============================================================================
+# ============================================================
+# DATA PROVIDER
+# ============================================================
+def _get_market_data(
+    symbol: str,
+    timeframe: str,
+) -> List[Any]:
+    if market_data is None:
+        return []
+    methods = (
+        "get_candles",
+        "fetch_candles",
+        "get_ohlc",
+        "get_data",
+    )
+    for method_name in methods:
+        method = getattr(
+            market_data,
+            method_name,
+            None,
+        )
+        if not callable(method):
+            continue
+        attempts = (
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+            },
+            {
+                "symbol": symbol,
+                "interval": timeframe,
+            },
+        )
+        for kwargs in attempts:
+            try:
+                raw = method(**kwargs)
+                candles = _extract_candles(raw)
+                if _validate_candles(candles):
+                    return candles
+            except TypeError:
+                continue
+            except Exception:
+                continue
+    return []
+# ============================================================
 # RÉSULTATS
-# ============================================================================
-
+# ============================================================
 def _base_result(
     symbol: str,
-    direction: str = "NEUTRAL",
-    h4_direction: str = "NEUTRAL",
-    h1_direction: str = "NEUTRAL",
-    m15_direction: str = "NEUTRAL",
-    m5_direction: str = "NEUTRAL",
+    timeframe: str = "M15",
 ) -> Dict[str, Any]:
-
     return {
+        "success": False,
+        "status": "WAIT",
         "symbol": symbol,
-        "direction": _normalize_direction(
-            direction
-        ),
-        "h4_direction": _normalize_direction(
-            h4_direction
-        ),
-        "h1_direction": _normalize_direction(
-            h1_direction
-        ),
-        "m15_direction": _normalize_direction(
-            m15_direction
-        ),
-        "m5_direction": _normalize_direction(
-            m5_direction
-        ),
+        "market": symbol,
+        "timeframe": timeframe,
+        "direction": "NEUTRAL",
         "score": 0.0,
         "rr": 0.0,
+        "quality": "NO_SIGNAL",
         "entry": 0.0,
         "stop_loss": 0.0,
         "take_profit": 0.0,
-        "sl": 0.0,
-        "tp": 0.0,
-        "signal": None,
-        "signal_id": None,
-        "timestamp": _utc_now().isoformat(),
+        "reason": "",
+        "scenario": "RANGE",
+        "h4_direction": "NEUTRAL",
+        "h1_direction": "NEUTRAL",
+        "m15_direction": "NEUTRAL",
+        "m5_direction": "NEUTRAL",
     }
-
-
 def _wait_result(
-    symbol: str,
+    base: Dict[str, Any],
     reason: str,
-    *,
-    direction: str = "NEUTRAL",
-    h4_direction: str = "NEUTRAL",
-    h1_direction: str = "NEUTRAL",
-    m15_direction: str = "NEUTRAL",
-    m5_direction: str = "NEUTRAL",
-    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-
-    result = _base_result(
-        symbol=symbol,
-        direction=direction,
-        h4_direction=h4_direction,
-        h1_direction=h1_direction,
-        m15_direction=m15_direction,
-        m5_direction=m5_direction,
-    )
-
+    result = dict(base)
     result.update(
         {
+            "success": False,
             "status": "WAIT",
             "reason": reason,
         }
     )
-
-    if extra:
-        result.update(
-            extra
-        )
-
     return result
-
-
 def _reject_result(
-    symbol: str,
+    base: Dict[str, Any],
     reason: str,
-    *,
-    direction: str = "NEUTRAL",
-    h4_direction: str = "NEUTRAL",
-    h1_direction: str = "NEUTRAL",
-    m15_direction: str = "NEUTRAL",
-    m5_direction: str = "NEUTRAL",
-    score: float = 0.0,
-    rr: float = 0.0,
-    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-
-    result = _base_result(
-        symbol=symbol,
-        direction=direction,
-        h4_direction=h4_direction,
-        h1_direction=h1_direction,
-        m15_direction=m15_direction,
-        m5_direction=m5_direction,
-    )
-
+    result = dict(base)
     result.update(
         {
+            "success": False,
             "status": "REJECT",
             "reason": reason,
-            "score": round(
-                _safe_float(
-                    score
-                ),
-                2,
-            ),
-            "rr": round(
-                _safe_float(
-                    rr
-                ),
-                4,
-            ),
         }
     )
-
-    if extra:
-        result.update(
-            extra
-        )
-
     return result
-
-
-# ============================================================================
+# ============================================================
 # ANALYSE PRINCIPALE
-# ============================================================================
-
+# ============================================================
 def analyze_market(
     symbol: str = "XAU/USD",
+    timeframe: str = "M15",
 ) -> Dict[str, Any]:
-
-    symbol = str(
-        symbol or "XAU/USD"
-    ).strip().upper()
-
-    logger.info(
-        "========== ANALYSE %s ==========",
+    symbol = str(symbol).upper().strip()
+    result = _base_result(
         symbol,
+        timeframe,
     )
-
-    # ======================================================================
-    # 1. PROVIDER
-    # ======================================================================
-
-    if not _is_crypto_symbol(
-        symbol
-    ):
-
-        provider_ready, provider_reason = (
-            _twelve_data_ready(
-                symbol
-            )
-        )
-
-        if not provider_ready:
-
-            logger.warning(
-                "%s",
-                provider_reason,
-            )
-
-            return _wait_result(
-                symbol,
-                provider_reason,
-            )
-
-    # ======================================================================
-    # 2. MARCHÉ
-    # ======================================================================
-
-    if not _market_open(
-        symbol
-    ):
-
+    # --------------------------------------------------------
+    # CONFIG
+    # --------------------------------------------------------
+    threshold = _safe_float(
+        getattr(
+            CONFIG,
+            "SIGNAL_THRESHOLD",
+            60.0,
+        ),
+        60.0,
+    )
+    minimum_rr = _safe_float(
+        getattr(
+            CONFIG,
+            "MINIMUM_RR",
+            2.0,
+        ),
+        2.0,
+    )
+    # --------------------------------------------------------
+    # MARKET
+    # --------------------------------------------------------
+    if not _market_open(symbol):
         return _wait_result(
-            symbol,
+            result,
             "Marché actuellement fermé.",
         )
-
-    # ======================================================================
-    # 3. DONNÉES
-    # ======================================================================
-
-    candles: Dict[
-        str,
-        List[Any],
-    ] = {}
-
-    for timeframe in TIMEFRAMES:
-
-        # Crypto ne dépend jamais du cooldown Twelve Data.
-        if not _is_crypto_symbol(
-            symbol
-        ):
-
-            ready, reason = (
-                _twelve_data_ready(
-                    symbol
-                )
-            )
-
-            if not ready:
-
-                return _wait_result(
-                    symbol,
-                    reason,
-                )
-
-        data = _extract_candles(
-            symbol,
-            timeframe,
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
+    candles_h4 = _get_market_data(
+        symbol,
+        "H4",
+    )
+    candles_h1 = _get_market_data(
+        symbol,
+        "H1",
+    )
+    candles_m15 = _get_market_data(
+        symbol,
+        "M15",
+    )
+    candles_m5 = _get_market_data(
+        symbol,
+        "M5",
+    )
+    if not _validate_candles(candles_h4):
+        return _wait_result(
+            result,
+            "Données H4 insuffisantes.",
         )
-
-        if not data:
-
-            if not _is_crypto_symbol(
-                symbol
-            ):
-
-                ready, reason = (
-                    _twelve_data_ready(
-                        symbol
-                    )
-                )
-
-                if not ready:
-
-                    return _wait_result(
-                        symbol,
-                        reason,
-                    )
-
-            return _wait_result(
-                symbol,
-                (
-                    f"Données indisponibles "
-                    f"{timeframe} pour {symbol}."
-                ),
-            )
-
-        if not _validate_candles(
-            data
-        ):
-
-            return _wait_result(
-                symbol,
-                (
-                    f"Données insuffisantes "
-                    f"{timeframe} pour {symbol}."
-                ),
-            )
-
-        candles[
-            timeframe
-        ] = data
-
-    # ======================================================================
-    # 4. DIRECTIONS
-    # ======================================================================
-
+    if not _validate_candles(candles_h1):
+        return _wait_result(
+            result,
+            "Données H1 insuffisantes.",
+        )
+    if not _validate_candles(candles_m15):
+        return _wait_result(
+            result,
+            "Données M15 insuffisantes.",
+        )
+    if not _validate_candles(candles_m5):
+        return _wait_result(
+            result,
+            "Données M5 insuffisantes.",
+        )
+    # --------------------------------------------------------
+    # DIRECTIONS
+    # --------------------------------------------------------
     h4_direction = _structure_direction(
-        candles["H4"]
+        candles_h4
     )
-
     h1_direction = _structure_direction(
-        candles["H1"]
+        candles_h1
     )
-
     m15_direction = _structure_direction(
-        candles["M15"]
+        candles_m15
     )
-
-    logger.info(
-        (
-            "%s directions : "
-            "H4=%s | H1=%s | M15=%s"
-        ),
-        symbol,
+    m5_direction = _structure_direction(
+        candles_m5
+    )
+    result.update(
+        {
+            "h4_direction": h4_direction,
+            "h1_direction": h1_direction,
+            "m15_direction": m15_direction,
+            "m5_direction": m5_direction,
+        }
+    )
+    # --------------------------------------------------------
+    # SCÉNARIO
+    # --------------------------------------------------------
+    scenario = _determine_scenario(
         h4_direction,
         h1_direction,
         m15_direction,
+        m5_direction,
     )
-
-    # ======================================================================
-    # 5. ALIGNEMENT PRINCIPAL
-    # ======================================================================
-
-    direction = _primary_alignment(
-        h4_direction,
-        h1_direction,
-        m15_direction,
+    result["scenario"] = scenario["type"]
+    direction = _normalize_direction(
+        scenario["direction"]
     )
-
+    # --------------------------------------------------------
+    # RANGE / AUCUNE DIRECTION
+    # --------------------------------------------------------
     if direction == "NEUTRAL":
-
-        logger.info(
-            "%s : H4/H1/M15 non alignés.",
-            symbol,
-        )
-
-        return _reject_result(
-            symbol,
+        return _wait_result(
+            result,
             (
-                "H4 + H1 + M15 "
-                "ne sont pas parfaitement alignés."
+                "Aucun scénario directionnel "
+                "suffisamment clair : marché en "
+                "range ou structure indéterminée."
             ),
-            direction="NEUTRAL",
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
         )
-
-    logger.info(
-        (
-            "%s ALIGNEMENT PRINCIPAL VALIDÉ : "
-            "H4=%s | H1=%s | M15=%s | direction=%s"
-        ),
-        symbol,
-        h4_direction,
-        h1_direction,
-        m15_direction,
-        direction,
+    # --------------------------------------------------------
+    # ATR
+    # --------------------------------------------------------
+    atr_h4 = _calculate_atr(
+        candles_h4
     )
-
-    # ======================================================================
-    # 6. ATR M15
-    # ======================================================================
-
-    atr = _calculate_atr(
-        candles["M15"],
-        period=14,
+    atr_h1 = _calculate_atr(
+        candles_h1
     )
-
+    atr_m15 = _calculate_atr(
+        candles_m15
+    )
+    atr_m5 = _calculate_atr(
+        candles_m5
+    )
+    atr = atr_m15 or atr_h1 or atr_h4
     if atr <= 0:
-
         return _wait_result(
-            symbol,
-            (
-                "Alignement H4/H1/M15 valide, "
-                "mais ATR M15 indisponible."
-            ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
+            result,
+            "ATR invalide ou volatilité insuffisante.",
         )
-
-    # ======================================================================
-    # 7. RECHERCHE MULTI-ZONES
-    # ======================================================================
-
-    zone_candidates = _build_zone_candidates(
-        candles["M15"],
+    # --------------------------------------------------------
+    # LIQUIDITÉ
+    # --------------------------------------------------------
+    liquidity_h1 = _detect_liquidity_sweep(
+        candles_h1,
         direction,
-        max_zones=MAX_ZONE_CANDIDATES,
     )
-
-    logger.info(
-        "%s : %s zones candidates à tester.",
-        symbol,
-        len(zone_candidates),
+    liquidity_m15 = _detect_liquidity_sweep(
+        candles_m15,
+        direction,
     )
-
+    liquidity_m5 = _detect_liquidity_sweep(
+        candles_m5,
+        direction,
+    )
+    liquidity_candidates = [
+        liquidity_h1,
+        liquidity_m15,
+        liquidity_m5,
+    ]
+    liquidity = max(
+        liquidity_candidates,
+        key=lambda item: _safe_float(
+            item.get("quality")
+        ),
+    )
+    # --------------------------------------------------------
+    # DISPLACEMENT
+    # --------------------------------------------------------
+    displacement_h1 = _detect_displacement(
+        candles_h1,
+        direction,
+        atr_h1 or atr,
+    )
+    displacement_m15 = _detect_displacement(
+        candles_m15,
+        direction,
+        atr_m15 or atr,
+    )
+    displacement = max(
+        [displacement_h1, displacement_m15],
+        key=lambda item: _safe_float(
+            item.get("strength")
+        ),
+    )
+    # --------------------------------------------------------
+    # ORDER BLOCK
+    # --------------------------------------------------------
+    order_block = _detect_order_block(
+        candles_m15,
+        direction,
+        displacement,
+    )
+    # --------------------------------------------------------
+    # FVG
+    # --------------------------------------------------------
+    fvg = _detect_fvg(
+        candles_m15,
+        direction,
+        atr,
+    )
+    # --------------------------------------------------------
+    # PREMIUM / DISCOUNT
+    # --------------------------------------------------------
+    current_price = _close(
+        candles_m5[-1]
+    )
+    premium_discount = _premium_discount(
+        candles_m15,
+        current_price,
+    )
+    # --------------------------------------------------------
+    # SUPPORT / RESISTANCE
+    # --------------------------------------------------------
+    support_resistance = _build_support_resistance(
+        candles_m15,
+        direction,
+        current_price,
+    )
+    # --------------------------------------------------------
+    # ZONES
+    # --------------------------------------------------------
+    zone_candidates = _build_zone_candidates(
+        candles_m15,
+        direction,
+        atr,
+    )
     if not zone_candidates:
-
         return _wait_result(
-            symbol,
-            (
-                "Alignement H4/H1/M15 validé, "
-                "mais aucune zone clé exploitable "
-                "n'est actuellement disponible."
-            ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
+            result,
+            "Aucune zone structurelle exploitable.",
         )
-
-    # ======================================================================
-    # 8. ÉVALUATION DE TOUTES LES ZONES
-    # ======================================================================
-
-    zone_results: List[
-        Dict[str, Any]
-    ] = []
-
-    for zone_number, (
-        zone_low,
-        zone_high,
-    ) in enumerate(
-        zone_candidates,
-        start=1,
-    ):
-
-        evaluation = _evaluate_zone(
-            candles["M15"],
+    evaluated_zones: List[Dict[str, Any]] = []
+    for candidate in zone_candidates:
+        evaluated = _evaluate_zone(
+            candles_m15,
+            candidate,
             direction,
-            zone_low,
-            zone_high,
             atr,
         )
-
-        evaluation[
-            "zone_number"
-        ] = zone_number
-
-        zone_results.append(
-            evaluation
+        evaluated_zones.append(
+            evaluated
         )
-
-        logger.info(
-            (
-                "%s ZONE #%s %.5f-%.5f | "
-                "stage=%s | breakout=%s | "
-                "momentum=%s | retest=%s | "
-                "rejection=%s | candle=%s"
-            ),
-            symbol,
-            zone_number,
-            zone_low,
-            zone_high,
-            evaluation.get(
-                "stage"
-            ),
-            evaluation.get(
-                "breakout_confirmed"
-            ),
-            evaluation.get(
-                "momentum_valid"
-            ),
-            evaluation.get(
-                "retest_confirmed"
-            ),
-            evaluation.get(
-                "rejection_confirmed"
-            ),
-            evaluation.get(
-                "candle_confirmation"
-            ),
-        )
-
-    # ======================================================================
-    # 9. RECHERCHE DE LA MEILLEURE ZONE
-    # ======================================================================
-
-    # Priorité :
-    #
-    # COMPLETE
-    # WAIT_CANDLE
-    # WAIT_REJECTION
-    # WAIT_RETEST
-    # WAIT_MOMENTUM
-    # WAIT_BREAKOUT
-    #
-    # Cela permet au bot de conserver la zone
-    # la plus avancée dans son cycle.
-
+    # --------------------------------------------------------
+    # PRIORITÉ DES STADES
+    # --------------------------------------------------------
     stage_priority = {
-        "COMPLETE": 6,
-        "WAIT_CANDLE": 5,
-        "WAIT_REJECTION": 4,
-        "WAIT_RETEST": 3,
-        "WAIT_MOMENTUM": 2,
-        "WAIT_BREAKOUT": 1,
-        "ZONE": 0,
+        "COMPLETE": 5,
+        "REJECTION": 4,
+        "RETEST": 3,
+        "BREAKOUT": 2,
+        "NO_BREAKOUT": 1,
     }
-
     best_zone = max(
-        zone_results,
-        key=lambda item: (
+        evaluated_zones,
+        key=lambda zone: (
             stage_priority.get(
-                item.get(
-                    "stage",
-                    "ZONE",
-                ),
+                zone.get("stage"),
                 0,
             ),
-            -abs(
-                _close(
-                    candles["M15"][-1]
-                )
-                - item.get(
-                    "key_level",
-                    0.0,
-                )
+            bool(
+                zone.get(
+                    "momentum",
+                    {},
+                ).get("valid")
             ),
+            abs(
+                current_price
+                - _safe_float(
+                    zone.get("level")
+                )
+            ) * -1,
         ),
     )
-
     stage = best_zone.get(
         "stage",
-        "ZONE",
+        "NO_BREAKOUT",
     )
-
-    logger.info(
-        (
-            "%s meilleure zone = #%s | "
-            "stage=%s"
-        ),
-        symbol,
-        best_zone.get(
-            "zone_number"
-        ),
-        stage,
-    )
-
-    # ======================================================================
-    # 10. SI AUCUN BREAKOUT
-    # ======================================================================
-
-    if stage == "WAIT_BREAKOUT":
-
+    # --------------------------------------------------------
+    # PAS DE BREAKOUT
+    # --------------------------------------------------------
+    if stage == "NO_BREAKOUT":
         return _wait_result(
-            symbol,
+            result,
             (
-                "H4 + H1 + M15 alignés, "
-                "zones clés analysées, "
-                "mais aucun breakout valide "
-                "n'est encore confirmé. "
-                "Surveillance en attente."
+                "Aucun breakout structurel "
+                "confirmé sur les zones surveillées."
             ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            extra={
-                "zones_tested": len(
-                    zone_results
-                ),
-                "zone": best_zone,
-                "breakout_confirmed": False,
-                "retest_confirmed": False,
-                "rejection_confirmed": False,
-                "candle_confirmation": False,
-            },
         )
-
-    # ======================================================================
-    # 11. BREAKOUT MAIS MOMENTUM INSUFFISANT
-    # ======================================================================
-
-    if stage == "WAIT_MOMENTUM":
-
-        return _wait_result(
-            symbol,
-            (
-                "Breakout détecté sur une zone clé, "
-                "mais la vitesse/momentum du mouvement "
-                "est insuffisante. "
-                "Le bot attend une impulsion plus propre."
-            ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            extra={
-                "zones_tested": len(
-                    zone_results
-                ),
-                "zone": best_zone,
-                "breakout_confirmed": True,
-                "retest_confirmed": False,
-                "rejection_confirmed": False,
-                "candle_confirmation": False,
-                "momentum": best_zone.get(
-                    "momentum",
-                    {},
-                ),
-            },
-        )
-
-    # ======================================================================
-    # 12. BREAKOUT + MOMENTUM MAIS PAS RETEST
-    # ======================================================================
-
-    if stage == "WAIT_RETEST":
-
-        return _wait_result(
-            symbol,
-            (
-                "Breakout + momentum confirmés. "
-                "Le bot attend maintenant le retest "
-                "de la zone cassée."
-            ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            extra={
-                "zones_tested": len(
-                    zone_results
-                ),
-                "zone": best_zone,
-                "breakout_confirmed": True,
-                "retest_confirmed": False,
-                "rejection_confirmed": False,
-                "candle_confirmation": False,
-                "momentum": best_zone.get(
-                    "momentum",
-                    {},
-                ),
-            },
-        )
-
-    # ======================================================================
-    # 13. RETEST MAIS PAS REJECTION
-    # ======================================================================
-
-    if stage == "WAIT_REJECTION":
-
-        return _wait_result(
-            symbol,
-            (
-                "Breakout + momentum + retest "
-                "confirmés. "
-                "Le bot attend maintenant le rejet "
-                "de la zone."
-            ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            extra={
-                "zones_tested": len(
-                    zone_results
-                ),
-                "zone": best_zone,
-                "breakout_confirmed": True,
-                "retest_confirmed": True,
-                "rejection_confirmed": False,
-                "candle_confirmation": False,
-                "momentum": best_zone.get(
-                    "momentum",
-                    {},
-                ),
-            },
-        )
-
-    # ======================================================================
-    # 14. REJECTION MAIS PAS BOUGIE DE CONFIRMATION
-    # ======================================================================
-
-    if stage == "WAIT_CANDLE":
-
-        return _wait_result(
-            symbol,
-            (
-                "Rejet de zone confirmé. "
-                "Le bot attend maintenant une bougie "
-                "de confirmation M15 valide avant "
-                "de calculer l'entrée."
-            ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            extra={
-                "zones_tested": len(
-                    zone_results
-                ),
-                "zone": best_zone,
-                "breakout_confirmed": True,
-                "retest_confirmed": True,
-                "rejection_confirmed": True,
-                "candle_confirmation": False,
-                "momentum": best_zone.get(
-                    "momentum",
-                    {},
-                ),
-            },
-        )
-
-    # ======================================================================
-    # 15. ZONE COMPLÈTE
-    # ======================================================================
-
-    zone_low = _safe_float(
-        best_zone.get(
-            "low"
-        )
-    )
-
-    zone_high = _safe_float(
-        best_zone.get(
-            "high"
-        )
-    )
-
+    # --------------------------------------------------------
+    # BREAKOUT MAIS PAS MOMENTUM
+    # --------------------------------------------------------
     momentum = best_zone.get(
         "momentum",
         {},
     )
-
-    # ======================================================================
-    # 16. ENTRY
-    # ======================================================================
-
-    current_candle = (
-        candles["M5"][-1]
-    )
-
-    entry = _close(
-        current_candle
-    )
-
-    if entry <= 0:
-
-        entry = _close(
-            candles["M15"][-1]
+    if not momentum.get("valid"):
+        return _wait_result(
+            result,
+            (
+                "Breakout détecté mais "
+                "displacement/momentum insuffisant."
+            ),
         )
-
-    if entry <= 0:
-
-        return _reject_result(
-            symbol,
-            "Prix d'entrée invalide.",
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
+    # --------------------------------------------------------
+    # BREAKOUT + MOMENTUM MAIS PAS RETEST
+    # --------------------------------------------------------
+    if not best_zone.get(
+        "retest_confirmed"
+    ):
+        return _wait_result(
+            result,
+            (
+                "Breakout et momentum confirmés ; "
+                "attente du retest de la zone."
+            ),
         )
-
-    # ======================================================================
-    # 17. SL / TP
-    # ======================================================================
-
-    stop_loss, take_profit = (
-        _build_sl_tp(
-            candles["M15"],
-            direction,
-            entry,
-            atr,
+    # --------------------------------------------------------
+    # RETEST MAIS PAS REJECTION
+    # --------------------------------------------------------
+    if not best_zone.get(
+        "rejection_confirmed"
+    ):
+        return _wait_result(
+            result,
+            (
+                "Retest confirmé ; "
+                "attente de la rejection."
+            ),
         )
+    # --------------------------------------------------------
+    # REJECTION MAIS BOUGIE M15 NON CONFIRMÉE
+    # --------------------------------------------------------
+    if not best_zone.get(
+        "candle_confirmation"
+    ):
+        return _wait_result(
+            result,
+            (
+                "Rejection confirmée ; "
+                "attente de la confirmation "
+                "de la bougie M15."
+            ),
+        )
+    # --------------------------------------------------------
+    # M5
+    # --------------------------------------------------------
+    m5 = _m5_confirmation(
+        candles_m5,
+        direction,
+        atr_m5 or atr,
     )
-
+    # IMPORTANT :
+    # M5 ne bloque pas le signal.
+    #
+    # Il améliore le score / timing,
+    # mais n'annule pas une configuration
+    # principale déjà validée.
+    # --------------------------------------------------------
+    # ENTRY
+    # --------------------------------------------------------
+    entry = current_price
+    # --------------------------------------------------------
+    # SL / TP
+    # --------------------------------------------------------
+    stop_loss, take_profit = _build_sl_tp(
+        candles_m15,
+        direction,
+        entry,
+        atr,
+    )
     if not _validate_geometry(
         direction,
         entry,
         stop_loss,
         take_profit,
     ):
-
         return _reject_result(
-            symbol,
-            "Géométrie Entry/SL/TP invalide.",
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            extra={
-                "zone": best_zone,
-            },
+            result,
+            "Géométrie Entry / SL / TP invalide.",
         )
-
-    # ======================================================================
-    # 18. RR
-    # ======================================================================
-
+    # --------------------------------------------------------
+    # RR
+    # --------------------------------------------------------
     rr = calculate_rr(
         entry,
         stop_loss,
         take_profit,
     )
-
-    minimum_rr = 2.0
-
-    try:
-
-        if CONFIG is not None:
-
-            minimum_rr = float(
-                getattr(
-                    CONFIG,
-                    "MINIMUM_RR",
-                    2.0,
-                )
-            )
-
-    except Exception:
-
-        minimum_rr = 2.0
-
+    rr = _safe_float(
+        rr,
+        0.0,
+    )
     if rr < minimum_rr:
-
+        result.update(
+            {
+                "entry": entry,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "rr": rr,
+            }
+        )
         return _reject_result(
-            symbol,
+            result,
             (
                 f"RR insuffisant : "
-                f"{rr:.2f} < "
-                f"{minimum_rr:.2f}"
+                f"{rr:.2f} < {minimum_rr:.2f}."
             ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            rr=rr,
-            extra={
-                "zone": best_zone,
-                "momentum": momentum,
-            },
         )
-
-    # ======================================================================
-    # 19. M5 SECONDAIRE
-    # ======================================================================
-
-    m5 = _m5_confirmation(
-        candles["M5"],
-        direction,
-    )
-
-    logger.info(
-        (
-            "%s M5 SECONDARY : valid=%s | "
-            "direction=%s | BOS=%s | "
-            "sweep=%s | retest=%s | candle=%s"
-        ),
-        symbol,
-        m5.get(
-            "valid"
-        ),
-        m5.get(
-            "direction"
-        ),
-        m5.get(
-            "micro_bos"
-        ),
-        m5.get(
-            "liquidity_sweep"
-        ),
-        m5.get(
-            "retest"
-        ),
-        m5.get(
-            "candle_confirmation"
-        ),
-    )
-
-    # IMPORTANT :
-    #
-    # M5 n'est JAMAIS utilisé pour rejeter
-    # un setup H4/H1/M15 déjà validé.
-    #
-    # Il sert uniquement à améliorer le score
-    # et la qualité d'entrée.
-
-    # ======================================================================
-    # 20. ZONE FINALE
-    # ======================================================================
-
+    # --------------------------------------------------------
+    # ZONE ENRICHIE
+    # --------------------------------------------------------
     zone = {
-        "low": zone_low,
-        "high": zone_high,
-        "direction": direction,
-        "level_type": (
-            "RESISTANCE"
-            if direction == "BUY"
-            else "SUPPORT"
+        "low": _safe_float(
+            best_zone.get("low")
         ),
-        "key_level": (
-            zone_low
-            + zone_high
-        ) / 2,
+        "high": _safe_float(
+            best_zone.get("high")
+        ),
+        "direction": direction,
+        "level_type": best_zone.get(
+            "level_type",
+            "NONE",
+        ),
+        "key_level": _safe_float(
+            best_zone.get("level")
+        ),
         "breakout_confirmed": True,
         "breakout_index": best_zone.get(
             "breakout_index"
@@ -3350,22 +2178,30 @@ def analyze_market(
         "entry_valid": True,
         "structure_confirmed": True,
         "momentum_valid": bool(
-            momentum.get(
-                "valid"
-            )
+            momentum.get("valid")
         ),
         "breakout_momentum": momentum,
         "liquidity": bool(
-            m5.get(
-                "liquidity_sweep"
-            )
+            liquidity.get("detected")
         ),
+        "liquidity_quality": _safe_float(
+            liquidity.get("quality")
+        ),
+        "order_block": bool(
+            order_block.get("present")
+        ),
+        "fvg": bool(
+            fvg.get("present")
+        ),
+        "premium_discount": premium_discount.get(
+            "zone",
+            "EQUILIBRIUM",
+        ),
+        "support_resistance": support_resistance,
     }
-
-    # ======================================================================
-    # 21. SCORE
-    # ======================================================================
-
+    # --------------------------------------------------------
+    # SCORE FINAL
+    # --------------------------------------------------------
     score = _calculate_final_score(
         symbol=symbol,
         direction=direction,
@@ -3375,358 +2211,179 @@ def analyze_market(
         m5=m5,
         rr=rr,
         zone=zone,
-        momentum=momentum,
+        scenario=scenario,
+        liquidity=liquidity,
+        displacement=displacement,
+        order_block=order_block,
+        fvg=fvg,
+        premium_discount=premium_discount,
+        support_resistance=support_resistance,
+        atr=atr,
     )
-
-    threshold = 60.0
-
-    try:
-
-        if CONFIG is not None:
-
-            threshold = float(
-                getattr(
-                    CONFIG,
-                    "SIGNAL_THRESHOLD",
-                    60.0,
-                )
-            )
-
-    except Exception:
-
-        threshold = 60.0
-
-    logger.info(
-        (
-            "%s SCORE FINAL = %.2f/100 | "
-            "RR=%.2f | seuil=%.2f"
-        ),
-        symbol,
-        score,
-        rr,
-        threshold,
+    result.update(
+        {
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "rr": rr,
+            "score": score,
+        }
     )
-
+    # --------------------------------------------------------
+    # SCORE MINIMUM
+    # --------------------------------------------------------
     if score < threshold:
-
         return _reject_result(
-            symbol,
+            result,
             (
                 f"Score insuffisant : "
-                f"{score:.2f} < "
-                f"{threshold:.2f}"
+                f"{score:.1f}/100 "
+                f"< {threshold:.1f}."
             ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            m5_direction=m5.get(
-                "direction",
-                "NEUTRAL",
-            ),
-            score=score,
-            rr=rr,
-            extra={
-                "zone": zone,
-                "momentum": momentum,
-                "m5_confirmation": m5,
-            },
         )
-
-    # ======================================================================
-    # 22. NEWS
-    # ======================================================================
-
-    news_blocked, news_reason = (
-        _check_news(
-            symbol
-        )
+    # --------------------------------------------------------
+    # NEWS
+    # --------------------------------------------------------
+    news = _check_news(
+        symbol
     )
-
-    if news_blocked:
-
-        return _wait_result(
-            symbol,
+    if news.get("blocked"):
+        return _reject_result(
+            result,
             (
-                news_reason
-                or
-                "Annonce économique importante bloquante."
+                "Signal bloqué par le filtre "
+                f"économique : "
+                f"{news.get('reason', 'événement à risque')}."
             ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            m5_direction=m5.get(
-                "direction",
-                "NEUTRAL",
-            ),
-            extra={
-                "score": score,
-                "rr": rr,
-                "entry": entry,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "zone": zone,
-                "momentum": momentum,
-                "m5_confirmation": m5,
-            },
         )
-
-    # ======================================================================
-    # 23. CONSTRUCTION DU SIGNAL
-    # ======================================================================
-
+    # --------------------------------------------------------
+    # QUALITÉ
+    # --------------------------------------------------------
+    if score >= 90:
+        quality = "A+"
+    elif score >= 80:
+        quality = "A"
+    elif score >= 70:
+        quality = "B"
+    else:
+        quality = "C"
+    # --------------------------------------------------------
+    # BUILD SIGNAL
+    # --------------------------------------------------------
     signal = None
-
     if build_signal is not None:
-
         try:
-
             signal = build_signal(
                 symbol=symbol,
-                trend={
-                    "direction": direction,
-                    "h4": h4_direction,
-                    "h4_direction": h4_direction,
-                    "h4_strength": 1.0,
-                },
-                zone=zone,
-                confirmation=m5,
+                direction=direction,
+                score=score,
                 entry=entry,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                spread_ok=True,
-                session_ok=True,
-                h4_direction=h4_direction,
-                h1_direction=h1_direction,
-                m15_direction=m15_direction,
-            )
-
-        except TypeError:
-
-            try:
-
-                signal = build_signal(
-                    symbol,
-                    {
-                        "direction": direction,
-                        "h4": h4_direction,
-                    },
-                    zone,
-                    m5,
-                    entry,
-                    stop_loss,
-                    take_profit,
-                )
-
-            except Exception as exc:
-
-                logger.error(
-                    (
-                        "SIGNAL %s : "
-                        "construction impossible : %s"
+                rr=rr,
+                risk_percent=_safe_float(
+                    getattr(
+                        CONFIG,
+                        "DEFAULT_RISK_PERCENT",
+                        1.0,
                     ),
-                    symbol,
-                    exc,
-                )
-
-        except Exception as exc:
-
-            logger.error(
-                (
-                    "SIGNAL %s : "
-                    "construction impossible : %s"
+                    1.0,
                 ),
-                symbol,
-                exc,
+                zone=zone,
+                confirmation=m5,
             )
-
-    # ======================================================================
-    # 24. SIGNAL ID
-    # ======================================================================
-
-    signal_id = None
-
-    if signal is not None:
-
-        if isinstance(
-            signal,
-            dict,
-        ):
-
-            signal_id = signal.get(
-                "signal_id"
-            )
-
-        else:
-
-            signal_id = getattr(
-                signal,
-                "signal_id",
-                None,
-            )
-
-    # ======================================================================
-    # 25. ÉCHEC CONSTRUCTION
-    # ======================================================================
-
-    if (
-        build_signal is not None
-        and signal is None
-    ):
-
-        return _reject_result(
-            symbol,
-            (
-                "Setup analytique valide, "
-                "mais construction du signal impossible."
-            ),
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-            m5_direction=m5.get(
-                "direction",
-                "NEUTRAL",
-            ),
-            score=score,
-            rr=rr,
-            extra={
-                "entry": entry,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "zone": zone,
-                "momentum": momentum,
-                "m5_confirmation": m5,
-            },
-        )
-
-    # ======================================================================
-    # 26. SIGNAL FINAL
-    # ======================================================================
-
-    result = {
-        "symbol": symbol,
-        "status": "ACTIVE",
-        "reason": (
-            "Signal validé : "
-            "H4 + H1 + M15 parfaitement alignés, "
-            "zone clé identifiée, breakout confirmé, "
-            "momentum/vitesse validé, retest confirmé, "
-            "rejection confirmée, bougie M15 confirmée, "
-            "RR et score validés."
-        ),
-        "direction": direction,
-        "score": round(
-            score,
-            2,
-        ),
-        "rr": round(
-            rr,
-            4,
-        ),
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "sl": stop_loss,
-        "tp": take_profit,
-        "signal": signal,
-        "signal_id": signal_id,
-        "h4_direction": h4_direction,
-        "h1_direction": h1_direction,
-        "m15_direction": m15_direction,
-        "m5_direction": m5.get(
-            "direction",
-            "NEUTRAL",
-        ),
-        "m5_confirmation": m5,
-        "zone": zone,
-        "momentum": momentum,
-        "atr": atr,
-        "zones_tested": len(
-            zone_results
-        ),
-        "breakout_confirmed": True,
-        "retest_confirmed": True,
-        "rejection_confirmed": True,
-        "candle_confirmation": True,
-        "timestamp": _utc_now().isoformat(),
-    }
-
-    logger.info(
-        (
-            "=================================================="
-        ),
+        except Exception:
+            signal = None
+    # --------------------------------------------------------
+    # RÉSULTAT FINAL
+    # --------------------------------------------------------
+    scenario_type = scenario.get(
+        "type",
+        "RANGE",
     )
-
-    logger.info(
-        (
-            "SIGNAL VALIDE %s | %s | "
-            "H4=%s | H1=%s | M15=%s | "
-            "score=%.2f | RR=%.2f | "
-            "zones=%s | entry=%s | SL=%s | TP=%s"
-        ),
-        symbol,
-        direction,
+    h4_preference = scenario.get(
+        "h4_preference",
         h4_direction,
-        h1_direction,
-        m15_direction,
-        score,
-        rr,
-        len(zone_results),
-        entry,
-        stop_loss,
-        take_profit,
     )
-
-    logger.info(
-        (
-            "=================================================="
-        ),
+    if scenario_type == "COUNTER_TREND":
+        scenario_description = (
+            "contre-tendance H4 : "
+            "structure H1/M15 opposée au biais H4"
+        )
+    elif scenario_type == "CORRECTION":
+        scenario_description = (
+            "correction dans le contexte H4"
+        )
+    elif scenario_type == "POTENTIAL_REVERSAL":
+        scenario_description = (
+            "possible changement de structure"
+        )
+    else:
+        scenario_description = (
+            "continuation / structure directionnelle"
+        )
+    result.update(
+        {
+            "success": True,
+            "status": "ACTIVE",
+            "direction": direction,
+            "quality": quality,
+            "score": round(score, 2),
+            "rr": round(rr, 2),
+            "entry": round(entry, 8),
+            "stop_loss": round(stop_loss, 8),
+            "take_profit": round(take_profit, 8),
+            "scenario": scenario_type,
+            "scenario_description": scenario_description,
+            "h4_preference": h4_preference,
+            "m5_confirmation": m5,
+            "liquidity": liquidity,
+            "displacement": displacement,
+            "order_block": order_block,
+            "fvg": fvg,
+            "premium_discount": premium_discount,
+            "support_resistance": support_resistance,
+            "zone": zone,
+            "signal": signal,
+            "reason": (
+                f"Signal validé : scénario "
+                f"{scenario_type}, biais H4 "
+                f"{h4_preference}, structure H1/M15 "
+                f"exploitable, liquidité/displacement "
+                f"et zone validés, breakout + retest "
+                f"+ rejection + confirmation M15, "
+                f"RR {rr:.2f} et score "
+                f"{score:.1f}/100 validés. "
+                f"M5 utilisé comme confirmation "
+                f"secondaire non bloquante."
+            ),
+        }
     )
-
     return result
-
-
-# ============================================================================
-# ALIASES
-# ============================================================================
-
+# ============================================================
+# ALIASES COMPATIBILITÉ
+# ============================================================
 def analyser_marche(
     symbol: str = "XAU/USD",
     timeframe: str = "M15",
 ) -> Dict[str, Any]:
-
     return analyze_market(
-        symbol
+        symbol=symbol,
+        timeframe=timeframe,
     )
-
-
 def analyser_marche_complet(
     symbol: str = "XAU/USD",
+    timeframe: str = "M15",
 ) -> Dict[str, Any]:
-
     return analyze_market(
-        symbol
+        symbol=symbol,
+        timeframe=timeframe,
     )
-
-
 def run_analysis(
     symbol: str = "XAU/USD",
+    timeframe: str = "M15",
 ) -> Dict[str, Any]:
-
     return analyze_market(
-        symbol
+        symbol=symbol,
+        timeframe=timeframe,
     )
-
-
-# ============================================================================
-# EXPORT
-# ============================================================================
-
-__all__ = [
-    "analyze_market",
-    "analyser_marche",
-    "analyser_marche_complet",
-    "run_analysis",
-]
