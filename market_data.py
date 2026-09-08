@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from threading import Lock
@@ -108,13 +109,6 @@ VALID_TIMEFRAMES = set(
 # CACHE TTL
 # ============================================================
 
-# Temps pendant lequel une donnée est considérée
-# comme suffisamment récente pour être réutilisée.
-#
-# H4  : 8 heures
-# H1  : 2 heures
-# M15 : 30 minutes
-# M5  : 1 minute
 CACHE_TTL_SECONDS = {
     "H4": 8 * 60 * 60,
     "H1": 2 * 60 * 60,
@@ -127,11 +121,6 @@ CACHE_TTL_SECONDS = {
 # CACHE STALE
 # ============================================================
 
-# Une donnée expirée peut exceptionnellement être
-# utilisée comme secours si l'API est temporairement
-# indisponible.
-#
-# On reste volontairement strict.
 STALE_CACHE_MAX_AGE_SECONDS = {
     "H4": 8 * 60 * 60,
     "H1": 2 * 60 * 60,
@@ -142,14 +131,6 @@ STALE_CACHE_MAX_AGE_SECONDS = {
 
 _CACHE_LOCK = Lock()
 
-# key :
-# (SYMBOL, TIMEFRAME, OUTPUTSIZE)
-#
-# value :
-# {
-#     "candles": [...],
-#     "timestamp": float
-# }
 _CANDLE_CACHE: Dict[
     Tuple[str, str, int],
     Dict[str, object],
@@ -263,11 +244,8 @@ def _get_binance_api_key() -> str:
     """
     Récupère éventuellement la clé Binance.
 
-    Les données publiques de marché Binance
+    Les données publiques Binance
     n'exigent pas cette clé.
-
-    Elle est néanmoins supportée pour préparer
-    les futures fonctions d'exécution.
     """
 
     return os.getenv(
@@ -279,8 +257,6 @@ def _get_binance_api_key() -> str:
 def _get_binance_api_secret() -> str:
     """
     Récupère éventuellement le secret Binance.
-
-    Utilisé plus tard pour les opérations privées.
     """
 
     return os.getenv(
@@ -319,7 +295,6 @@ def _normalize_timeframe(
     normalized = timeframe.strip().upper()
 
     if normalized not in VALID_TIMEFRAMES:
-
         raise ValueError(
             f"Timeframe invalide : {timeframe}. "
             f"Valeurs autorisées : "
@@ -376,9 +351,7 @@ def _parse_timestamp(
     )
 
     for fmt in formats:
-
         try:
-
             dt = datetime.strptime(
                 value,
                 fmt,
@@ -444,9 +417,6 @@ def _get_cached_candles(
 ) -> Optional[List[Candle]]:
     """
     Retourne les candles du cache.
-
-    allow_stale=True autorise un cache expiré
-    dans le cadre d'un fallback exceptionnel.
     """
 
     key = _cache_key(
@@ -806,6 +776,7 @@ def _request_twelve_candles(
         try:
 
             with _STATS_LOCK:
+
                 _STATS[
                     "api_requests"
                 ] += 1
@@ -841,6 +812,7 @@ def _request_twelve_candles(
                     retry_seconds = int(
                         retry_after
                     )
+
                 except (
                     TypeError,
                     ValueError,
@@ -1178,9 +1150,6 @@ def _request_binance_candles(
 ) -> List[Candle]:
     """
     Récupère les candles publiques Binance.
-
-    Les endpoints publics de marché ne nécessitent
-    pas de clé API.
     """
 
     timeframe = _normalize_timeframe(
@@ -1206,8 +1175,6 @@ def _request_binance_candles(
         ]
     )
 
-    # Binance limite le nombre de candles
-    # par requête. On protège la valeur.
     limit = min(
         max(
             int(outputsize),
@@ -1284,6 +1251,7 @@ def _request_binance_candles(
                     retry_seconds = int(
                         retry_after
                     )
+
                 except (
                     TypeError,
                     ValueError,
@@ -1337,6 +1305,7 @@ def _request_binance_candles(
             ):
 
                 try:
+
                     error_data = (
                         response.json()
                     )
@@ -1347,6 +1316,7 @@ def _request_binance_candles(
                     )
 
                 except Exception:
+
                     message = response.text[
                         :300
                     ]
@@ -1587,9 +1557,6 @@ def _request_market_candles(
 
         except Exception:
 
-            # Binance indisponible :
-            # Twelve Data devient le secours.
-
             with _STATS_LOCK:
                 _STATS[
                     "fallback_to_twelve"
@@ -1772,7 +1739,6 @@ def get_market_data_stats(
     """
 
     with _STATS_LOCK:
-
         return dict(_STATS)
 
 
@@ -1789,3 +1755,28 @@ def reset_market_data_stats() -> None:
 
         for key in _STATS:
             _STATS[key] = 0
+
+
+# ============================================================
+# OBJET GLOBAL DE COMPATIBILITÉ
+# ============================================================
+
+"""
+Certains modules de NOVA TRADE AI utilisent :
+
+    from market_data import market_data
+
+On expose donc le module lui-même sous le nom
+"market_data".
+
+Ainsi :
+
+    market_data.get_candles(...)
+    market_data.get_latest_price(...)
+    market_data.get_price(...)
+    market_data.get_market_data_stats(...)
+
+fonctionnent directement.
+"""
+
+market_data = sys.modules[__name__]
