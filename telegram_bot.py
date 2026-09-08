@@ -15,13 +15,14 @@ IMPORTANT :
 import asyncio
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
 )
+
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,7 +30,6 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from analyse import analyze_market
 from config import CONFIG
 
 
@@ -60,7 +60,9 @@ LOGGER = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN"
+)
 
 if not TELEGRAM_BOT_TOKEN:
     LOGGER.warning(
@@ -111,6 +113,10 @@ def get_default_symbol():
     except AttributeError:
         return "XAU/USD"
 
+
+# ============================================================
+# VALIDATION SIGNAL
+# ============================================================
 
 def is_valid_automatic_signal(
     result: Dict[str, Any],
@@ -208,7 +214,14 @@ async def run_market_analysis(
     symbol: str,
 ) -> Dict[str, Any]:
     """
-    Lance l'analyse du marché sans bloquer Telegram.
+    Lance l'analyse du marché.
+
+    IMPORTANT :
+    analyse.py est importé uniquement lorsqu'une analyse
+    est réellement demandée.
+
+    Cela permet au bot Telegram de démarrer indépendamment
+    du superviseur économique.
     """
 
     global last_analysis
@@ -216,6 +229,10 @@ async def run_market_analysis(
     async with analysis_lock:
 
         try:
+
+            # Import différé volontaire.
+            from analyse import analyze_market
+
             result = await asyncio.to_thread(
                 analyze_market,
                 symbol,
@@ -274,7 +291,10 @@ def format_analysis(
 
     quality = result.get(
         "quality",
-        result.get("qualite", "N/A"),
+        result.get(
+            "qualite",
+            "N/A",
+        ),
     )
 
     status = result.get(
@@ -483,7 +503,6 @@ async def test_news_command(
     """
     Test isolé du superviseur économique.
 
-    IMPORTANT :
     Cette commande ne touche PAS au moteur de trading.
     """
 
@@ -564,12 +583,13 @@ async def test_news_command(
     )
 
     # --------------------------------------------------------
-    # Affichage de quelques annonces HIGH
+    # Affichage des annonces HIGH
     # --------------------------------------------------------
 
     if high > 0:
 
         try:
+
             events = await asyncio.to_thread(
                 get_high_impact_events
             )
@@ -583,12 +603,12 @@ async def test_news_command(
 
             return
 
-        # Limite volontaire pour éviter un message Telegram énorme.
         events = events[:5]
 
         for event in events:
 
             try:
+
                 formatted = format_economic_event(
                     event,
                     include_ai_explanation=False,
@@ -803,11 +823,17 @@ async def post_init(
 
 
 # ============================================================
-# MAIN
+# RUN BOT
 # ============================================================
 
-def main():
-    """Point d'entrée principal."""
+def run_bot():
+    """
+    Point d'entrée utilisé par main.py.
+
+    main.py appelle :
+        from telegram_bot import run_bot
+        run_bot()
+    """
 
     if not TELEGRAM_BOT_TOKEN:
 
@@ -892,8 +918,20 @@ def main():
 
 
 # ============================================================
-# EXECUTION
+# COMPATIBILITÉ
+# ============================================================
+
+def main():
+    """
+    Alias de compatibilité.
+    """
+
+    run_bot()
+
+
+# ============================================================
+# EXECUTION DIRECTE
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+    run_bot()
