@@ -55,14 +55,39 @@ WEIGHTS = {
 # TOTAL
 # ============================================================
 
-TOTAL_WEIGHT = sum(
-    WEIGHTS.values()
-)
+TOTAL_WEIGHT = sum(WEIGHTS.values())
 
 assert TOTAL_WEIGHT == 100, (
     f"Les poids du score doivent totaliser 100. "
     f"Total actuel : {TOTAL_WEIGHT}"
 )
+
+
+# ============================================================
+# OUTILS INTERNES
+# ============================================================
+
+def _clamp(
+    value: float,
+    minimum: float = 0.0,
+    maximum: float = 100.0,
+) -> float:
+    """
+    Limite une valeur entre minimum et maximum.
+    """
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return minimum
+
+    return min(
+        maximum,
+        max(
+            minimum,
+            value,
+        ),
+    )
 
 
 # ============================================================
@@ -80,50 +105,67 @@ def calculate_score(
     """
     Calcule le score final sur 100.
 
-    H4/H1/M15 représentent la validation principale.
+    H4 / H1 / M15 représentent la validation principale.
 
     M5 est secondaire :
     il peut augmenter le score mais ne constitue
     jamais une condition obligatoire.
+
+    IMPORTANT :
+    Le score ne remplace PAS la validation du setup.
+
+    Le pipeline doit d'abord vérifier :
+        breakout
+        retest
+        rejection
+        candle confirmation
+        proximité de l'entrée
+
+    Le score sert ensuite à qualifier le setup.
     """
 
     score = 0.0
 
     # ========================================================
-    # H4
+    # H4 — TENDANCE GLOBALE
     # ========================================================
 
-    if trend.h4 == zone.direction:
-        score += WEIGHTS["H4"]
+    if trend is not None:
+        if trend.h4 == zone.direction:
+            score += WEIGHTS["H4"]
 
     # ========================================================
-    # H1
+    # H1 — STRUCTURE / ZONE
     # ========================================================
+
+    h1_strength = _clamp(
+        getattr(
+            zone,
+            "h1_strength",
+            0.0,
+        )
+    )
 
     score += (
-        min(
-            100.0,
-            max(
-                0.0,
-                zone.h1_strength,
-            ),
-        )
+        h1_strength
         / 100.0
         * WEIGHTS["H1_ZONE"]
     )
 
     # ========================================================
-    # M15
+    # M15 — CONTEXTE / ZONE
     # ========================================================
 
-    score += (
-        min(
-            100.0,
-            max(
-                0.0,
-                zone.m15_strength,
-            ),
+    m15_strength = _clamp(
+        getattr(
+            zone,
+            "m15_strength",
+            0.0,
         )
+    )
+
+    score += (
+        m15_strength
         / 100.0
         * WEIGHTS["M15_ZONE"]
     )
@@ -134,16 +176,32 @@ def calculate_score(
 
     zone_quality = 0.0
 
-    if zone.structure_confirmed:
+    if getattr(
+        zone,
+        "structure_confirmed",
+        False,
+    ):
         zone_quality += 4.0
 
-    if zone.liquidity_nearby:
+    if getattr(
+        zone,
+        "liquidity_nearby",
+        False,
+    ):
         zone_quality += 3.0
 
-    if zone.order_block:
+    if getattr(
+        zone,
+        "order_block",
+        False,
+    ):
         zone_quality += 2.0
 
-    if zone.fvg:
+    if getattr(
+        zone,
+        "fvg",
+        False,
+    ):
         zone_quality += 1.0
 
     score += min(
@@ -157,8 +215,14 @@ def calculate_score(
     # BONUS UNIQUEMENT
     # ========================================================
 
-    if confirmation.retest:
-        score += WEIGHTS["M5_RETEST"]
+    if confirmation is not None:
+
+        if getattr(
+            confirmation,
+            "retest",
+            False,
+        ):
+            score += WEIGHTS["M5_RETEST"]
 
     # ========================================================
     # M5 CANDLE
@@ -166,8 +230,14 @@ def calculate_score(
     # BONUS UNIQUEMENT
     # ========================================================
 
-    if confirmation.candle_confirmation:
-        score += WEIGHTS["M5_CANDLE"]
+    if confirmation is not None:
+
+        if getattr(
+            confirmation,
+            "candle_confirmation",
+            False,
+        ):
+            score += WEIGHTS["M5_CANDLE"]
 
     # ========================================================
     # LIQUIDITY SWEEP
@@ -175,12 +245,47 @@ def calculate_score(
     # BONUS UNIQUEMENT
     # ========================================================
 
-    if confirmation.liquidity_sweep:
-        score += WEIGHTS["LIQUIDITY_SWEEP"]
+    if confirmation is not None:
+
+        liquidity_sweep = (
+            getattr(
+                confirmation,
+                "liquidity_sweep",
+                False,
+            )
+        )
+
+        # Compatibilité avec certaines
+        # anciennes structures de Confirmation.
+        if not liquidity_sweep:
+
+            liquidity_sweep = (
+                getattr(
+                    zone,
+                    "liquidity_nearby",
+                    False,
+                )
+                and getattr(
+                    confirmation,
+                    "micro_bos",
+                    False,
+                )
+            )
+
+        if liquidity_sweep:
+            score += WEIGHTS["LIQUIDITY_SWEEP"]
 
     # ========================================================
     # RR
     # ========================================================
+
+    try:
+        rr = float(rr)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        rr = 0.0
 
     if rr >= 2.0:
 
@@ -215,19 +320,142 @@ def calculate_score(
     # ========================================================
 
     return round(
-        min(
+        _clamp(
+            score,
+            0.0,
             100.0,
-            max(
-                0.0,
-                score,
-            ),
         ),
         2,
     )
 
 
 # ============================================================
-# VALIDATION SEUIL
+# CLASSE SCORE ENGINE
+# ============================================================
+
+class ScoreEngine:
+    """
+    Interface objet utilisée par analysis/pipeline.py.
+
+    Les fonctions calculate_score(), should_send_signal()
+    et score_label() restent également disponibles pour
+    assurer la compatibilité avec le reste du projet.
+    """
+
+    def __init__(
+        self,
+        threshold: float = 60.0,
+    ) -> None:
+
+        try:
+            self.threshold = float(
+                threshold
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            self.threshold = 60.0
+
+    # ========================================================
+    # CALCUL
+    # ========================================================
+
+    def calculate_score(
+        self,
+        trend: TrendContext,
+        zone: Zone,
+        confirmation: Confirmation,
+        rr: float,
+        spread_ok: bool = True,
+        session_ok: bool = True,
+        **kwargs,
+    ) -> float:
+        """
+        Calcule le score du setup.
+        """
+
+        return calculate_score(
+            trend=trend,
+            zone=zone,
+            confirmation=confirmation,
+            rr=rr,
+            spread_ok=spread_ok,
+            session_ok=session_ok,
+        )
+
+    # ========================================================
+    # ALIAS calculate()
+    # ========================================================
+
+    def calculate(
+        self,
+        trend: TrendContext,
+        zone: Zone,
+        confirmation: Confirmation,
+        rr: float,
+        spread_ok: bool = True,
+        session_ok: bool = True,
+        **kwargs,
+    ) -> float:
+        """
+        Alias de compatibilité.
+
+        Certains modules peuvent appeler :
+            engine.calculate(...)
+
+        au lieu de :
+            engine.calculate_score(...)
+        """
+
+        return self.calculate_score(
+            trend=trend,
+            zone=zone,
+            confirmation=confirmation,
+            rr=rr,
+            spread_ok=spread_ok,
+            session_ok=session_ok,
+            **kwargs,
+        )
+
+    # ========================================================
+    # VALIDATION SEUIL
+    # ========================================================
+
+    def should_send_signal(
+        self,
+        score: float,
+        threshold: float | None = None,
+    ) -> bool:
+        """
+        Vérifie si le score atteint le seuil.
+        """
+
+        if threshold is None:
+            threshold = self.threshold
+
+        return should_send_signal(
+            score,
+            threshold,
+        )
+
+    # ========================================================
+    # LABEL
+    # ========================================================
+
+    def score_label(
+        self,
+        score: float,
+    ) -> str:
+        """
+        Retourne la qualité du score.
+        """
+
+        return score_label(score)
+
+
+# ============================================================
+# VALIDATION SEUIL — FONCTION
 # ============================================================
 
 def should_send_signal(
