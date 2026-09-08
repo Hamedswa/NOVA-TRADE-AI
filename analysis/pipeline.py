@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -78,13 +78,19 @@ except Exception:
 try:
     from risk.risk_manager import calculate_rr
 except Exception:
+
     def calculate_rr(
         entry: float,
         stop_loss: float,
         take_profit: float,
     ) -> float:
-        risk = abs(float(entry) - float(stop_loss))
-        reward = abs(float(take_profit) - float(entry))
+        risk = abs(
+            float(entry) - float(stop_loss)
+        )
+
+        reward = abs(
+            float(take_profit) - float(entry)
+        )
 
         if risk <= 0:
             return 0.0
@@ -124,6 +130,8 @@ TIMEFRAMES: Tuple[str, ...] = (
     "M5",
 )
 
+# IMPORTANT :
+# D1 est volontairement absent.
 PRIMARY_TIMEFRAMES: Tuple[str, ...] = (
     "H4",
     "H1",
@@ -149,10 +157,14 @@ DIRECTIONS = {
 # HELPERS GÉNÉRAUX
 # ---------------------------------------------------------------------------
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(
+    value: Any,
+    default: float = 0.0,
+) -> float:
     """
     Conversion sécurisée en float.
     """
+
     try:
         number = float(value)
 
@@ -165,14 +177,19 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _normalize_direction(value: Any) -> str:
+def _normalize_direction(
+    value: Any,
+) -> str:
     """
     Normalise BUY / SELL / NEUTRAL.
     """
+
     if value is None:
         return "NEUTRAL"
 
-    text = str(value).strip().upper()
+    text = str(
+        value
+    ).strip().upper()
 
     aliases = {
         "LONG": "BUY",
@@ -186,7 +203,10 @@ def _normalize_direction(value: Any) -> str:
         "N/A": "NEUTRAL",
     }
 
-    text = aliases.get(text, text)
+    text = aliases.get(
+        text,
+        text,
+    )
 
     if text not in DIRECTIONS:
         return "NEUTRAL"
@@ -194,20 +214,28 @@ def _normalize_direction(value: Any) -> str:
     return text
 
 
-def _is_crypto_symbol(symbol: str) -> bool:
+def _is_crypto_symbol(
+    symbol: str,
+) -> bool:
     """
-    Retourne True si le symbole est un actif crypto.
+    Retourne True si le symbole est une crypto.
 
-    Les cryptos utilisent Coinbase et ne doivent donc
-    pas être bloquées par le cooldown Twelve Data.
+    Les cryptos utilisent leur fournisseur crypto
+    et ne doivent jamais être bloquées par
+    le cooldown Twelve Data.
     """
-    normalized = str(symbol or "").strip().upper()
+
+    normalized = str(
+        symbol or ""
+    ).strip().upper()
 
     return normalized in CRYPTO_SYMBOLS
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(
+        timezone.utc
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -216,21 +244,28 @@ def _utc_now() -> datetime:
 
 def _get_twelve_data_status() -> Dict[str, Any]:
     """
-    Récupère l'état du fournisseur Twelve Data sans casser
-    le pipeline si la fonction n'existe pas encore.
+    Récupère l'état de Twelve Data de façon tolérante.
 
-    market_data.get_provider_status() peut retourner :
+    Formats supportés :
+
         {
-            "twelve_data": {...}
+            "twelve_data": {
+                "available": False,
+                "cooldown": 60
+            }
         }
 
-    ou directement :
+    ou :
+
         {
             "available": False,
-            "cooldown": 52
+            "cooldown": 60
         }
 
-    Cette fonction reste volontairement tolérante.
+    ou API séparée :
+
+        twelve_data_available()
+        get_twelve_data_cooldown()
     """
 
     if market_data is None:
@@ -240,6 +275,7 @@ def _get_twelve_data_status() -> Dict[str, Any]:
         }
 
     try:
+
         getter = getattr(
             market_data,
             "get_provider_status",
@@ -247,16 +283,23 @@ def _get_twelve_data_status() -> Dict[str, Any]:
         )
 
         if callable(getter):
+
             status = getter()
 
-            if isinstance(status, dict):
+            if isinstance(
+                status,
+                dict,
+            ):
 
                 twelve = status.get(
                     "twelve_data",
                     status,
                 )
 
-                if isinstance(twelve, dict):
+                if isinstance(
+                    twelve,
+                    dict,
+                ):
 
                     available = twelve.get(
                         "available",
@@ -275,7 +318,9 @@ def _get_twelve_data_status() -> Dict[str, Any]:
                     )
 
                     return {
-                        "available": bool(available),
+                        "available": bool(
+                            available
+                        ),
                         "cooldown": max(
                             0,
                             int(
@@ -287,14 +332,20 @@ def _get_twelve_data_status() -> Dict[str, Any]:
                         ),
                     }
 
-        # Nouvelle API éventuelle
+        # ---------------------------------------------------------------
+        # API ALTERNATIVE
+        # ---------------------------------------------------------------
+
         available_fn = getattr(
             market_data,
             "twelve_data_available",
             None,
         )
 
-        if callable(available_fn):
+        if callable(
+            available_fn
+        ):
+
             available = bool(
                 available_fn()
             )
@@ -307,7 +358,10 @@ def _get_twelve_data_status() -> Dict[str, Any]:
                 None,
             )
 
-            if callable(cooldown_fn):
+            if callable(
+                cooldown_fn
+            ):
+
                 cooldown = max(
                     0,
                     int(
@@ -324,46 +378,55 @@ def _get_twelve_data_status() -> Dict[str, Any]:
             }
 
     except Exception as exc:
+
         logger.debug(
             "Impossible de lire le statut Twelve Data : %s",
             exc,
         )
 
-    # IMPORTANT :
-    # Une impossibilité de lire le statut ne doit pas
-    # bloquer l'analyse.
+    # Si le statut ne peut pas être lu,
+    # on ne bloque pas artificiellement.
     return {
         "available": True,
         "cooldown": 0,
     }
 
 
-def _twelve_data_ready(symbol: str) -> Tuple[bool, str]:
+def _twelve_data_ready(
+    symbol: str,
+) -> Tuple[bool, str]:
     """
-    Vérifie si Twelve Data peut être utilisé.
+    Vérifie si Twelve Data est utilisable.
 
-    Pour les cryptos :
+    Crypto :
         toujours True ici.
 
-    Pour Forex / XAU :
-        le cooldown Twelve Data bloque temporairement
-        l'analyse afin d'éviter des appels inutiles.
+    Forex / XAU :
+        respecte le cooldown Twelve Data.
     """
 
-    if _is_crypto_symbol(symbol):
+    if _is_crypto_symbol(
+        symbol
+    ):
         return True, ""
 
     status = _get_twelve_data_status()
 
     available = bool(
-        status.get("available", True)
+        status.get(
+            "available",
+            True,
+        )
     )
 
     cooldown = max(
         0,
         int(
             _safe_float(
-                status.get("cooldown", 0),
+                status.get(
+                    "cooldown",
+                    0,
+                ),
                 0,
             )
         ),
@@ -372,11 +435,14 @@ def _twelve_data_ready(symbol: str) -> Tuple[bool, str]:
     if not available:
 
         if cooldown > 0:
+
             reason = (
                 "Twelve Data temporairement limité "
                 f"— cooldown {cooldown}s"
             )
+
         else:
+
             reason = (
                 "Twelve Data temporairement indisponible"
             )
@@ -397,16 +463,28 @@ def _extract_candles(
     """
     Récupère les chandeliers via market_data.
 
-    Cette fonction accepte plusieurs formats afin de rester
-    compatible avec les différentes versions du data layer.
+    IMPORTANT :
+
+    Si Twelve Data vient de déclencher un HTTP 429,
+    cette fonction vérifie immédiatement le cooldown.
+
+    Elle ne doit donc PAS produire :
+
+        ERROR | DATA EUR/USD H4 : 0 chandelier
+
+    lorsqu'il s'agit simplement d'un rate-limit.
+
+    Les erreurs réelles restent journalisées.
     """
 
     if market_data is None:
+
         logger.error(
             "DATA %s %s : market_data indisponible",
             symbol,
             timeframe,
         )
+
         return []
 
     try:
@@ -417,83 +495,248 @@ def _extract_candles(
             None,
         )
 
-        if not callable(getter):
+        if not callable(
+            getter
+        ):
+
             logger.error(
                 "DATA %s %s : get_candles indisponible",
                 symbol,
                 timeframe,
             )
+
             return []
 
         candles = None
 
-        # Format principal actuel
+        # ---------------------------------------------------------------
+        # FORMAT PRINCIPAL
+        # ---------------------------------------------------------------
+
         try:
+
             candles = getter(
                 symbol,
                 timeframe,
             )
+
         except TypeError:
             pass
 
-        # Variante avec keyword
+        # ---------------------------------------------------------------
+        # FORMAT KEYWORD
+        # ---------------------------------------------------------------
+
         if candles is None:
+
             try:
+
                 candles = getter(
                     symbol=symbol,
                     timeframe=timeframe,
                 )
+
             except TypeError:
                 pass
 
-        # Variante interval
+        # ---------------------------------------------------------------
+        # FORMAT INTERVAL
+        # ---------------------------------------------------------------
+
         if candles is None:
+
             try:
+
                 candles = getter(
                     symbol=symbol,
                     interval=timeframe,
                 )
+
             except TypeError:
                 pass
 
+        # ---------------------------------------------------------------
+        # AUCUNE DONNÉE
+        # ---------------------------------------------------------------
+
         if candles is None:
-            logger.error(
-                "DATA %s %s : aucune donnée",
+
+            # IMPORTANT :
+            # Recheck après l'appel.
+            #
+            # Un HTTP 429 peut avoir déclenché
+            # le cooldown pendant get_candles().
+
+            if not _is_crypto_symbol(
+                symbol
+            ):
+
+                ready, reason = (
+                    _twelve_data_ready(
+                        symbol
+                    )
+                )
+
+                if not ready:
+
+                    logger.warning(
+                        "%s",
+                        reason,
+                    )
+
+                    return []
+
+            logger.warning(
+                "DATA %s %s : aucune donnée disponible.",
                 symbol,
                 timeframe,
             )
+
             return []
 
-        if isinstance(candles, dict):
+        # ---------------------------------------------------------------
+        # FORMAT DICT
+        # ---------------------------------------------------------------
 
-            # Formats possibles
+        if isinstance(
+            candles,
+            dict,
+        ):
+
+            found = False
+
             for key in (
                 "candles",
                 "data",
                 "values",
                 "results",
             ):
-                value = candles.get(key)
 
-                if isinstance(value, list):
+                value = candles.get(
+                    key
+                )
+
+                if isinstance(
+                    value,
+                    list,
+                ):
+
                     candles = value
+                    found = True
                     break
 
-        if not isinstance(candles, (list, tuple)):
-            return []
+            # Si aucun format connu n'a été trouvé,
+            # ne pas considérer arbitrairement le dict
+            # comme une liste de chandeliers.
+            if not found:
 
-        result = list(candles)
+                logger.warning(
+                    (
+                        "DATA %s %s : "
+                        "réponse fournisseur sans chandeliers."
+                    ),
+                    symbol,
+                    timeframe,
+                )
 
-        if not result:
-            logger.error(
-                "DATA %s %s : 0 chandelier",
+                return []
+
+        # ---------------------------------------------------------------
+        # FORMAT INVALIDE
+        # ---------------------------------------------------------------
+
+        if not isinstance(
+            candles,
+            (list, tuple),
+        ):
+
+            logger.warning(
+                (
+                    "DATA %s %s : "
+                    "format de données invalide."
+                ),
                 symbol,
                 timeframe,
             )
 
+            return []
+
+        result = list(
+            candles
+        )
+
+        # ---------------------------------------------------------------
+        # LISTE VIDE
+        # ---------------------------------------------------------------
+
+        if not result:
+
+            # Recheck du provider AVANT de journaliser.
+            #
+            # Si le provider vient de passer en cooldown,
+            # ce n'est pas une erreur de données.
+
+            if not _is_crypto_symbol(
+                symbol
+            ):
+
+                ready, reason = (
+                    _twelve_data_ready(
+                        symbol
+                    )
+                )
+
+                if not ready:
+
+                    logger.warning(
+                        "%s",
+                        reason,
+                    )
+
+                    return []
+
+            logger.warning(
+                "DATA %s %s : aucune donnée disponible.",
+                symbol,
+                timeframe,
+            )
+
+            return []
+
+        # ---------------------------------------------------------------
+        # DONNÉES OK
+        # ---------------------------------------------------------------
+
         return result
 
     except Exception as exc:
+
+        # ---------------------------------------------------------------
+        # CAS IMPORTANT : HTTP 429 / COOLDOWN
+        # ---------------------------------------------------------------
+
+        if not _is_crypto_symbol(
+            symbol
+        ):
+
+            ready, reason = (
+                _twelve_data_ready(
+                    symbol
+                )
+            )
+
+            if not ready:
+
+                logger.warning(
+                    "%s",
+                    reason,
+                )
+
+                return []
+
+        # ---------------------------------------------------------------
+        # VRAIE ERREUR
+        # ---------------------------------------------------------------
 
         logger.error(
             "DATA %s %s erreur : %s",
@@ -517,7 +760,10 @@ def _validate_candles(
         return False
 
     try:
-        count = len(candles)
+        count = len(
+            candles
+        )
+
     except Exception:
         return False
 
@@ -534,7 +780,7 @@ def _candle_value(
     default: float = 0.0,
 ) -> float:
     """
-    Extrait une valeur OHLC d'un chandelier dict ou objet.
+    Extrait une valeur OHLC depuis un dict ou un objet.
     """
 
     if candle is None:
@@ -542,16 +788,23 @@ def _candle_value(
 
     try:
 
-        if isinstance(candle, dict):
+        if isinstance(
+            candle,
+            dict,
+        ):
 
-            value = candle.get(key)
+            value = candle.get(
+                key
+            )
 
             if value is None:
+
                 value = candle.get(
                     key.lower()
                 )
 
             if value is None:
+
                 value = candle.get(
                     key.upper()
                 )
@@ -576,28 +829,36 @@ def _candle_value(
         return default
 
 
-def _close(candle: Any) -> float:
+def _close(
+    candle: Any,
+) -> float:
     return _candle_value(
         candle,
         "close",
     )
 
 
-def _open(candle: Any) -> float:
+def _open(
+    candle: Any,
+) -> float:
     return _candle_value(
         candle,
         "open",
     )
 
 
-def _high(candle: Any) -> float:
+def _high(
+    candle: Any,
+) -> float:
     return _candle_value(
         candle,
         "high",
     )
 
 
-def _low(candle: Any) -> float:
+def _low(
+    candle: Any,
+) -> float:
     return _candle_value(
         candle,
         "low",
@@ -613,7 +874,7 @@ def _calculate_atr(
     period: int = 14,
 ) -> float:
     """
-    ATR simple / robuste.
+    ATR robuste.
     """
 
     if not candles:
@@ -628,33 +889,55 @@ def _calculate_atr(
 
     for candle in candles:
 
-        high = _high(candle)
-        low = _low(candle)
-        close = _close(candle)
+        high = _high(
+            candle
+        )
+
+        low = _low(
+            candle
+        )
+
+        close = _close(
+            candle
+        )
 
         if high <= 0 or low <= 0:
             continue
 
         if previous_close is None:
+
             tr = high - low
+
         else:
+
             tr = max(
                 high - low,
-                abs(high - previous_close),
-                abs(low - previous_close),
+                abs(
+                    high - previous_close
+                ),
+                abs(
+                    low - previous_close
+                ),
             )
 
         if tr >= 0:
-            true_ranges.append(tr)
+            true_ranges.append(
+                tr
+            )
 
         previous_close = close
 
     if not true_ranges:
         return 0.0
 
-    values = true_ranges[-period:]
+    values = true_ranges[
+        -period:
+    ]
 
-    return sum(values) / len(values)
+    return (
+        sum(values)
+        / len(values)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +951,9 @@ def _swing_highs(
 
     highs: List[float] = []
 
-    if len(candles) < (lookback * 2 + 1):
+    if len(candles) < (
+        lookback * 2 + 1
+    ):
         return highs
 
     for i in range(
@@ -693,12 +978,17 @@ def _swing_highs(
             if j == i:
                 continue
 
-            if _high(candles[j]) >= current:
+            if _high(
+                candles[j]
+            ) >= current:
+
                 is_high = False
                 break
 
         if is_high:
-            highs.append(current)
+            highs.append(
+                current
+            )
 
     return highs
 
@@ -710,7 +1000,9 @@ def _swing_lows(
 
     lows: List[float] = []
 
-    if len(candles) < (lookback * 2 + 1):
+    if len(candles) < (
+        lookback * 2 + 1
+    ):
         return lows
 
     for i in range(
@@ -735,12 +1027,17 @@ def _swing_lows(
             if j == i:
                 continue
 
-            if _low(candles[j]) <= current:
+            if _low(
+                candles[j]
+            ) <= current:
+
                 is_low = False
                 break
 
         if is_low:
-            lows.append(current)
+            lows.append(
+                current
+            )
 
     return lows
 
@@ -753,13 +1050,13 @@ def _structure_direction(
     candles: Sequence[Any],
 ) -> str:
     """
-    Détermine une direction structurelle simple.
+    Détermine une direction structurelle.
 
     BUY :
-        derniers swings = HH / HL
+        HH + HL
 
     SELL :
-        derniers swings = LH / LL
+        LH + LL
 
     Sinon :
         NEUTRAL
@@ -778,7 +1075,10 @@ def _structure_direction(
         lookback=2,
     )
 
-    if len(highs) < 2 or len(lows) < 2:
+    if len(highs) < 2:
+        return "NEUTRAL"
+
+    if len(lows) < 2:
         return "NEUTRAL"
 
     last_high = highs[-1]
@@ -812,14 +1112,14 @@ def _primary_alignment(
     m15_direction: str,
 ) -> str:
     """
-    Règle fondamentale NOVA TRADE AI :
+    RÈGLE PRINCIPALE NOVA TRADE AI :
 
         H4 + H1 + M15
         doivent être parfaitement alignés.
 
-    D1 n'est jamais utilisé.
+    D1 n'est pas utilisé.
 
-    M5 n'intervient pas ici.
+    M5 n'intervient jamais dans cette validation.
     """
 
     h4 = _normalize_direction(
@@ -858,7 +1158,7 @@ def _find_key_level(
     direction: str,
 ) -> Tuple[float, float]:
     """
-    Détermine une zone clé simple à partir des derniers swings.
+    Détermine une zone clé à partir des swings récents.
 
     Retour :
         (low, high)
@@ -871,7 +1171,9 @@ def _find_key_level(
     if not candles:
         return 0.0, 0.0
 
-    recent = list(candles)[-50:]
+    recent = list(
+        candles
+    )[-50:]
 
     highs = [
         _high(c)
@@ -890,11 +1192,18 @@ def _find_key_level(
 
     if direction == "BUY":
 
+        swing_highs = _swing_highs(
+            recent,
+            lookback=2,
+        )
+
+        candidates = (
+            swing_highs
+            or highs[-5:]
+        )
+
         level = max(
-            _swing_highs(
-                recent,
-                lookback=2,
-            ) or highs[-5:]
+            candidates
         )
 
         return (
@@ -904,11 +1213,18 @@ def _find_key_level(
 
     if direction == "SELL":
 
+        swing_lows = _swing_lows(
+            recent,
+            lookback=2,
+        )
+
+        candidates = (
+            swing_lows
+            or lows[-5:]
+        )
+
         level = min(
-            _swing_lows(
-                recent,
-                lookback=2,
-            ) or lows[-5:]
+            candidates
         )
 
         return (
@@ -940,19 +1256,23 @@ def _breakout_confirmed(
     if level_low <= 0 or level_high <= 0:
         return False
 
-    recent = list(candles)[-5:]
+    recent = list(
+        candles
+    )[-5:]
 
     if direction == "BUY":
 
         return any(
-            _close(candle) > level_high
+            _close(candle)
+            > level_high
             for candle in recent
         )
 
     if direction == "SELL":
 
         return any(
-            _close(candle) < level_low
+            _close(candle)
+            < level_low
             for candle in recent
         )
 
@@ -980,31 +1300,44 @@ def _retest_confirmed(
     if level_low <= 0 or level_high <= 0:
         return False
 
-    recent = list(candles)[-8:]
+    recent = list(
+        candles
+    )[-8:]
 
     tolerance = max(
-        abs(level_high - level_low) * 1.5,
+        abs(
+            level_high - level_low
+        ) * 1.5,
         1e-8,
     )
 
     for candle in recent:
 
-        high = _high(candle)
-        low = _low(candle)
+        high = _high(
+            candle
+        )
+
+        low = _low(
+            candle
+        )
 
         if direction == "BUY":
 
             if (
-                low <= level_high + tolerance
-                and high >= level_low - tolerance
+                low
+                <= level_high + tolerance
+                and high
+                >= level_low - tolerance
             ):
                 return True
 
         elif direction == "SELL":
 
             if (
-                high >= level_low - tolerance
-                and low <= level_high + tolerance
+                high
+                >= level_low - tolerance
+                and low
+                <= level_high + tolerance
             ):
                 return True
 
@@ -1027,12 +1360,25 @@ def _rejection_confirmed(
     if not candles:
         return False
 
-    candle = list(candles)[-1]
+    candle = list(
+        candles
+    )[-1]
 
-    open_price = _open(candle)
-    close_price = _close(candle)
-    high = _high(candle)
-    low = _low(candle)
+    open_price = _open(
+        candle
+    )
+
+    close_price = _close(
+        candle
+    )
+
+    high = _high(
+        candle
+    )
+
+    low = _low(
+        candle
+    )
 
     body = abs(
         close_price - open_price
@@ -1040,7 +1386,8 @@ def _rejection_confirmed(
 
     upper_wick = max(
         0.0,
-        high - max(
+        high
+        - max(
             open_price,
             close_price,
         ),
@@ -1051,7 +1398,8 @@ def _rejection_confirmed(
         min(
             open_price,
             close_price,
-        ) - low,
+        )
+        - low,
     )
 
     if direction == "BUY":
@@ -1087,14 +1435,29 @@ def _candle_confirmation(
     if not candles:
         return False
 
-    candle = list(candles)[-1]
+    candle = list(
+        candles
+    )[-1]
 
-    open_price = _open(candle)
-    close_price = _close(candle)
-    high = _high(candle)
-    low = _low(candle)
+    open_price = _open(
+        candle
+    )
 
-    candle_range = high - low
+    close_price = _close(
+        candle
+    )
+
+    high = _high(
+        candle
+    )
+
+    low = _low(
+        candle
+    )
+
+    candle_range = (
+        high - low
+    )
 
     if candle_range <= 0:
         return False
@@ -1103,7 +1466,9 @@ def _candle_confirmation(
         close_price - open_price
     )
 
-    body_ratio = body / candle_range
+    body_ratio = (
+        body / candle_range
+    )
 
     if direction == "BUY":
 
@@ -1131,11 +1496,11 @@ def _m5_confirmation(
     direction: str,
 ) -> Dict[str, Any]:
     """
-    M5 est volontairement NON BLOQUANT.
+    M5 est NON BLOQUANT.
 
-    Il peut améliorer la qualité du setup,
-    mais ne peut jamais annuler un alignement
-    H4 + H1 + M15 valide.
+    Il peut améliorer le score,
+    mais ne peut jamais annuler un setup
+    H4 + H1 + M15 parfaitement aligné.
     """
 
     direction = _normalize_direction(
@@ -1143,6 +1508,7 @@ def _m5_confirmation(
     )
 
     if not candles:
+
         return {
             "valid": False,
             "direction": "NEUTRAL",
@@ -1171,7 +1537,9 @@ def _m5_confirmation(
         )
     )
 
-    recent = list(candles)[-5:]
+    recent = list(
+        candles
+    )[-5:]
 
     micro_bos = (
         m5_direction == direction
@@ -1195,7 +1563,10 @@ def _m5_confirmation(
 
         current = recent[-1]
 
-        if direction == "BUY" and previous_lows:
+        if (
+            direction == "BUY"
+            and previous_lows
+        ):
 
             liquidity_sweep = (
                 _low(current)
@@ -1230,14 +1601,22 @@ def _m5_confirmation(
     )
 
     return {
-        "valid": bool(valid),
+        "valid": bool(
+            valid
+        ),
         "direction": m5_direction,
-        "micro_bos": bool(micro_bos),
+        "micro_bos": bool(
+            micro_bos
+        ),
         "liquidity_sweep": bool(
             liquidity_sweep
         ),
-        "retest": bool(retest),
-        "rejection": bool(rejection),
+        "retest": bool(
+            retest
+        ),
+        "rejection": bool(
+            rejection
+        ),
         "candle_confirmation": bool(
             candle_confirmation
         ),
@@ -1273,7 +1652,9 @@ def _build_sl_tp(
     if atr <= 0:
         atr = entry * 0.001
 
-    recent = list(candles)[-20:]
+    recent = list(
+        candles
+    )[-20:]
 
     if direction == "BUY":
 
@@ -1284,24 +1665,34 @@ def _build_sl_tp(
         ]
 
         if lows:
-            structural_sl = min(lows)
+
+            structural_sl = min(
+                lows
+            )
 
             sl = min(
                 structural_sl,
                 entry - atr * 0.5,
             )
-        else:
-            sl = entry - atr
 
-        risk = entry - sl
+        else:
+
+            sl = (
+                entry - atr
+            )
+
+        risk = (
+            entry - sl
+        )
 
         if risk <= 0:
-            risk = atr
 
+            risk = atr
             sl = entry - risk
 
-        tp = entry + (
-            risk * 2.5
+        tp = (
+            entry
+            + risk * 2.5
         )
 
         return sl, tp
@@ -1315,24 +1706,34 @@ def _build_sl_tp(
         ]
 
         if highs:
-            structural_sl = max(highs)
+
+            structural_sl = max(
+                highs
+            )
 
             sl = max(
                 structural_sl,
                 entry + atr * 0.5,
             )
-        else:
-            sl = entry + atr
 
-        risk = sl - entry
+        else:
+
+            sl = (
+                entry + atr
+            )
+
+        risk = (
+            sl - entry
+        )
 
         if risk <= 0:
-            risk = atr
 
+            risk = atr
             sl = entry + risk
 
-        tp = entry - (
-            risk * 2.5
+        tp = (
+            entry
+            - risk * 2.5
         )
 
         return sl, tp
@@ -1358,13 +1759,17 @@ def _validate_geometry(
     if direction == "BUY":
 
         return (
-            stop_loss < entry < take_profit
+            stop_loss
+            < entry
+            < take_profit
         )
 
     if direction == "SELL":
 
         return (
-            stop_loss > entry > take_profit
+            stop_loss
+            > entry
+            > take_profit
         )
 
     return False
@@ -1386,19 +1791,17 @@ def _fallback_score(
     Score déterministe de secours.
 
     Poids :
-        H4              20
-        H1              20
-        M15             20
-        Zone qualité    10
-        M5 retest       10
-        M5 candle        5
-        Liquidity        5
-        RR               5
-        Market           5
-        ------------------
-        TOTAL           100
-
-    Le M5 n'annule jamais le signal.
+        H4               20
+        H1               20
+        M15              20
+        Zone qualité     10
+        M5 retest        10
+        M5 candle         5
+        Liquidity         5
+        RR                5
+        Market            5
+        --------------------
+        TOTAL            100
     """
 
     direction = _normalize_direction(
@@ -1408,19 +1811,25 @@ def _fallback_score(
     score = 0.0
 
     if (
-        _normalize_direction(h4_direction)
+        _normalize_direction(
+            h4_direction
+        )
         == direction
     ):
         score += 20
 
     if (
-        _normalize_direction(h1_direction)
+        _normalize_direction(
+            h1_direction
+        )
         == direction
     ):
         score += 20
 
     if (
-        _normalize_direction(m15_direction)
+        _normalize_direction(
+            m15_direction
+        )
         == direction
     ):
         score += 20
@@ -1428,26 +1837,37 @@ def _fallback_score(
     # Zone structurelle validée
     score += 10
 
-    if m5.get("retest"):
+    # M5 secondaire
+    if m5.get(
+        "retest"
+    ):
         score += 10
 
-    if m5.get("candle_confirmation"):
+    if m5.get(
+        "candle_confirmation"
+    ):
         score += 5
 
-    if m5.get("liquidity_sweep"):
+    if m5.get(
+        "liquidity_sweep"
+    ):
         score += 5
 
     if rr >= 2.0:
         score += 5
+
     elif rr >= 1.5:
         score += 3
 
-    # Marché exploitable
+    # Conditions de marché
     score += 5
 
     return min(
         100.0,
-        round(score, 2),
+        round(
+            score,
+            2,
+        ),
     )
 
 
@@ -1464,7 +1884,8 @@ def _calculate_final_score(
 ) -> float:
     """
     Utilise le scoring engine s'il est disponible.
-    Sinon utilise le score déterministe local.
+
+    Sinon fallback déterministe.
     """
 
     if calculate_score is not None:
@@ -1482,7 +1903,10 @@ def _calculate_final_score(
                 zone=zone,
             )
 
-            if isinstance(result, dict):
+            if isinstance(
+                result,
+                dict,
+            ):
 
                 value = result.get(
                     "score",
@@ -1515,14 +1939,18 @@ def _calculate_final_score(
             )
 
         except TypeError:
-            # Signature différente :
-            # on utilise le fallback proprement.
+
+            # Signature incompatible :
+            # fallback déterministe.
             pass
 
         except Exception as exc:
 
             logger.debug(
-                "Scoring engine indisponible pour %s : %s",
+                (
+                    "Scoring engine indisponible "
+                    "pour %s : %s"
+                ),
                 symbol,
                 exc,
             )
@@ -1554,7 +1982,10 @@ def _check_news(
             symbol
         )
 
-        if isinstance(result, tuple):
+        if isinstance(
+            result,
+            tuple,
+        ):
 
             blocked = bool(
                 result[0]
@@ -1568,19 +1999,21 @@ def _check_news(
 
             return blocked, reason
 
-        return bool(result), None
+        return bool(
+            result
+        ), None
 
     except Exception as exc:
 
         logger.warning(
-            "NEWS %s : filtre indisponible : %s",
+            (
+                "NEWS %s : "
+                "filtre indisponible : %s"
+            ),
             symbol,
             exc,
         )
 
-        # Une erreur de calendrier ne doit pas
-        # transformer automatiquement le marché
-        # en REJECT.
         return False, None
 
 
@@ -1592,12 +2025,13 @@ def _market_open(
     symbol: str,
 ) -> bool:
     """
-    Vérification légère de disponibilité du marché.
+    Vérification légère du marché.
 
-    Si market_data fournit une fonction dédiée,
-    on l'utilise.
+    Si market_data possède une fonction dédiée,
+    elle est utilisée.
 
-    Sinon on ne bloque pas artificiellement l'analyse.
+    Sinon aucune fermeture artificielle
+    n'est appliquée.
     """
 
     if market_data is None:
@@ -1614,18 +2048,24 @@ def _market_open(
             None,
         )
 
-        if callable(checker):
+        if callable(
+            checker
+        ):
 
             try:
+
                 return bool(
                     checker(symbol)
                 )
+
             except TypeError:
 
                 try:
+
                     return bool(
                         checker()
                     )
+
                 except Exception:
                     pass
 
@@ -1680,11 +2120,15 @@ def _reject_result(
             direction
         ),
         "score": round(
-            _safe_float(score),
+            _safe_float(
+                score
+            ),
             2,
         ),
         "rr": round(
-            _safe_float(rr),
+            _safe_float(
+                rr
+            ),
             2,
         ),
         "entry": 0.0,
@@ -1706,16 +2150,13 @@ def analyze_market(
     """
     Analyse complète d'un marché.
 
-    IMPORTANT :
-    Le premier contrôle est désormais le provider.
-
-    Forex/XAU :
+    Forex / XAU :
         Twelve Data disponible -> analyse
-        Twelve Data cooldown -> WAIT immédiat
+        Twelve Data cooldown -> WAIT
 
     Crypto :
-        Coinbase -> analyse indépendante
-        Twelve Data cooldown ignoré
+        fournisseur crypto -> analyse
+        Twelve Data ignoré
     """
 
     symbol = str(
@@ -1728,35 +2169,43 @@ def analyze_market(
     )
 
     # ------------------------------------------------------------------
-    # 1. CONTRÔLE PROVIDER
+    # 1. PROVIDER
     # ------------------------------------------------------------------
 
-    provider_ready, provider_reason = (
-        _twelve_data_ready(symbol)
-    )
+    if not _is_crypto_symbol(
+        symbol
+    ):
 
-    if not provider_ready:
-
-        logger.warning(
-            "%s",
-            provider_reason,
+        provider_ready, provider_reason = (
+            _twelve_data_ready(
+                symbol
+            )
         )
 
-        logger.info(
-            "Analyse reportée : %s",
-            symbol,
-        )
+        if not provider_ready:
 
-        return _wait_result(
-            symbol,
-            provider_reason,
-        )
+            logger.warning(
+                "%s",
+                provider_reason,
+            )
+
+            logger.info(
+                "Analyse reportée : %s",
+                symbol,
+            )
+
+            return _wait_result(
+                symbol,
+                provider_reason,
+            )
 
     # ------------------------------------------------------------------
     # 2. MARCHÉ
     # ------------------------------------------------------------------
 
-    if not _market_open(symbol):
+    if not _market_open(
+        symbol
+    ):
 
         return _wait_result(
             symbol,
@@ -1764,20 +2213,28 @@ def analyze_market(
         )
 
     # ------------------------------------------------------------------
-    # 3. RECUPERATION DES DONNEES
+    # 3. RÉCUPÉRATION DES DONNÉES
     # ------------------------------------------------------------------
 
-    candles: Dict[str, List[Any]] = {}
+    candles: Dict[
+        str,
+        List[Any],
+    ] = {}
 
     for timeframe in TIMEFRAMES:
 
-        # Sécurité supplémentaire :
-        # si Twelve Data passe en cooldown entre deux appels,
-        # on arrête immédiatement pour Forex/XAU.
-        if not _is_crypto_symbol(symbol):
+        # --------------------------------------------------------------
+        # Vérification provider avant chaque appel
+        # --------------------------------------------------------------
+
+        if not _is_crypto_symbol(
+            symbol
+        ):
 
             ready, reason = (
-                _twelve_data_ready(symbol)
+                _twelve_data_ready(
+                    symbol
+                )
             )
 
             if not ready:
@@ -1787,15 +2244,72 @@ def analyze_market(
                     reason,
                 )
 
+                logger.info(
+                    "Analyse reportée : %s",
+                    symbol,
+                )
+
                 return _wait_result(
                     symbol,
                     reason,
                 )
 
+        # --------------------------------------------------------------
+        # Récupération
+        # --------------------------------------------------------------
+
         data = _extract_candles(
             symbol,
             timeframe,
         )
+
+        # --------------------------------------------------------------
+        # IMPORTANT :
+        # si get_candles() vient de déclencher
+        # un cooldown, on retourne la vraie raison
+        # au lieu de "Données insuffisantes H4".
+        # --------------------------------------------------------------
+
+        if not data:
+
+            if not _is_crypto_symbol(
+                symbol
+            ):
+
+                ready, reason = (
+                    _twelve_data_ready(
+                        symbol
+                    )
+                )
+
+                if not ready:
+
+                    logger.warning(
+                        "%s",
+                        reason,
+                    )
+
+                    logger.info(
+                        "Analyse reportée : %s",
+                        symbol,
+                    )
+
+                    return _wait_result(
+                        symbol,
+                        reason,
+                    )
+
+            return _wait_result(
+                symbol,
+                (
+                    f"Données indisponibles "
+                    f"{timeframe} pour {symbol}."
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # Validation historique
+        # --------------------------------------------------------------
 
         if not _validate_candles(
             data,
@@ -1810,10 +2324,12 @@ def analyze_market(
                 ),
             )
 
-        candles[timeframe] = data
+        candles[
+            timeframe
+        ] = data
 
     # ------------------------------------------------------------------
-    # 4. DIRECTION H4 / H1 / M15
+    # 4. DIRECTIONS H4 / H1 / M15
     # ------------------------------------------------------------------
 
     h4_direction = _structure_direction(
@@ -1875,12 +2391,14 @@ def analyze_market(
     )
 
     # ------------------------------------------------------------------
-    # 6. ZONE H1/M15
+    # 6. ZONE CLÉ
     # ------------------------------------------------------------------
 
-    zone_low, zone_high = _find_key_level(
-        candles["M15"],
-        direction,
+    zone_low, zone_high = (
+        _find_key_level(
+            candles["M15"],
+            direction,
+        )
     )
 
     if (
@@ -1928,7 +2446,10 @@ def analyze_market(
 
         return _wait_result(
             symbol,
-            "Breakout confirmé mais retest non confirmé.",
+            (
+                "Breakout confirmé "
+                "mais retest non confirmé."
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1944,11 +2465,14 @@ def analyze_market(
 
         return _wait_result(
             symbol,
-            "Retest détecté mais rejection non confirmée.",
+            (
+                "Retest détecté "
+                "mais rejection non confirmée."
+            ),
         )
 
     # ------------------------------------------------------------------
-    # 10. CONFIRMATION CANDLE
+    # 10. CONFIRMATION CANDLE M15
     # ------------------------------------------------------------------
 
     candle_confirmation = (
@@ -1962,20 +2486,26 @@ def analyze_market(
 
         return _wait_result(
             symbol,
-            "Candle de confirmation M15 absente.",
+            (
+                "Candle de confirmation "
+                "M15 absente."
+            ),
         )
 
     # ------------------------------------------------------------------
-    # 11. ENTREE
+    # 11. ENTRY
     # ------------------------------------------------------------------
 
-    current_candle = candles["M5"][-1]
+    current_candle = (
+        candles["M5"][-1]
+    )
 
     entry = _close(
         current_candle
     )
 
     if entry <= 0:
+
         entry = _close(
             candles["M15"][-1]
         )
@@ -2046,6 +2576,7 @@ def analyze_market(
     try:
 
         if CONFIG is not None:
+
             minimum_rr = float(
                 getattr(
                     CONFIG,
@@ -2055,6 +2586,7 @@ def analyze_market(
             )
 
     except Exception:
+
         minimum_rr = 2.0
 
     if rr < minimum_rr:
@@ -2063,14 +2595,15 @@ def analyze_market(
             symbol,
             (
                 f"RR insuffisant : "
-                f"{rr:.2f} < {minimum_rr:.2f}"
+                f"{rr:.2f} < "
+                f"{minimum_rr:.2f}"
             ),
             direction=direction,
             rr=rr,
         )
 
     # ------------------------------------------------------------------
-    # 15. M5 SECONDARY CONFIRMATION
+    # 15. M5 SECONDARY
     # ------------------------------------------------------------------
 
     m5 = _m5_confirmation(
@@ -2091,6 +2624,10 @@ def analyze_market(
         m5.get("retest"),
         m5.get("candle_confirmation"),
     )
+
+    # IMPORTANT :
+    # aucune condition ici ne rejette le setup
+    # uniquement parce que M5 n'est pas confirmé.
 
     # ------------------------------------------------------------------
     # 16. SCORE
@@ -2124,6 +2661,7 @@ def analyze_market(
     try:
 
         if CONFIG is not None:
+
             threshold = float(
                 getattr(
                     CONFIG,
@@ -2133,12 +2671,13 @@ def analyze_market(
             )
 
     except Exception:
+
         threshold = 60.0
 
     logger.info(
         (
-            "%s score=%s/100 | RR=%.2f | "
-            "seuil=%s"
+            "%s score=%.2f/100 | "
+            "RR=%.2f | seuil=%.2f"
         ),
         symbol,
         score,
@@ -2152,7 +2691,8 @@ def analyze_market(
             symbol,
             (
                 f"Score insuffisant : "
-                f"{score:.2f} < {threshold:.2f}"
+                f"{score:.2f} < "
+                f"{threshold:.2f}"
             ),
             direction=direction,
             score=score,
@@ -2164,7 +2704,9 @@ def analyze_market(
     # ------------------------------------------------------------------
 
     news_blocked, news_reason = (
-        _check_news(symbol)
+        _check_news(
+            symbol
+        )
     )
 
     if news_blocked:
@@ -2179,7 +2721,7 @@ def analyze_market(
         )
 
     # ------------------------------------------------------------------
-    # 18. CONSTRUCTION DU SIGNAL
+    # 18. CONSTRUCTION SIGNAL
     # ------------------------------------------------------------------
 
     signal = None
@@ -2265,9 +2807,36 @@ def analyze_market(
             signal,
             dict,
         ):
+
             signal_id = signal.get(
                 "signal_id"
             )
+
+    # ------------------------------------------------------------------
+    # IMPORTANT :
+    # Le pipeline ne doit pas prétendre qu'un objet Signal
+    # a été construit si build_signal a échoué.
+    #
+    # Les conditions analytiques restent valides, mais
+    # si le moteur de signal est disponible et échoue,
+    # on ne force jamais ACTIVE.
+    # ------------------------------------------------------------------
+
+    if (
+        build_signal is not None
+        and signal is None
+    ):
+
+        return _reject_result(
+            symbol,
+            (
+                "Setup analytique valide, "
+                "mais construction du signal impossible."
+            ),
+            direction=direction,
+            score=score,
+            rr=rr,
+        )
 
     result = {
         "symbol": symbol,
@@ -2331,6 +2900,10 @@ def analyser_marche(
 ) -> Dict[str, Any]:
     """
     Alias français conservé pour compatibilité.
+
+    Le paramètre timeframe est conservé pour éviter
+    de casser les appels existants, mais l'analyse
+    reste obligatoirement multi-timeframe.
     """
 
     return analyze_market(
