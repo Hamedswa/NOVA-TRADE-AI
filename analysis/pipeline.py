@@ -5,13 +5,16 @@ analysis/pipeline.py
 PIPELINE PRINCIPAL D'ANALYSE
 
 Architecture :
+
     Données
+        ↓
+    Nettoyage / réduction du bruit
         ↓
     H4 + H1 + M15
         ↓
-    Alignement directionnel principal
+    Alignement principal
         ↓
-    Zone clé
+    Recherche multi-zones
         ↓
     Breakout
         ↓
@@ -20,6 +23,12 @@ Architecture :
     Rejection
         ↓
     Confirmation candle
+        ↓
+    Momentum / vitesse
+        ↓
+    Volatilité / ATR
+        ↓
+    Liquidité
         ↓
     M5 = confirmation secondaire
         ↓
@@ -31,17 +40,17 @@ Architecture :
         ↓
     Signal final
 
-RÈGLES PRINCIPALES :
+RÈGLES :
+
     - H4 + H1 + M15 doivent être parfaitement alignés.
     - D1 n'est PAS utilisé.
     - M5 est secondaire et NON BLOQUANT.
     - Score minimum : 60.
     - RR minimum : 2.0.
-    - Aucun signal ne doit être forcé.
-    - Si Twelve Data est en cooldown, l'analyse Forex/XAU
-      est simplement reportée.
-    - Les cryptos utilisent leur fournisseur crypto
-      indépendamment de Twelve Data.
+    - Aucun signal forcé.
+    - Breakout absent = WAIT, pas faux REJECT.
+    - Plusieurs zones candidates sont testées.
+    - Crypto indépendante de Twelve Data.
 """
 
 from __future__ import annotations
@@ -52,16 +61,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-# ---------------------------------------------------------------------------
-# LOGGING
-# ---------------------------------------------------------------------------
-
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# IMPORTS PROJET
-# ---------------------------------------------------------------------------
+# ============================================================================
+# IMPORTS
+# ============================================================================
 
 try:
     from config import CONFIG
@@ -84,6 +89,7 @@ except Exception:
         stop_loss: float,
         take_profit: float,
     ) -> float:
+
         risk = abs(
             float(entry) - float(stop_loss)
         )
@@ -107,6 +113,7 @@ except Exception:
 try:
     from scoring.scoring_engine import calculate_score
 except Exception:
+
     try:
         from scoring import calculate_score
     except Exception:
@@ -119,9 +126,9 @@ except Exception:
     economic_filter = None
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # CONSTANTES
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 TIMEFRAMES: Tuple[str, ...] = (
     "H4",
@@ -130,8 +137,6 @@ TIMEFRAMES: Tuple[str, ...] = (
     "M5",
 )
 
-# IMPORTANT :
-# D1 est volontairement absent.
 PRIMARY_TIMEFRAMES: Tuple[str, ...] = (
     "H4",
     "H1",
@@ -152,20 +157,20 @@ DIRECTIONS = {
     "NEUTRAL",
 }
 
+MINIMUM_CANDLES = 20
 
-# ---------------------------------------------------------------------------
-# HELPERS GÉNÉRAUX
-# ---------------------------------------------------------------------------
+
+# ============================================================================
+# HELPERS
+# ============================================================================
 
 def _safe_float(
     value: Any,
     default: float = 0.0,
 ) -> float:
-    """
-    Conversion sécurisée en float.
-    """
 
     try:
+
         number = float(value)
 
         if not math.isfinite(number):
@@ -180,9 +185,6 @@ def _safe_float(
 def _normalize_direction(
     value: Any,
 ) -> str:
-    """
-    Normalise BUY / SELL / NEUTRAL.
-    """
 
     if value is None:
         return "NEUTRAL"
@@ -217,13 +219,6 @@ def _normalize_direction(
 def _is_crypto_symbol(
     symbol: str,
 ) -> bool:
-    """
-    Retourne True si le symbole est une crypto.
-
-    Les cryptos utilisent leur fournisseur crypto
-    et ne doivent jamais être bloquées par
-    le cooldown Twelve Data.
-    """
 
     normalized = str(
         symbol or ""
@@ -238,37 +233,14 @@ def _utc_now() -> datetime:
     )
 
 
-# ---------------------------------------------------------------------------
-# CONTRÔLE TWELVE DATA
-# ---------------------------------------------------------------------------
+# ============================================================================
+# TWELVE DATA
+# ============================================================================
 
 def _get_twelve_data_status() -> Dict[str, Any]:
-    """
-    Récupère l'état de Twelve Data de façon tolérante.
-
-    Formats supportés :
-
-        {
-            "twelve_data": {
-                "available": False,
-                "cooldown": 60
-            }
-        }
-
-    ou :
-
-        {
-            "available": False,
-            "cooldown": 60
-        }
-
-    ou API séparée :
-
-        twelve_data_available()
-        get_twelve_data_cooldown()
-    """
 
     if market_data is None:
+
         return {
             "available": True,
             "cooldown": 0,
@@ -332,10 +304,6 @@ def _get_twelve_data_status() -> Dict[str, Any]:
                         ),
                     }
 
-        # ---------------------------------------------------------------
-        # API ALTERNATIVE
-        # ---------------------------------------------------------------
-
         available_fn = getattr(
             market_data,
             "twelve_data_available",
@@ -380,12 +348,10 @@ def _get_twelve_data_status() -> Dict[str, Any]:
     except Exception as exc:
 
         logger.debug(
-            "Impossible de lire le statut Twelve Data : %s",
+            "Statut Twelve Data inaccessible : %s",
             exc,
         )
 
-    # Si le statut ne peut pas être lu,
-    # on ne bloque pas artificiellement.
     return {
         "available": True,
         "cooldown": 0,
@@ -395,15 +361,6 @@ def _get_twelve_data_status() -> Dict[str, Any]:
 def _twelve_data_ready(
     symbol: str,
 ) -> Tuple[bool, str]:
-    """
-    Vérifie si Twelve Data est utilisable.
-
-    Crypto :
-        toujours True ici.
-
-    Forex / XAU :
-        respecte le cooldown Twelve Data.
-    """
 
     if _is_crypto_symbol(
         symbol
@@ -436,46 +393,30 @@ def _twelve_data_ready(
 
         if cooldown > 0:
 
-            reason = (
-                "Twelve Data temporairement limité "
-                f"— cooldown {cooldown}s"
+            return (
+                False,
+                (
+                    "Twelve Data temporairement limité "
+                    f"— cooldown {cooldown}s"
+                ),
             )
 
-        else:
-
-            reason = (
-                "Twelve Data temporairement indisponible"
-            )
-
-        return False, reason
+        return (
+            False,
+            "Twelve Data temporairement indisponible",
+        )
 
     return True, ""
 
 
-# ---------------------------------------------------------------------------
-# EXTRACTION DES CHANDELIERS
-# ---------------------------------------------------------------------------
+# ============================================================================
+# DONNÉES
+# ============================================================================
 
 def _extract_candles(
     symbol: str,
     timeframe: str,
 ) -> List[Any]:
-    """
-    Récupère les chandeliers via market_data.
-
-    IMPORTANT :
-
-    Si Twelve Data vient de déclencher un HTTP 429,
-    cette fonction vérifie immédiatement le cooldown.
-
-    Elle ne doit donc PAS produire :
-
-        ERROR | DATA EUR/USD H4 : 0 chandelier
-
-    lorsqu'il s'agit simplement d'un rate-limit.
-
-    Les erreurs réelles restent journalisées.
-    """
 
     if market_data is None:
 
@@ -509,10 +450,6 @@ def _extract_candles(
 
         candles = None
 
-        # ---------------------------------------------------------------
-        # FORMAT PRINCIPAL
-        # ---------------------------------------------------------------
-
         try:
 
             candles = getter(
@@ -522,10 +459,6 @@ def _extract_candles(
 
         except TypeError:
             pass
-
-        # ---------------------------------------------------------------
-        # FORMAT KEYWORD
-        # ---------------------------------------------------------------
 
         if candles is None:
 
@@ -539,10 +472,6 @@ def _extract_candles(
             except TypeError:
                 pass
 
-        # ---------------------------------------------------------------
-        # FORMAT INTERVAL
-        # ---------------------------------------------------------------
-
         if candles is None:
 
             try:
@@ -555,17 +484,7 @@ def _extract_candles(
             except TypeError:
                 pass
 
-        # ---------------------------------------------------------------
-        # AUCUNE DONNÉE
-        # ---------------------------------------------------------------
-
         if candles is None:
-
-            # IMPORTANT :
-            # Recheck après l'appel.
-            #
-            # Un HTTP 429 peut avoir déclenché
-            # le cooldown pendant get_candles().
 
             if not _is_crypto_symbol(
                 symbol
@@ -593,10 +512,6 @@ def _extract_candles(
             )
 
             return []
-
-        # ---------------------------------------------------------------
-        # FORMAT DICT
-        # ---------------------------------------------------------------
 
         if isinstance(
             candles,
@@ -625,9 +540,6 @@ def _extract_candles(
                     found = True
                     break
 
-            # Si aucun format connu n'a été trouvé,
-            # ne pas considérer arbitrairement le dict
-            # comme une liste de chandeliers.
             if not found:
 
                 logger.warning(
@@ -640,10 +552,6 @@ def _extract_candles(
                 )
 
                 return []
-
-        # ---------------------------------------------------------------
-        # FORMAT INVALIDE
-        # ---------------------------------------------------------------
 
         if not isinstance(
             candles,
@@ -665,16 +573,7 @@ def _extract_candles(
             candles
         )
 
-        # ---------------------------------------------------------------
-        # LISTE VIDE
-        # ---------------------------------------------------------------
-
         if not result:
-
-            # Recheck du provider AVANT de journaliser.
-            #
-            # Si le provider vient de passer en cooldown,
-            # ce n'est pas une erreur de données.
 
             if not _is_crypto_symbol(
                 symbol
@@ -703,17 +602,16 @@ def _extract_candles(
 
             return []
 
-        # ---------------------------------------------------------------
-        # DONNÉES OK
-        # ---------------------------------------------------------------
+        logger.info(
+            "DATA %s %s : %s bougies reçues.",
+            symbol,
+            timeframe,
+            len(result),
+        )
 
         return result
 
     except Exception as exc:
-
-        # ---------------------------------------------------------------
-        # CAS IMPORTANT : HTTP 429 / COOLDOWN
-        # ---------------------------------------------------------------
 
         if not _is_crypto_symbol(
             symbol
@@ -734,10 +632,6 @@ def _extract_candles(
 
                 return []
 
-        # ---------------------------------------------------------------
-        # VRAIE ERREUR
-        # ---------------------------------------------------------------
-
         logger.error(
             "DATA %s %s erreur : %s",
             symbol,
@@ -750,38 +644,27 @@ def _extract_candles(
 
 def _validate_candles(
     candles: Sequence[Any],
-    minimum: int = 20,
+    minimum: int = MINIMUM_CANDLES,
 ) -> bool:
-    """
-    Vérifie qu'un historique est exploitable.
-    """
 
     if candles is None:
         return False
 
     try:
-        count = len(
-            candles
-        )
-
+        return len(candles) >= minimum
     except Exception:
         return False
 
-    return count >= minimum
 
-
-# ---------------------------------------------------------------------------
-# ACCÈS OHLC
-# ---------------------------------------------------------------------------
+# ============================================================================
+# OHLC
+# ============================================================================
 
 def _candle_value(
     candle: Any,
     key: str,
     default: float = 0.0,
 ) -> float:
-    """
-    Extrait une valeur OHLC depuis un dict ou un objet.
-    """
 
     if candle is None:
         return default
@@ -798,13 +681,11 @@ def _candle_value(
             )
 
             if value is None:
-
                 value = candle.get(
                     key.lower()
                 )
 
             if value is None:
-
                 value = candle.get(
                     key.upper()
                 )
@@ -829,77 +710,55 @@ def _candle_value(
         return default
 
 
-def _close(
-    candle: Any,
-) -> float:
-    return _candle_value(
-        candle,
-        "close",
-    )
-
-
-def _open(
-    candle: Any,
-) -> float:
+def _open(candle: Any) -> float:
     return _candle_value(
         candle,
         "open",
     )
 
 
-def _high(
-    candle: Any,
-) -> float:
+def _close(candle: Any) -> float:
+    return _candle_value(
+        candle,
+        "close",
+    )
+
+
+def _high(candle: Any) -> float:
     return _candle_value(
         candle,
         "high",
     )
 
 
-def _low(
-    candle: Any,
-) -> float:
+def _low(candle: Any) -> float:
     return _candle_value(
         candle,
         "low",
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # ATR
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _calculate_atr(
     candles: Sequence[Any],
     period: int = 14,
 ) -> float:
-    """
-    ATR robuste.
-    """
 
-    if not candles:
-        return 0.0
-
-    if len(candles) < 2:
+    if not candles or len(candles) < 2:
         return 0.0
 
     true_ranges: List[float] = []
 
-    previous_close = None
+    previous_close: Optional[float] = None
 
     for candle in candles:
 
-        high = _high(
-            candle
-        )
-
-        low = _low(
-            candle
-        )
-
-        close = _close(
-            candle
-        )
+        high = _high(candle)
+        low = _low(candle)
+        close = _close(candle)
 
         if high <= 0 or low <= 0:
             continue
@@ -921,28 +780,21 @@ def _calculate_atr(
             )
 
         if tr >= 0:
-            true_ranges.append(
-                tr
-            )
+            true_ranges.append(tr)
 
         previous_close = close
 
     if not true_ranges:
         return 0.0
 
-    values = true_ranges[
-        -period:
-    ]
+    values = true_ranges[-period:]
 
-    return (
-        sum(values)
-        / len(values)
-    )
+    return sum(values) / len(values)
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # SWINGS
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _swing_highs(
     candles: Sequence[Any],
@@ -968,7 +820,7 @@ def _swing_highs(
         if current <= 0:
             continue
 
-        is_high = True
+        valid = True
 
         for j in range(
             i - lookback,
@@ -982,13 +834,11 @@ def _swing_highs(
                 candles[j]
             ) >= current:
 
-                is_high = False
+                valid = False
                 break
 
-        if is_high:
-            highs.append(
-                current
-            )
+        if valid:
+            highs.append(current)
 
     return highs
 
@@ -1017,7 +867,7 @@ def _swing_lows(
         if current <= 0:
             continue
 
-        is_low = True
+        valid = True
 
         for j in range(
             i - lookback,
@@ -1031,36 +881,22 @@ def _swing_lows(
                 candles[j]
             ) <= current:
 
-                is_low = False
+                valid = False
                 break
 
-        if is_low:
-            lows.append(
-                current
-            )
+        if valid:
+            lows.append(current)
 
     return lows
 
 
-# ---------------------------------------------------------------------------
-# STRUCTURE / DIRECTION
-# ---------------------------------------------------------------------------
+# ============================================================================
+# STRUCTURE
+# ============================================================================
 
 def _structure_direction(
     candles: Sequence[Any],
 ) -> str:
-    """
-    Détermine une direction structurelle.
-
-    BUY :
-        HH + HL
-
-    SELL :
-        LH + LL
-
-    Sinon :
-        NEUTRAL
-    """
 
     if not candles or len(candles) < 10:
         return "NEUTRAL"
@@ -1075,10 +911,7 @@ def _structure_direction(
         lookback=2,
     )
 
-    if len(highs) < 2:
-        return "NEUTRAL"
-
-    if len(lows) < 2:
+    if len(highs) < 2 or len(lows) < 2:
         return "NEUTRAL"
 
     last_high = highs[-1]
@@ -1102,25 +935,15 @@ def _structure_direction(
     return "NEUTRAL"
 
 
-# ---------------------------------------------------------------------------
-# ALIGNEMENT PRINCIPAL
-# ---------------------------------------------------------------------------
+# ============================================================================
+# ALIGNEMENT
+# ============================================================================
 
 def _primary_alignment(
     h4_direction: str,
     h1_direction: str,
     m15_direction: str,
 ) -> str:
-    """
-    RÈGLE PRINCIPALE NOVA TRADE AI :
-
-        H4 + H1 + M15
-        doivent être parfaitement alignés.
-
-    D1 n'est pas utilisé.
-
-    M5 n'intervient jamais dans cette validation.
-    """
 
     h4 = _normalize_direction(
         h4_direction
@@ -1134,13 +957,11 @@ def _primary_alignment(
         m15_direction
     )
 
-    if h4 == "NEUTRAL":
-        return "NEUTRAL"
-
-    if h1 == "NEUTRAL":
-        return "NEUTRAL"
-
-    if m15 == "NEUTRAL":
+    if (
+        h4 == "NEUTRAL"
+        or h1 == "NEUTRAL"
+        or m15 == "NEUTRAL"
+    ):
         return "NEUTRAL"
 
     if h4 == h1 == m15:
@@ -1149,95 +970,134 @@ def _primary_alignment(
     return "NEUTRAL"
 
 
-# ---------------------------------------------------------------------------
-# NIVEAU CLÉ
-# ---------------------------------------------------------------------------
+# ============================================================================
+# ZONES CANDIDATES
+# ============================================================================
 
-def _find_key_level(
+def _build_zone_candidates(
     candles: Sequence[Any],
     direction: str,
-) -> Tuple[float, float]:
-    """
-    Détermine une zone clé à partir des swings récents.
-
-    Retour :
-        (low, high)
-    """
+    max_zones: int = 8,
+) -> List[Tuple[float, float]]:
 
     direction = _normalize_direction(
         direction
     )
 
     if not candles:
-        return 0.0, 0.0
+        return []
 
     recent = list(
         candles
-    )[-50:]
+    )[-80:]
 
-    highs = [
-        _high(c)
-        for c in recent
-        if _high(c) > 0
-    ]
-
-    lows = [
-        _low(c)
-        for c in recent
-        if _low(c) > 0
-    ]
-
-    if not highs or not lows:
-        return 0.0, 0.0
+    candidates: List[float] = []
 
     if direction == "BUY":
 
-        swing_highs = _swing_highs(
-            recent,
-            lookback=2,
+        # Pour BUY, on recherche des résistances
+        # dont la cassure peut confirmer l'impulsion.
+        candidates.extend(
+            _swing_highs(
+                recent,
+                lookback=2,
+            )
         )
 
-        candidates = (
-            swing_highs
-            or highs[-5:]
+        candidates.extend(
+            _high(c)
+            for c in recent[-20:]
+            if _high(c) > 0
         )
 
-        level = max(
-            candidates
+    elif direction == "SELL":
+
+        # Pour SELL, on recherche des supports
+        # dont la cassure peut confirmer l'impulsion.
+        candidates.extend(
+            _swing_lows(
+                recent,
+                lookback=2,
+            )
         )
 
-        return (
-            level * 0.9995,
-            level * 1.0005,
+        candidates.extend(
+            _low(c)
+            for c in recent[-20:]
+            if _low(c) > 0
         )
 
-    if direction == "SELL":
+    # ------------------------------------------------------------------
+    # Nettoyage
+    # ------------------------------------------------------------------
 
-        swing_lows = _swing_lows(
-            recent,
-            lookback=2,
+    clean: List[float] = []
+
+    for value in candidates:
+
+        value = _safe_float(
+            value
         )
 
-        candidates = (
-            swing_lows
-            or lows[-5:]
+        if value <= 0:
+            continue
+
+        if not any(
+            abs(value - existing)
+            <= max(
+                abs(value) * 0.0005,
+                1e-8,
+            )
+            for existing in clean
+        ):
+            clean.append(value)
+
+    # ------------------------------------------------------------------
+    # Trier selon proximité au prix actuel
+    # ------------------------------------------------------------------
+
+    current_price = _close(
+        recent[-1]
+    )
+
+    if current_price > 0:
+
+        clean.sort(
+            key=lambda x: abs(
+                x - current_price
+            )
         )
 
-        level = min(
-            candidates
+    else:
+
+        clean.reverse()
+
+    clean = clean[:max_zones]
+
+    zones: List[
+        Tuple[float, float]
+    ] = []
+
+    for level in clean:
+
+        width = max(
+            abs(level) * 0.0005,
+            1e-8,
         )
 
-        return (
-            level * 0.9995,
-            level * 1.0005,
+        zones.append(
+            (
+                level - width,
+                level + width,
+            )
         )
 
-    return 0.0, 0.0
+    return zones
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # BREAKOUT
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _breakout_confirmed(
     candles: Sequence[Any],
@@ -1253,7 +1113,10 @@ def _breakout_confirmed(
     if not candles:
         return False
 
-    if level_low <= 0 or level_high <= 0:
+    if (
+        level_low <= 0
+        or level_high <= 0
+    ):
         return False
 
     recent = list(
@@ -1279,9 +1142,9 @@ def _breakout_confirmed(
     return False
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # RETEST
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _retest_confirmed(
     candles: Sequence[Any],
@@ -1297,13 +1160,6 @@ def _retest_confirmed(
     if not candles:
         return False
 
-    if level_low <= 0 or level_high <= 0:
-        return False
-
-    recent = list(
-        candles
-    )[-8:]
-
     tolerance = max(
         abs(
             level_high - level_low
@@ -1311,15 +1167,14 @@ def _retest_confirmed(
         1e-8,
     )
 
+    recent = list(
+        candles
+    )[-12:]
+
     for candle in recent:
 
-        high = _high(
-            candle
-        )
-
-        low = _low(
-            candle
-        )
+        high = _high(candle)
+        low = _low(candle)
 
         if direction == "BUY":
 
@@ -1344,9 +1199,9 @@ def _retest_confirmed(
     return False
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # REJECTION
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _rejection_confirmed(
     candles: Sequence[Any],
@@ -1364,21 +1219,10 @@ def _rejection_confirmed(
         candles
     )[-1]
 
-    open_price = _open(
-        candle
-    )
-
-    close_price = _close(
-        candle
-    )
-
-    high = _high(
-        candle
-    )
-
-    low = _low(
-        candle
-    )
+    open_price = _open(candle)
+    close_price = _close(candle)
+    high = _high(candle)
+    low = _low(candle)
 
     body = abs(
         close_price - open_price
@@ -1419,9 +1263,9 @@ def _rejection_confirmed(
     return False
 
 
-# ---------------------------------------------------------------------------
-# CONFIRMATION CANDLE
-# ---------------------------------------------------------------------------
+# ============================================================================
+# CANDLE CONFIRMATION
+# ============================================================================
 
 def _candle_confirmation(
     candles: Sequence[Any],
@@ -1439,21 +1283,10 @@ def _candle_confirmation(
         candles
     )[-1]
 
-    open_price = _open(
-        candle
-    )
-
-    close_price = _close(
-        candle
-    )
-
-    high = _high(
-        candle
-    )
-
-    low = _low(
-        candle
-    )
+    open_price = _open(candle)
+    close_price = _close(candle)
+    high = _high(candle)
+    low = _low(candle)
 
     candle_range = (
         high - low
@@ -1487,21 +1320,152 @@ def _candle_confirmation(
     return False
 
 
-# ---------------------------------------------------------------------------
-# M5 CONFIRMATION
-# ---------------------------------------------------------------------------
+# ============================================================================
+# MOMENTUM / VITESSE
+# ============================================================================
+
+def _momentum_analysis(
+    candles: Sequence[Any],
+    direction: str,
+) -> Dict[str, Any]:
+
+    direction = _normalize_direction(
+        direction
+    )
+
+    if not candles:
+
+        return {
+            "valid": False,
+            "direction": "NEUTRAL",
+            "speed": 0.0,
+            "body_ratio": 0.0,
+            "expansion": False,
+        }
+
+    recent = list(
+        candles
+    )[-10:]
+
+    if len(recent) < 5:
+
+        return {
+            "valid": False,
+            "direction": "NEUTRAL",
+            "speed": 0.0,
+            "body_ratio": 0.0,
+            "expansion": False,
+        }
+
+    last = recent[-1]
+
+    last_open = _open(last)
+    last_close = _close(last)
+    last_high = _high(last)
+    last_low = _low(last)
+
+    current_range = (
+        last_high - last_low
+    )
+
+    current_body = abs(
+        last_close - last_open
+    )
+
+    body_ratio = 0.0
+
+    if current_range > 0:
+
+        body_ratio = (
+            current_body
+            / current_range
+        )
+
+    previous_ranges = []
+
+    for candle in recent[:-1]:
+
+        candle_range = (
+            _high(candle)
+            - _low(candle)
+        )
+
+        if candle_range > 0:
+            previous_ranges.append(
+                candle_range
+            )
+
+    average_range = 0.0
+
+    if previous_ranges:
+
+        average_range = (
+            sum(previous_ranges)
+            / len(previous_ranges)
+        )
+
+    expansion = (
+        average_range > 0
+        and current_range
+        >= average_range * 1.10
+    )
+
+    speed = 0.0
+
+    if len(recent) >= 4:
+
+        old_close = _close(
+            recent[-4]
+        )
+
+        if old_close > 0:
+
+            speed = abs(
+                last_close - old_close
+            ) / old_close
+
+    candle_direction = "NEUTRAL"
+
+    if last_close > last_open:
+        candle_direction = "BUY"
+
+    elif last_close < last_open:
+        candle_direction = "SELL"
+
+    directional = (
+        candle_direction == direction
+    )
+
+    valid = (
+        directional
+        and body_ratio >= 0.40
+    )
+
+    return {
+        "valid": bool(valid),
+        "direction": candle_direction,
+        "speed": round(
+            speed,
+            8,
+        ),
+        "body_ratio": round(
+            body_ratio,
+            4,
+        ),
+        "expansion": bool(
+            expansion
+        ),
+    }
+
+
+# ============================================================================
+# M5
+# ============================================================================
 
 def _m5_confirmation(
     candles: Sequence[Any],
     direction: str,
 ) -> Dict[str, Any]:
-    """
-    M5 est NON BLOQUANT.
-
-    Il peut améliorer le score,
-    mais ne peut jamais annuler un setup
-    H4 + H1 + M15 parfaitement aligné.
-    """
 
     direction = _normalize_direction(
         direction
@@ -1601,31 +1565,23 @@ def _m5_confirmation(
     )
 
     return {
-        "valid": bool(
-            valid
-        ),
+        "valid": bool(valid),
         "direction": m5_direction,
-        "micro_bos": bool(
-            micro_bos
-        ),
+        "micro_bos": bool(micro_bos),
         "liquidity_sweep": bool(
             liquidity_sweep
         ),
-        "retest": bool(
-            retest
-        ),
-        "rejection": bool(
-            rejection
-        ),
+        "retest": bool(retest),
+        "rejection": bool(rejection),
         "candle_confirmation": bool(
             candle_confirmation
         ),
     }
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # SL / TP
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _build_sl_tp(
     candles: Sequence[Any],
@@ -1677,9 +1633,7 @@ def _build_sl_tp(
 
         else:
 
-            sl = (
-                entry - atr
-            )
+            sl = entry - atr
 
         risk = (
             entry - sl
@@ -1718,9 +1672,7 @@ def _build_sl_tp(
 
         else:
 
-            sl = (
-                entry + atr
-            )
+            sl = entry + atr
 
         risk = (
             sl - entry
@@ -1741,9 +1693,9 @@ def _build_sl_tp(
     return 0.0, 0.0
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # GEOMETRIE
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _validate_geometry(
     direction: str,
@@ -1775,9 +1727,9 @@ def _validate_geometry(
     return False
 
 
-# ---------------------------------------------------------------------------
-# SCORE FALLBACK
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SCORE
+# ============================================================================
 
 def _fallback_score(
     direction: str,
@@ -1786,23 +1738,8 @@ def _fallback_score(
     m15_direction: str,
     m5: Dict[str, Any],
     rr: float,
+    momentum: Dict[str, Any],
 ) -> float:
-    """
-    Score déterministe de secours.
-
-    Poids :
-        H4               20
-        H1               20
-        M15              20
-        Zone qualité     10
-        M5 retest        10
-        M5 candle         5
-        Liquidity         5
-        RR                5
-        Market            5
-        --------------------
-        TOTAL            100
-    """
 
     direction = _normalize_direction(
         direction
@@ -1810,57 +1747,44 @@ def _fallback_score(
 
     score = 0.0
 
-    if (
-        _normalize_direction(
-            h4_direction
-        )
-        == direction
-    ):
+    if _normalize_direction(
+        h4_direction
+    ) == direction:
         score += 20
 
-    if (
-        _normalize_direction(
-            h1_direction
-        )
-        == direction
-    ):
+    if _normalize_direction(
+        h1_direction
+    ) == direction:
         score += 20
 
-    if (
-        _normalize_direction(
-            m15_direction
-        )
-        == direction
-    ):
+    if _normalize_direction(
+        m15_direction
+    ) == direction:
         score += 20
 
-    # Zone structurelle validée
+    # Setup zone
     score += 10
 
+    # Momentum / vitesse
+    if momentum.get("valid"):
+        score += 5
+
+    if momentum.get("expansion"):
+        score += 5
+
     # M5 secondaire
-    if m5.get(
-        "retest"
-    ):
-        score += 10
-
-    if m5.get(
-        "candle_confirmation"
-    ):
+    if m5.get("retest"):
         score += 5
 
-    if m5.get(
-        "liquidity_sweep"
-    ):
+    if m5.get("candle_confirmation"):
         score += 5
 
+    if m5.get("liquidity_sweep"):
+        score += 5
+
+    # RR
     if rr >= 2.0:
         score += 5
-
-    elif rr >= 1.5:
-        score += 3
-
-    # Conditions de marché
-    score += 5
 
     return min(
         100.0,
@@ -1881,12 +1805,8 @@ def _calculate_final_score(
     m5: Dict[str, Any],
     rr: float,
     zone: Dict[str, Any],
+    momentum: Dict[str, Any],
 ) -> float:
-    """
-    Utilise le scoring engine s'il est disponible.
-
-    Sinon fallback déterministe.
-    """
 
     if calculate_score is not None:
 
@@ -1939,18 +1859,12 @@ def _calculate_final_score(
             )
 
         except TypeError:
-
-            # Signature incompatible :
-            # fallback déterministe.
             pass
 
         except Exception as exc:
 
             logger.debug(
-                (
-                    "Scoring engine indisponible "
-                    "pour %s : %s"
-                ),
+                "Scoring engine indisponible %s : %s",
                 symbol,
                 exc,
             )
@@ -1962,12 +1876,13 @@ def _calculate_final_score(
         m15_direction=m15_direction,
         m5=m5,
         rr=rr,
+        momentum=momentum,
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # NEWS
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _check_news(
     symbol: str,
@@ -1999,17 +1914,12 @@ def _check_news(
 
             return blocked, reason
 
-        return bool(
-            result
-        ), None
+        return bool(result), None
 
     except Exception as exc:
 
         logger.warning(
-            (
-                "NEWS %s : "
-                "filtre indisponible : %s"
-            ),
+            "NEWS %s : filtre indisponible : %s",
             symbol,
             exc,
         )
@@ -2017,22 +1927,13 @@ def _check_news(
         return False, None
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # MARCHÉ
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _market_open(
     symbol: str,
 ) -> bool:
-    """
-    Vérification légère du marché.
-
-    Si market_data possède une fonction dédiée,
-    elle est utilisée.
-
-    Sinon aucune fermeture artificielle
-    n'est appliquée.
-    """
 
     if market_data is None:
         return True
@@ -2048,9 +1949,7 @@ def _market_open(
             None,
         )
 
-        if callable(
-            checker
-        ):
+        if callable(checker):
 
             try:
 
@@ -2075,89 +1974,134 @@ def _market_open(
     return True
 
 
-# ---------------------------------------------------------------------------
-# RESULTAT WAIT
-# ---------------------------------------------------------------------------
+# ============================================================================
+# RÉSULTATS
+# ============================================================================
 
-def _wait_result(
+def _base_result(
     symbol: str,
-    reason: str,
+    direction: str = "NEUTRAL",
+    h4_direction: str = "NEUTRAL",
+    h1_direction: str = "NEUTRAL",
+    m15_direction: str = "NEUTRAL",
+    m5_direction: str = "NEUTRAL",
 ) -> Dict[str, Any]:
 
     return {
         "symbol": symbol,
-        "status": "WAIT",
-        "reason": reason,
-        "direction": "NEUTRAL",
+        "direction": _normalize_direction(
+            direction
+        ),
+        "h4_direction": _normalize_direction(
+            h4_direction
+        ),
+        "h1_direction": _normalize_direction(
+            h1_direction
+        ),
+        "m15_direction": _normalize_direction(
+            m15_direction
+        ),
+        "m5_direction": _normalize_direction(
+            m5_direction
+        ),
         "score": 0.0,
         "rr": 0.0,
         "entry": 0.0,
         "stop_loss": 0.0,
         "take_profit": 0.0,
+        "sl": 0.0,
+        "tp": 0.0,
         "signal": None,
         "signal_id": None,
         "timestamp": _utc_now().isoformat(),
     }
 
 
-# ---------------------------------------------------------------------------
-# RESULTAT REJECT
-# ---------------------------------------------------------------------------
+def _wait_result(
+    symbol: str,
+    reason: str,
+    *,
+    direction: str = "NEUTRAL",
+    h4_direction: str = "NEUTRAL",
+    h1_direction: str = "NEUTRAL",
+    m15_direction: str = "NEUTRAL",
+    m5_direction: str = "NEUTRAL",
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+
+    result = _base_result(
+        symbol=symbol,
+        direction=direction,
+        h4_direction=h4_direction,
+        h1_direction=h1_direction,
+        m15_direction=m15_direction,
+        m5_direction=m5_direction,
+    )
+
+    result.update(
+        {
+            "status": "WAIT",
+            "reason": reason,
+        }
+    )
+
+    if extra:
+        result.update(extra)
+
+    return result
+
 
 def _reject_result(
     symbol: str,
     reason: str,
+    *,
     direction: str = "NEUTRAL",
+    h4_direction: str = "NEUTRAL",
+    h1_direction: str = "NEUTRAL",
+    m15_direction: str = "NEUTRAL",
+    m5_direction: str = "NEUTRAL",
     score: float = 0.0,
     rr: float = 0.0,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
 
-    return {
-        "symbol": symbol,
-        "status": "REJECT",
-        "reason": reason,
-        "direction": _normalize_direction(
-            direction
-        ),
-        "score": round(
-            _safe_float(
-                score
+    result = _base_result(
+        symbol=symbol,
+        direction=direction,
+        h4_direction=h4_direction,
+        h1_direction=h1_direction,
+        m15_direction=m15_direction,
+        m5_direction=m5_direction,
+    )
+
+    result.update(
+        {
+            "status": "REJECT",
+            "reason": reason,
+            "score": round(
+                _safe_float(score),
+                2,
             ),
-            2,
-        ),
-        "rr": round(
-            _safe_float(
-                rr
+            "rr": round(
+                _safe_float(rr),
+                4,
             ),
-            2,
-        ),
-        "entry": 0.0,
-        "stop_loss": 0.0,
-        "take_profit": 0.0,
-        "signal": None,
-        "signal_id": None,
-        "timestamp": _utc_now().isoformat(),
-    }
+        }
+    )
+
+    if extra:
+        result.update(extra)
+
+    return result
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # ANALYSE PRINCIPALE
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def analyze_market(
     symbol: str = "XAU/USD",
 ) -> Dict[str, Any]:
-    """
-    Analyse complète d'un marché.
-
-    Forex / XAU :
-        Twelve Data disponible -> analyse
-        Twelve Data cooldown -> WAIT
-
-    Crypto :
-        fournisseur crypto -> analyse
-        Twelve Data ignoré
-    """
 
     symbol = str(
         symbol or "XAU/USD"
@@ -2168,9 +2112,9 @@ def analyze_market(
         symbol,
     )
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # 1. PROVIDER
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
 
     if not _is_crypto_symbol(
         symbol
@@ -2189,19 +2133,14 @@ def analyze_market(
                 provider_reason,
             )
 
-            logger.info(
-                "Analyse reportée : %s",
-                symbol,
-            )
-
             return _wait_result(
                 symbol,
                 provider_reason,
             )
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # 2. MARCHÉ
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
 
     if not _market_open(
         symbol
@@ -2212,9 +2151,9 @@ def analyze_market(
             "Marché actuellement fermé.",
         )
 
-    # ------------------------------------------------------------------
-    # 3. RÉCUPÉRATION DES DONNÉES
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 3. DONNÉES
+    # ----------------------------------------------------------------------
 
     candles: Dict[
         str,
@@ -2222,10 +2161,6 @@ def analyze_market(
     ] = {}
 
     for timeframe in TIMEFRAMES:
-
-        # --------------------------------------------------------------
-        # Vérification provider avant chaque appel
-        # --------------------------------------------------------------
 
         if not _is_crypto_symbol(
             symbol
@@ -2239,36 +2174,15 @@ def analyze_market(
 
             if not ready:
 
-                logger.warning(
-                    "%s",
-                    reason,
-                )
-
-                logger.info(
-                    "Analyse reportée : %s",
-                    symbol,
-                )
-
                 return _wait_result(
                     symbol,
                     reason,
                 )
 
-        # --------------------------------------------------------------
-        # Récupération
-        # --------------------------------------------------------------
-
         data = _extract_candles(
             symbol,
             timeframe,
         )
-
-        # --------------------------------------------------------------
-        # IMPORTANT :
-        # si get_candles() vient de déclencher
-        # un cooldown, on retourne la vraie raison
-        # au lieu de "Données insuffisantes H4".
-        # --------------------------------------------------------------
 
         if not data:
 
@@ -2284,16 +2198,6 @@ def analyze_market(
 
                 if not ready:
 
-                    logger.warning(
-                        "%s",
-                        reason,
-                    )
-
-                    logger.info(
-                        "Analyse reportée : %s",
-                        symbol,
-                    )
-
                     return _wait_result(
                         symbol,
                         reason,
@@ -2307,13 +2211,8 @@ def analyze_market(
                 ),
             )
 
-        # --------------------------------------------------------------
-        # Validation historique
-        # --------------------------------------------------------------
-
         if not _validate_candles(
-            data,
-            minimum=20,
+            data
         ):
 
             return _wait_result(
@@ -2328,9 +2227,9 @@ def analyze_market(
             timeframe
         ] = data
 
-    # ------------------------------------------------------------------
-    # 4. DIRECTIONS H4 / H1 / M15
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 4. DIRECTIONS
+    # ----------------------------------------------------------------------
 
     h4_direction = _structure_direction(
         candles["H4"]
@@ -2355,9 +2254,9 @@ def analyze_market(
         m15_direction,
     )
 
-    # ------------------------------------------------------------------
-    # 5. ALIGNEMENT PRINCIPAL
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 5. ALIGNEMENT
+    # ----------------------------------------------------------------------
 
     direction = _primary_alignment(
         h4_direction,
@@ -2368,10 +2267,7 @@ def analyze_market(
     if direction == "NEUTRAL":
 
         logger.info(
-            (
-                "%s : "
-                "H4/H1/M15 non alignés."
-            ),
+            "%s : H4/H1/M15 non alignés.",
             symbol,
         )
 
@@ -2382,6 +2278,9 @@ def analyze_market(
                 "ne sont pas parfaitement alignés."
             ),
             direction="NEUTRAL",
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
         )
 
     logger.info(
@@ -2390,50 +2289,122 @@ def analyze_market(
         direction,
     )
 
-    # ------------------------------------------------------------------
-    # 6. ZONE CLÉ
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 6. RECHERCHE MULTI-ZONES
+    # ----------------------------------------------------------------------
 
-    zone_low, zone_high = (
-        _find_key_level(
-            candles["M15"],
-            direction,
-        )
-    )
-
-    if (
-        zone_low <= 0
-        or zone_high <= 0
-    ):
-
-        return _reject_result(
-            symbol,
-            "Aucune zone clé exploitable.",
-            direction=direction,
-        )
-
-    # ------------------------------------------------------------------
-    # 7. BREAKOUT
-    # ------------------------------------------------------------------
-
-    breakout = _breakout_confirmed(
+    zone_candidates = _build_zone_candidates(
         candles["M15"],
         direction,
+        max_zones=8,
+    )
+
+    logger.info(
+        "%s : %s zones candidates détectées.",
+        symbol,
+        len(zone_candidates),
+    )
+
+    if not zone_candidates:
+
+        return _wait_result(
+            symbol,
+            (
+                "Contexte H4/H1/M15 valide, "
+                "mais aucune zone clé exploitable "
+                "n'est actuellement disponible."
+            ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+        )
+
+    # ----------------------------------------------------------------------
+    # 7. RECHERCHE BREAKOUT
+    # ----------------------------------------------------------------------
+
+    selected_zone = None
+
+    for zone_low, zone_high in zone_candidates:
+
+        breakout = _breakout_confirmed(
+            candles["M15"],
+            direction,
+            zone_low,
+            zone_high,
+        )
+
+        logger.info(
+            (
+                "%s zone %.5f-%.5f | "
+                "breakout=%s"
+            ),
+            symbol,
+            zone_low,
+            zone_high,
+            breakout,
+        )
+
+        if breakout:
+
+            selected_zone = (
+                zone_low,
+                zone_high,
+            )
+
+            break
+
+    # ----------------------------------------------------------------------
+    # IMPORTANT :
+    # aucun breakout = WAIT
+    # et NON REJECT.
+    # ----------------------------------------------------------------------
+
+    if selected_zone is None:
+
+        logger.info(
+            (
+                "%s : aucun breakout confirmé. "
+                "Contexte directionnel conservé."
+            ),
+            symbol,
+        )
+
+        return _wait_result(
+            symbol,
+            (
+                "H4 + H1 + M15 alignés, "
+                "mais aucun breakout de zone clé "
+                "n'est encore confirmé."
+            ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            extra={
+                "zones_tested": len(
+                    zone_candidates
+                ),
+                "breakout_confirmed": False,
+            },
+        )
+
+    zone_low, zone_high = selected_zone
+
+    logger.info(
+        (
+            "%s breakout confirmé | "
+            "zone=%.5f-%.5f"
+        ),
+        symbol,
         zone_low,
         zone_high,
     )
 
-    if not breakout:
-
-        return _reject_result(
-            symbol,
-            "Breakout de la zone clé non confirmé.",
-            direction=direction,
-        )
-
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     # 8. RETEST
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
 
     retest = _retest_confirmed(
         candles["M15"],
@@ -2447,14 +2418,32 @@ def analyze_market(
         return _wait_result(
             symbol,
             (
-                "Breakout confirmé "
-                "mais retest non confirmé."
+                "Breakout confirmé, "
+                "mais retest de la zone "
+                "encore absent."
             ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            extra={
+                "breakout_confirmed": True,
+                "retest_confirmed": False,
+                "zone": {
+                    "low": zone_low,
+                    "high": zone_high,
+                },
+            },
         )
 
-    # ------------------------------------------------------------------
+    logger.info(
+        "%s retest confirmé.",
+        symbol,
+    )
+
+    # ----------------------------------------------------------------------
     # 9. REJECTION
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
 
     rejection = _rejection_confirmed(
         candles["M15"],
@@ -2466,14 +2455,33 @@ def analyze_market(
         return _wait_result(
             symbol,
             (
-                "Retest détecté "
-                "mais rejection non confirmée."
+                "Retest détecté, "
+                "mais rejection de zone "
+                "non confirmée."
             ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            extra={
+                "breakout_confirmed": True,
+                "retest_confirmed": True,
+                "rejection_confirmed": False,
+                "zone": {
+                    "low": zone_low,
+                    "high": zone_high,
+                },
+            },
         )
 
-    # ------------------------------------------------------------------
-    # 10. CONFIRMATION CANDLE M15
-    # ------------------------------------------------------------------
+    logger.info(
+        "%s rejection confirmée.",
+        symbol,
+    )
+
+    # ----------------------------------------------------------------------
+    # 10. CONFIRMATION M15
+    # ----------------------------------------------------------------------
 
     candle_confirmation = (
         _candle_confirmation(
@@ -2487,14 +2495,88 @@ def analyze_market(
         return _wait_result(
             symbol,
             (
-                "Candle de confirmation "
-                "M15 absente."
+                "Rejection détectée, "
+                "mais la bougie de confirmation "
+                "M15 n'est pas encore valide."
             ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            extra={
+                "breakout_confirmed": True,
+                "retest_confirmed": True,
+                "rejection_confirmed": True,
+                "candle_confirmation": False,
+                "zone": {
+                    "low": zone_low,
+                    "high": zone_high,
+                },
+            },
         )
 
-    # ------------------------------------------------------------------
-    # 11. ENTRY
-    # ------------------------------------------------------------------
+    logger.info(
+        "%s confirmation candle M15 valide.",
+        symbol,
+    )
+
+    # ----------------------------------------------------------------------
+    # 11. MOMENTUM / VITESSE
+    # ----------------------------------------------------------------------
+
+    momentum = _momentum_analysis(
+        candles["M15"],
+        direction,
+    )
+
+    logger.info(
+        (
+            "%s momentum : valid=%s | "
+            "speed=%s | body_ratio=%s | "
+            "expansion=%s"
+        ),
+        symbol,
+        momentum.get("valid"),
+        momentum.get("speed"),
+        momentum.get("body_ratio"),
+        momentum.get("expansion"),
+    )
+
+    # Momentum analysé mais ne force jamais un signal.
+    # S'il est insuffisant, on attend simplement.
+
+    if not momentum.get(
+        "valid",
+        False,
+    ):
+
+        return _wait_result(
+            symbol,
+            (
+                "Structure et zone confirmées, "
+                "mais vitesse/momentum insuffisant "
+                "pour une entrée de qualité."
+            ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            extra={
+                "breakout_confirmed": True,
+                "retest_confirmed": True,
+                "rejection_confirmed": True,
+                "candle_confirmation": True,
+                "momentum": momentum,
+                "zone": {
+                    "low": zone_low,
+                    "high": zone_high,
+                },
+            },
+        )
+
+    # ----------------------------------------------------------------------
+    # 12. ENTRY
+    # ----------------------------------------------------------------------
 
     current_candle = (
         candles["M5"][-1]
@@ -2516,11 +2598,14 @@ def analyze_market(
             symbol,
             "Prix d'entrée invalide.",
             direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
         )
 
-    # ------------------------------------------------------------------
-    # 12. ATR
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 13. ATR
+    # ----------------------------------------------------------------------
 
     atr = _calculate_atr(
         candles["M15"],
@@ -2533,11 +2618,14 @@ def analyze_market(
             symbol,
             "ATR invalide.",
             direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
         )
 
-    # ------------------------------------------------------------------
-    # 13. SL / TP
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 14. SL / TP
+    # ----------------------------------------------------------------------
 
     stop_loss, take_profit = (
         _build_sl_tp(
@@ -2559,11 +2647,14 @@ def analyze_market(
             symbol,
             "Géométrie Entry/SL/TP invalide.",
             direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
         )
 
-    # ------------------------------------------------------------------
-    # 14. RR
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 15. RR
+    # ----------------------------------------------------------------------
 
     rr = calculate_rr(
         entry,
@@ -2599,12 +2690,15 @@ def analyze_market(
                 f"{minimum_rr:.2f}"
             ),
             direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
             rr=rr,
         )
 
-    # ------------------------------------------------------------------
-    # 15. M5 SECONDARY
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 16. M5
+    # ----------------------------------------------------------------------
 
     m5 = _m5_confirmation(
         candles["M5"],
@@ -2614,24 +2708,26 @@ def analyze_market(
     logger.info(
         (
             "%s M5 : valid=%s | "
-            "BOS=%s | sweep=%s | "
-            "retest=%s | candle=%s"
+            "direction=%s | BOS=%s | "
+            "sweep=%s | retest=%s | candle=%s"
         ),
         symbol,
         m5.get("valid"),
+        m5.get("direction"),
         m5.get("micro_bos"),
         m5.get("liquidity_sweep"),
         m5.get("retest"),
         m5.get("candle_confirmation"),
     )
 
+    # ----------------------------------------------------------------------
     # IMPORTANT :
-    # aucune condition ici ne rejette le setup
-    # uniquement parce que M5 n'est pas confirmé.
+    # M5 ne peut PAS rejeter.
+    # ----------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # 16. SCORE
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 17. ZONE FINALE
+    # ----------------------------------------------------------------------
 
     zone = {
         "low": zone_low,
@@ -2643,7 +2739,20 @@ def analyze_market(
         "candle_confirmation": True,
         "entry_valid": True,
         "structure_confirmed": True,
+        "momentum_valid": bool(
+            momentum.get("valid")
+        ),
+        "liquidity": bool(
+            m5.get("liquidity_sweep")
+        ),
+        "key_level": (
+            zone_low + zone_high
+        ) / 2,
     }
+
+    # ----------------------------------------------------------------------
+    # 18. SCORE
+    # ----------------------------------------------------------------------
 
     score = _calculate_final_score(
         symbol=symbol,
@@ -2654,6 +2763,7 @@ def analyze_market(
         m5=m5,
         rr=rr,
         zone=zone,
+        momentum=momentum,
     )
 
     threshold = 60.0
@@ -2695,13 +2805,24 @@ def analyze_market(
                 f"{threshold:.2f}"
             ),
             direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            m5_direction=m5.get(
+                "direction",
+                "NEUTRAL",
+            ),
             score=score,
             rr=rr,
+            extra={
+                "momentum": momentum,
+                "zone": zone,
+            },
         )
 
-    # ------------------------------------------------------------------
-    # 17. NEWS
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 19. NEWS
+    # ----------------------------------------------------------------------
 
     news_blocked, news_reason = (
         _check_news(
@@ -2718,11 +2839,28 @@ def analyze_market(
                 or
                 "Annonce économique importante bloquante."
             ),
+            direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            m5_direction=m5.get(
+                "direction",
+                "NEUTRAL",
+            ),
+            extra={
+                "score": score,
+                "rr": rr,
+                "entry": entry,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "zone": zone,
+                "momentum": momentum,
+            },
         )
 
-    # ------------------------------------------------------------------
-    # 18. CONSTRUCTION SIGNAL
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 20. CONSTRUCTION SIGNAL
+    # ----------------------------------------------------------------------
 
     signal = None
 
@@ -2789,19 +2927,13 @@ def analyze_market(
                 exc,
             )
 
-    # ------------------------------------------------------------------
-    # 19. RESULTAT FINAL
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # 21. SIGNAL ID
+    # ----------------------------------------------------------------------
 
     signal_id = None
 
     if signal is not None:
-
-        signal_id = getattr(
-            signal,
-            "signal_id",
-            None,
-        )
 
         if isinstance(
             signal,
@@ -2812,15 +2944,17 @@ def analyze_market(
                 "signal_id"
             )
 
-    # ------------------------------------------------------------------
-    # IMPORTANT :
-    # Le pipeline ne doit pas prétendre qu'un objet Signal
-    # a été construit si build_signal a échoué.
-    #
-    # Les conditions analytiques restent valides, mais
-    # si le moteur de signal est disponible et échoue,
-    # on ne force jamais ACTIVE.
-    # ------------------------------------------------------------------
+        else:
+
+            signal_id = getattr(
+                signal,
+                "signal_id",
+                None,
+            )
+
+    # ----------------------------------------------------------------------
+    # 22. ÉCHEC CONSTRUCTION
+    # ----------------------------------------------------------------------
 
     if (
         build_signal is not None
@@ -2834,9 +2968,28 @@ def analyze_market(
                 "mais construction du signal impossible."
             ),
             direction=direction,
+            h4_direction=h4_direction,
+            h1_direction=h1_direction,
+            m15_direction=m15_direction,
+            m5_direction=m5.get(
+                "direction",
+                "NEUTRAL",
+            ),
             score=score,
             rr=rr,
+            extra={
+                "entry": entry,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "zone": zone,
+                "momentum": momentum,
+                "m5_confirmation": m5,
+            },
         )
+
+    # ----------------------------------------------------------------------
+    # 23. RÉSULTAT FINAL
+    # ----------------------------------------------------------------------
 
     result = {
         "symbol": symbol,
@@ -2845,7 +2998,8 @@ def analyze_market(
             "Signal validé : "
             "H4 + H1 + M15 alignés, "
             "zone + breakout + retest + "
-            "rejection + confirmation validés."
+            "rejection + confirmation + "
+            "momentum validés."
         ),
         "direction": direction,
         "score": round(
@@ -2866,9 +3020,18 @@ def analyze_market(
         "h4_direction": h4_direction,
         "h1_direction": h1_direction,
         "m15_direction": m15_direction,
+        "m5_direction": m5.get(
+            "direction",
+            "NEUTRAL",
+        ),
         "m5_confirmation": m5,
         "zone": zone,
+        "momentum": momentum,
         "atr": atr,
+        "breakout_confirmed": True,
+        "retest_confirmed": True,
+        "rejection_confirmed": True,
+        "candle_confirmation": True,
         "timestamp": _utc_now().isoformat(),
     }
 
@@ -2890,21 +3053,14 @@ def analyze_market(
     return result
 
 
-# ---------------------------------------------------------------------------
-# ALIASES DE COMPATIBILITÉ
-# ---------------------------------------------------------------------------
+# ============================================================================
+# ALIASES
+# ============================================================================
 
 def analyser_marche(
     symbol: str = "XAU/USD",
     timeframe: str = "M15",
 ) -> Dict[str, Any]:
-    """
-    Alias français conservé pour compatibilité.
-
-    Le paramètre timeframe est conservé pour éviter
-    de casser les appels existants, mais l'analyse
-    reste obligatoirement multi-timeframe.
-    """
 
     return analyze_market(
         symbol
@@ -2929,9 +3085,9 @@ def run_analysis(
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # EXPORT
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 __all__ = [
     "analyze_market",
