@@ -15,8 +15,6 @@ from telegram.ext import (
 )
 from config import CONFIG, ALL_SYMBOLS
 from analysis.pipeline import analyze_market
-from signals.signal_tracker import SignalTracker
-from signals.signal_monitor import SignalMonitor
 # ============================================================
 # LOGGING
 # ============================================================
@@ -28,42 +26,61 @@ logger = logging.getLogger("NOVA_TRADE_AI")
 # ============================================================
 # ENVIRONMENT
 # ============================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    "",
+).strip()
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    "",
+).strip()
 AUTO_SIGNAL_ENABLED = (
-    os.getenv("AUTO_SIGNAL_ENABLED", "true").lower()
+    os.getenv(
+        "AUTO_SIGNAL_ENABLED",
+        "true",
+    ).lower()
     in ("1", "true", "yes", "on")
 )
 SCAN_INTERVAL_SECONDS = int(
-    os.getenv("SCAN_INTERVAL_SECONDS", "900")
+    os.getenv(
+        "SCAN_INTERVAL_SECONDS",
+        "900",
+    )
 )
-# Délai entre deux marchés analysés automatiquement.
-# 15 secondes évite de créer une rafale de requêtes Twelve Data.
+# Délai entre deux marchés.
+# Valeur volontairement élevée pour éviter
+# les rafales vers Twelve Data.
 SCAN_SYMBOL_DELAY_SECONDS = int(
-    os.getenv("SCAN_SYMBOL_DELAY_SECONDS", "15")
+    os.getenv(
+        "SCAN_SYMBOL_DELAY_SECONDS",
+        "15",
+    )
 )
 SIGNAL_COOLDOWN_SECONDS = int(
-    os.getenv("SIGNAL_COOLDOWN_SECONDS", "14400")
+    os.getenv(
+        "SIGNAL_COOLDOWN_SECONDS",
+        "14400",
+    )
 )
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 last_sent_signals = {}
 scanner_task = None
-# Empêche plusieurs analyses de marché de tourner
-# simultanément et de créer des rafales API.
+# Une seule analyse à la fois.
+# Cela empêche le scanner automatique et une analyse
+# manuelle de faire des requêtes API simultanément.
 analysis_lock = asyncio.Lock()
-signal_tracker = SignalTracker()
-signal_monitor = SignalMonitor()
+# Référence globale vers l'application Telegram.
+application = None
 # ============================================================
-# MARKET ANALYSIS LOCK
+# MARKET ANALYSIS
 # ============================================================
 async def run_market_analysis(symbol: str):
     """
-    Exécute une analyse de marché de manière séquentielle.
-    Une seule analyse API peut être active à la fois.
-    Cela évite que le scanner automatique et une analyse
-    manuelle déclenchent plusieurs appels simultanément.
+    Exécute une analyse de marché.
+    Toutes les analyses passent par le même verrou
+    afin d'éviter plusieurs appels API simultanés.
     """
     async with analysis_lock:
         logger.info(
@@ -88,29 +105,7 @@ async def run_market_analysis(symbol: str):
                 "reason": str(exc),
             }
 # ============================================================
-# MONITOR NOTIFICATION
-# ============================================================
-async def send_monitor_notification(message: str):
-    """
-    Callback utilisé par le SignalMonitor.
-    """
-    if not TELEGRAM_CHAT_ID:
-        logger.warning(
-            "TELEGRAM_CHAT_ID absent : notification monitor ignorée."
-        )
-        return
-    try:
-        await application.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=message,
-        )
-    except Exception as exc:
-        logger.exception(
-            "Erreur notification monitor : %s",
-            exc,
-        )
-# ============================================================
-# KEYBOARDS
+# KEYBOARD
 # ============================================================
 def main_menu_keyboard():
     return InlineKeyboardMarkup(
@@ -138,22 +133,48 @@ def main_menu_keyboard():
         ]
     )
 # ============================================================
-# FORMATTING
+# FORMAT RESULT
 # ============================================================
 def format_analysis_result(result: dict) -> str:
     """
     Formate le résultat d'analyse pour Telegram.
     """
-    symbol = result.get("symbol", "N/A")
-    direction = result.get("direction", "NEUTRAL")
-    score = result.get("score", 0)
-    rr = result.get("rr", 0)
-    quality = result.get("quality", "N/A")
-    status = result.get("status", "N/A")
-    reason = result.get("reason")
-    entry = result.get("entry")
-    stop_loss = result.get("stop_loss")
-    take_profit = result.get("take_profit")
+    symbol = result.get(
+        "symbol",
+        "N/A",
+    )
+    direction = result.get(
+        "direction",
+        "NEUTRAL",
+    )
+    score = result.get(
+        "score",
+        0,
+    )
+    rr = result.get(
+        "rr",
+        0,
+    )
+    quality = result.get(
+        "quality",
+        "N/A",
+    )
+    status = result.get(
+        "status",
+        "N/A",
+    )
+    reason = result.get(
+        "reason",
+    )
+    entry = result.get(
+        "entry",
+    )
+    stop_loss = result.get(
+        "stop_loss",
+    )
+    take_profit = result.get(
+        "take_profit",
+    )
     lines = [
         "📊 NOVA TRADE AI",
         "",
@@ -165,11 +186,17 @@ def format_analysis_result(result: dict) -> str:
         f"Statut : {status}",
     ]
     if entry is not None:
-        lines.append(f"Entry : {entry}")
+        lines.append(
+            f"Entry : {entry}"
+        )
     if stop_loss is not None:
-        lines.append(f"SL : {stop_loss}")
+        lines.append(
+            f"SL : {stop_loss}"
+        )
     if take_profit is not None:
-        lines.append(f"TP : {take_profit}")
+        lines.append(
+            f"TP : {take_profit}"
+        )
     if reason:
         lines.extend(
             [
@@ -181,34 +208,73 @@ def format_analysis_result(result: dict) -> str:
 # ============================================================
 # AUTOMATIC SIGNAL VALIDATION
 # ============================================================
-def is_valid_automatic_signal(result: dict) -> bool:
+def is_valid_automatic_signal(
+    result: dict,
+) -> bool:
     """
-    Validation finale avant envoi automatique.
-    H4 + H1 + M15 doivent être parfaitement alignés.
-    M5 reste secondaire/non bloquant.
+    Validation finale d'un signal automatique.
+    Validation principale :
+        H4 + H1 + M15
+    doivent être parfaitement alignés.
+    M5 reste secondaire et non bloquant.
     """
     if not result:
         return False
     status = str(
-        result.get("status", "")
+        result.get(
+            "status",
+            "",
+        )
     ).upper()
     direction = str(
-        result.get("direction", "")
+        result.get(
+            "direction",
+            "",
+        )
     ).upper()
-    score = float(
-        result.get("score", 0) or 0
-    )
-    rr = float(
-        result.get("rr", 0) or 0
-    )
+    try:
+        score = float(
+            result.get(
+                "score",
+                0,
+            )
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        score = 0.0
+    try:
+        rr = float(
+            result.get(
+                "rr",
+                0,
+            )
+            or 0
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        rr = 0.0
     h4 = str(
-        result.get("h4_direction", "")
+        result.get(
+            "h4_direction",
+            "",
+        )
     ).upper()
     h1 = str(
-        result.get("h1_direction", "")
+        result.get(
+            "h1_direction",
+            "",
+        )
     ).upper()
     m15 = str(
-        result.get("m15_direction", "")
+        result.get(
+            "m15_direction",
+            "",
+        )
     ).upper()
     # --------------------------------------------------------
     # STATUS
@@ -218,11 +284,13 @@ def is_valid_automatic_signal(result: dict) -> bool:
     # --------------------------------------------------------
     # DIRECTION
     # --------------------------------------------------------
-    if direction not in ("BUY", "SELL"):
+    if direction not in (
+        "BUY",
+        "SELL",
+    ):
         return False
     # --------------------------------------------------------
-    # ALIGNEMENT PRINCIPAL
-    # H4 + H1 + M15
+    # ALIGNEMENT H4 + H1 + M15
     # --------------------------------------------------------
     if not (
         h4 == direction
@@ -242,27 +310,42 @@ def is_valid_automatic_signal(result: dict) -> bool:
         return False
     return True
 # ============================================================
-# SIGNAL SENDING
+# SEND SIGNAL
 # ============================================================
-async def send_signal_to_channel(result: dict):
+async def send_signal_to_channel(
+    result: dict,
+):
     """
-    Envoie un signal valide vers le canal Telegram.
+    Envoie un signal validé vers le canal Telegram.
     """
     if not TELEGRAM_CHAT_ID:
         logger.warning(
-            "TELEGRAM_CHAT_ID absent : signal non envoyé."
+            "TELEGRAM_CHAT_ID absent : "
+            "signal non envoyé."
         )
         return False
-    if not is_valid_automatic_signal(result):
+    if not is_valid_automatic_signal(
+        result
+    ):
         return False
-    symbol = result.get("symbol", "UNKNOWN")
-    direction = result.get("direction", "UNKNOWN")
+    symbol = result.get(
+        "symbol",
+        "UNKNOWN",
+    )
+    direction = result.get(
+        "direction",
+        "UNKNOWN",
+    )
     signal_key = (
         f"{symbol}:{direction}"
     )
-    now = datetime.now(timezone.utc)
-    previous_time = last_sent_signals.get(
-        signal_key
+    now = datetime.now(
+        timezone.utc
+    )
+    previous_time = (
+        last_sent_signals.get(
+            signal_key
+        )
     )
     # --------------------------------------------------------
     # COOLDOWN
@@ -272,49 +355,33 @@ async def send_signal_to_channel(result: dict):
             now - previous_time
         ).total_seconds()
         if elapsed < SIGNAL_COOLDOWN_SECONDS:
+            remaining = (
+                SIGNAL_COOLDOWN_SECONDS
+                - elapsed
+            )
             logger.info(
-                "SIGNAL %s ignoré : cooldown %.0fs restant.",
+                "SIGNAL %s ignoré : "
+                "cooldown %.0fs restant.",
                 signal_key,
-                SIGNAL_COOLDOWN_SECONDS - elapsed,
+                remaining,
             )
             return False
     # --------------------------------------------------------
-    # FORMAT MESSAGE
+    # MESSAGE
     # --------------------------------------------------------
     message = format_analysis_result(
         result
     )
     try:
-        sent_message = await application.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=message,
+        sent_message = (
+            await application.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=message,
+            )
         )
         last_sent_signals[
             signal_key
         ] = now
-        # ----------------------------------------------------
-        # TRACKER
-        # ----------------------------------------------------
-        signal = result.get("signal")
-        if signal is not None:
-            try:
-                signal_tracker.register_signal(
-                    signal
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Erreur SignalTracker : %s",
-                    exc,
-                )
-            try:
-                signal_monitor.register_signal(
-                    signal
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Erreur SignalMonitor : %s",
-                    exc,
-                )
         logger.info(
             "SIGNAL envoyé : %s %s",
             symbol,
@@ -328,12 +395,15 @@ async def send_signal_to_channel(result: dict):
         )
         return False
 # ============================================================
-# SCAN ONE SYMBOL
+# SCAN SYMBOL
 # ============================================================
-async def scan_symbol(symbol: str):
+async def scan_symbol(
+    symbol: str,
+):
     """
-    Analyse un symbole puis envoie automatiquement
-    le signal uniquement s'il respecte toutes les règles.
+    Analyse un symbole.
+    Le signal est envoyé uniquement s'il respecte
+    les conditions finales.
     """
     logger.info(
         "SCAN : %s",
@@ -344,7 +414,9 @@ async def scan_symbol(symbol: str):
     )
     if not result:
         return
-    if result.get("status") == "ERROR":
+    if result.get(
+        "status"
+    ) == "ERROR":
         return
     if is_valid_automatic_signal(
         result
@@ -358,20 +430,29 @@ async def scan_symbol(symbol: str):
         )
     else:
         logger.info(
-            "Aucun signal valide : %s | statut=%s | score=%s | RR=%s",
+            "Aucun signal valide : %s | "
+            "statut=%s | score=%s | RR=%s",
             symbol,
-            result.get("status"),
-            result.get("score", 0),
-            result.get("rr", 0),
+            result.get(
+                "status"
+            ),
+            result.get(
+                "score",
+                0,
+            ),
+            result.get(
+                "rr",
+                0,
+            ),
         )
 # ============================================================
 # AUTOMATIC SCANNER
 # ============================================================
 async def automatic_scan_loop():
     """
-    Scanner automatique.
-    Les marchés sont analysés un par un avec un délai
-    configurable afin d'éviter les rafales API.
+    Scanner automatique séquentiel.
+    Les marchés sont analysés un par un avec
+    un délai configurable entre chaque marché.
     """
     logger.info(
         "Scanner automatique démarré."
@@ -388,7 +469,8 @@ async def automatic_scan_loop():
         try:
             if not AUTO_SIGNAL_ENABLED:
                 logger.info(
-                    "AUTO_SIGNAL_ENABLED=false : scanner en pause."
+                    "AUTO_SIGNAL_ENABLED=false : "
+                    "scanner en pause."
                 )
             else:
                 logger.info(
@@ -408,10 +490,12 @@ async def automatic_scan_loop():
                             exc,
                         )
                     # ------------------------------------------------
-                    # IMPORTANT :
-                    # ne pas créer une rafale Twelve Data.
+                    # IMPORTANT
                     # ------------------------------------------------
-                    if index < len(ALL_SYMBOLS) - 1:
+                    if (
+                        index
+                        < len(ALL_SYMBOLS) - 1
+                    ):
                         await asyncio.sleep(
                             SCAN_SYMBOL_DELAY_SECONDS
                         )
@@ -432,52 +516,41 @@ async def automatic_scan_loop():
             SCAN_INTERVAL_SECONDS
         )
 # ============================================================
-# STARTUP / SHUTDOWN
+# POST INIT
 # ============================================================
-async def post_init(app: Application):
+async def post_init(
+    app: Application,
+):
     """
-    Initialisation après création de l'application.
+    Initialisation de NOVA TRADE AI.
     """
     global scanner_task
     logger.info(
         "NOVA TRADE AI : initialisation..."
     )
     # --------------------------------------------------------
-    # SIGNAL MONITOR
-    # --------------------------------------------------------
-    try:
-        await signal_monitor.start(
-            send_monitor_notification
-        )
-        logger.info(
-            "SignalMonitor démarré."
-        )
-    except Exception as exc:
-        logger.exception(
-            "Erreur démarrage SignalMonitor : %s",
-            exc,
-        )
-    # --------------------------------------------------------
-    # AUTOMATIC SCANNER
+    # SCANNER
     # --------------------------------------------------------
     if scanner_task is None:
         scanner_task = asyncio.create_task(
             automatic_scan_loop()
         )
         logger.info(
-            "Scanner task créée."
+            "Scanner automatique activé."
         )
-async def post_shutdown(app: Application):
+# ============================================================
+# POST SHUTDOWN
+# ============================================================
+async def post_shutdown(
+    app: Application,
+):
     """
-    Arrêt propre.
+    Arrêt propre du scanner.
     """
     global scanner_task
     logger.info(
         "Arrêt NOVA TRADE AI..."
     )
-    # --------------------------------------------------------
-    # SCANNER
-    # --------------------------------------------------------
     if scanner_task is not None:
         scanner_task.cancel()
         try:
@@ -485,30 +558,22 @@ async def post_shutdown(app: Application):
         except asyncio.CancelledError:
             pass
         scanner_task = None
-    # --------------------------------------------------------
-    # MONITOR
-    # --------------------------------------------------------
-    try:
-        await signal_monitor.stop()
-    except Exception as exc:
-        logger.exception(
-            "Erreur arrêt SignalMonitor : %s",
-            exc,
-        )
     logger.info(
         "NOVA TRADE AI arrêté."
     )
 # ============================================================
-# COMMAND /start
+# /START
 # ============================================================
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if update.message is None:
+        return
     text = (
         "🤖 NOVA TRADE AI\n\n"
-        "Système d'analyse multi-timeframe "
-        "SMC / ICT.\n\n"
+        "Système d'analyse "
+        "multi-timeframe SMC / ICT.\n\n"
         "Sélectionne une action :"
     )
     await update.message.reply_text(
@@ -516,41 +581,51 @@ async def start_command(
         reply_markup=main_menu_keyboard(),
     )
 # ============================================================
-# COMMAND /help
+# /HELP
 # ============================================================
 async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if update.message is None:
+        return
     text = (
         "📖 AIDE — NOVA TRADE AI\n\n"
         "/start — Menu principal\n"
-        "/analyse — Analyser un marché\n"
+        "/analyse — Analyser XAU/USD\n"
         "/status — État du bot\n"
         "/about — Informations\n\n"
-        "Validation principale : H4 + H1 + M15.\n"
+        "Validation principale : "
+        "H4 + H1 + M15.\n\n"
         "M5 est une confirmation secondaire "
-        "et ne bloque pas un setup principal valide."
+        "et ne bloque pas un setup principal "
+        "valide."
     )
     await update.message.reply_text(
         text,
         reply_markup=main_menu_keyboard(),
     )
 # ============================================================
-# COMMAND /about
+# /ABOUT
 # ============================================================
 async def about_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if update.message is None:
+        return
     text = (
         "ℹ️ NOVA TRADE AI\n\n"
-        "Analyse technique automatisée basée "
-        "sur Price Action / SMC / ICT.\n\n"
-        f"Score minimum : {CONFIG.SIGNAL_THRESHOLD}/100\n"
-        f"RR minimum : {CONFIG.MINIMUM_RR}\n"
-        f"Risque par trade : {CONFIG.DEFAULT_RISK_PERCENT}%\n\n"
-        "Timeframes principaux : H4 + H1 + M15\n"
+        "Analyse technique automatisée "
+        "Price Action / SMC / ICT.\n\n"
+        f"Score minimum : "
+        f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
+        f"RR minimum : "
+        f"{CONFIG.MINIMUM_RR}\n"
+        f"Risque/trade : "
+        f"{CONFIG.DEFAULT_RISK_PERCENT}%\n\n"
+        "Timeframes principaux : "
+        "H4 + H1 + M15\n"
         "Confirmation secondaire : M5"
     )
     await update.message.reply_text(
@@ -558,12 +633,14 @@ async def about_command(
         reply_markup=main_menu_keyboard(),
     )
 # ============================================================
-# COMMAND /status
+# /STATUS
 # ============================================================
 async def status_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if update.message is None:
+        return
     text = (
         "📊 STATUT NOVA TRADE AI\n\n"
         f"Auto-signaux : "
@@ -593,26 +670,25 @@ async def run_analysis_message(
     if message is None:
         return
     await message.reply_text(
-        "⏳ Analyse en cours..."
+        "⏳ Analyse de XAU/USD en cours..."
     )
-    # Pour éviter de lancer simultanément plusieurs appels
-    # API, les analyses manuelles passent par le même verrou.
-    symbol = "XAU/USD"
     result = await run_market_analysis(
-        symbol
+        "XAU/USD"
     )
     if not result:
         await message.reply_text(
             "❌ Aucun résultat d'analyse."
         )
         return
-    text = format_analysis_result(
-        result
-    )
     await message.reply_text(
-        text,
+        format_analysis_result(
+            result
+        ),
         reply_markup=main_menu_keyboard(),
     )
+# ============================================================
+# /ANALYSE
+# ============================================================
 async def analyse_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -621,7 +697,7 @@ async def analyse_command(
         update
     )
 # ============================================================
-# CALLBACKS
+# CALLBACK HANDLER
 # ============================================================
 async def callback_handler(
     update: Update,
@@ -648,7 +724,9 @@ async def callback_handler(
             )
             return
         await query.message.reply_text(
-            format_analysis_result(result),
+            format_analysis_result(
+                result
+            ),
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -660,7 +738,8 @@ async def callback_handler(
             "📊 STATUT\n\n"
             f"Auto-signaux : "
             f"{'ACTIF' if AUTO_SIGNAL_ENABLED else 'INACTIF'}\n"
-            f"Scan : {SCAN_INTERVAL_SECONDS}s\n"
+            f"Scan : "
+            f"{SCAN_INTERVAL_SECONDS}s\n"
             f"Délai marchés : "
             f"{SCAN_SYMBOL_DELAY_SECONDS}s\n"
             f"Score minimum : "
@@ -680,10 +759,13 @@ async def callback_handler(
         text = (
             "ℹ️ NOVA TRADE AI\n\n"
             "Système d'analyse SMC / ICT.\n\n"
-            "Validation principale : H4 + H1 + M15.\n"
-            "M5 : confirmation secondaire.\n"
-            f"Score minimum : {CONFIG.SIGNAL_THRESHOLD}/100\n"
-            f"RR minimum : {CONFIG.MINIMUM_RR}"
+            "Validation principale : "
+            "H4 + H1 + M15.\n"
+            "M5 : confirmation secondaire.\n\n"
+            f"Score minimum : "
+            f"{CONFIG.SIGNAL_THRESHOLD}/100\n"
+            f"RR minimum : "
+            f"{CONFIG.MINIMUM_RR}"
         )
         await query.message.reply_text(
             text,
@@ -706,17 +788,18 @@ async def callback_handler(
             )
             return
         await query.message.reply_text(
-            format_analysis_result(result),
+            format_analysis_result(
+                result
+            ),
             reply_markup=main_menu_keyboard(),
         )
         return
 # ============================================================
-# APPLICATION
+# CREATE APPLICATION
 # ============================================================
-application = None
 def create_application() -> Application:
     """
-    Crée et configure l'application Telegram.
+    Crée l'application Telegram.
     """
     global application
     if not TELEGRAM_BOT_TOKEN:
@@ -725,9 +808,15 @@ def create_application() -> Application:
         )
     application = (
         Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
+        .token(
+            TELEGRAM_BOT_TOKEN
+        )
+        .post_init(
+            post_init
+        )
+        .post_shutdown(
+            post_shutdown
+        )
         .build()
     )
     # --------------------------------------------------------
