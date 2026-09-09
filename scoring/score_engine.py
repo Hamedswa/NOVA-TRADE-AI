@@ -1,6 +1,6 @@
 """
 NOVA TRADE AI
-scoring/scoring_engine.py
+scoring/score_engine.py
 MOTEUR DE SCORE MULTI-FACTEURS
 Architecture :
     H4
