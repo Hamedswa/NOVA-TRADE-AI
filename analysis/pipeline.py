@@ -43,10 +43,16 @@ Règles principales :
 - Aucun signal forcé.
 - Score minimum : CONFIG.SIGNAL_THRESHOLD.
 - RR minimum : CONFIG.MINIMUM_RR.
+
+Compatibilité données :
+- Les moteurs peuvent recevoir des Candle ou des dict.
+- Les données provenant de market_data sont normalisées
+  en Candle avant toute analyse.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from config import CONFIG
@@ -139,9 +145,12 @@ TIMEFRAME_TO_API = {
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         result = float(value)
+
         if result != result:
             return default
+
         return result
+
     except (TypeError, ValueError):
         return default
 
@@ -159,10 +168,18 @@ def _normalize_direction(value: Any) -> Direction:
 
     text = str(value).upper().strip()
 
-    if text in {"BUY", "LONG", "BULLISH"}:
+    if text in {
+        "BUY",
+        "LONG",
+        "BULLISH",
+    }:
         return Direction.BUY
 
-    if text in {"SELL", "SHORT", "BEARISH"}:
+    if text in {
+        "SELL",
+        "SHORT",
+        "BEARISH",
+    }:
         return Direction.SELL
 
     return Direction.NEUTRAL
@@ -172,29 +189,293 @@ def _direction_value(value: Any) -> str:
     return _normalize_direction(value).value
 
 
-def _get(obj: Any, key: str, default: Any = None) -> Any:
+def _get(
+    obj: Any,
+    key: str,
+    default: Any = None,
+) -> Any:
+    """
+    Lecture compatible objet/dict.
+
+    Permet au pipeline de manipuler aussi bien :
+        candle.close
+    que :
+        candle["close"]
+    """
+
     if obj is None:
         return default
 
     if isinstance(obj, dict):
-        return obj.get(key, default)
+        if key in obj:
+            return obj.get(key, default)
 
-    return getattr(obj, key, default)
+        # Compatibilité avec des données utilisant des majuscules.
+        upper_key = key.upper()
+
+        if upper_key in obj:
+            return obj.get(upper_key, default)
+
+        # Compatibilité avec quelques noms alternatifs.
+        aliases = {
+            "timestamp": (
+                "datetime",
+                "date",
+                "time",
+            ),
+            "open": (
+                "o",
+            ),
+            "high": (
+                "h",
+            ),
+            "low": (
+                "l",
+            ),
+            "close": (
+                "c",
+            ),
+            "volume": (
+                "v",
+            ),
+        }
+
+        for alias in aliases.get(key, ()):
+            if alias in obj:
+                return obj.get(alias, default)
+
+        return default
+
+    return getattr(
+        obj,
+        key,
+        default,
+    )
 
 
-def _last_candle(candles: list[Candle]) -> Optional[Candle]:
+def _parse_timestamp(
+    value: Any,
+) -> datetime:
+    """
+    Convertit différents formats de timestamp en datetime.
+
+    Le pipeline n'a pas besoin d'un timestamp parfait pour les calculs
+    numériques, mais Candle attend un objet datetime exploitable.
+    """
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(
+                tzinfo=timezone.utc
+            )
+
+        return value
+
+    if value is None:
+        return datetime.now(timezone.utc)
+
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(
+                float(value),
+                tz=timezone.utc,
+            )
+        except Exception:
+            return datetime.now(timezone.utc)
+
+    text = str(value).strip()
+
+    if not text:
+        return datetime.now(timezone.utc)
+
+    # ISO classique.
+    try:
+        parsed = datetime.fromisoformat(
+            text.replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed
+
+    except Exception:
+        pass
+
+    # Formats courants de market data.
+    formats = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    )
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(
+                text,
+                fmt,
+            ).replace(
+                tzinfo=timezone.utc
+            )
+        except Exception:
+            continue
+
+    return datetime.now(timezone.utc)
+
+
+def _normalize_candle(
+    candle: Any,
+) -> Optional[Candle]:
+    """
+    Convertit une bougie provenant de n'importe quelle source
+    compatible en objet Candle.
+
+    Accepte :
+        Candle
+        dict
+        dict avec clés majuscules
+        dict avec o/h/l/c
+    """
+
+    if candle is None:
+        return None
+
+    if isinstance(candle, Candle):
+        return candle
+
+    try:
+        timestamp = _parse_timestamp(
+            _get(
+                candle,
+                "timestamp",
+                None,
+            )
+        )
+
+        open_price = _safe_float(
+            _get(
+                candle,
+                "open",
+                0.0,
+            )
+        )
+
+        high_price = _safe_float(
+            _get(
+                candle,
+                "high",
+                0.0,
+            )
+        )
+
+        low_price = _safe_float(
+            _get(
+                candle,
+                "low",
+                0.0,
+            )
+        )
+
+        close_price = _safe_float(
+            _get(
+                candle,
+                "close",
+                0.0,
+            )
+        )
+
+        volume = _safe_float(
+            _get(
+                candle,
+                "volume",
+                0.0,
+            )
+        )
+
+        # Une bougie sans OHLC exploitable est ignorée.
+        if (
+            open_price == 0.0
+            and high_price == 0.0
+            and low_price == 0.0
+            and close_price == 0.0
+        ):
+            return None
+
+        return Candle(
+            timestamp=timestamp,
+            open=open_price,
+            high=high_price,
+            low=low_price,
+            close=close_price,
+            volume=volume,
+        )
+
+    except Exception:
+        return None
+
+
+def _normalize_candles(
+    candles: Any,
+) -> list[Candle]:
+    """
+    Normalise toute collection de bougies.
+
+    Le résultat retourné par cette fonction est TOUJOURS :
+        list[Candle]
+    """
+
+    if candles is None:
+        return []
+
+    if isinstance(candles, Candle):
+        return [candles]
+
+    try:
+        raw_candles = list(candles)
+    except TypeError:
+        return []
+
+    normalized: list[Candle] = []
+
+    for candle in raw_candles:
+        converted = _normalize_candle(candle)
+
+        if converted is not None:
+            normalized.append(converted)
+
+    return normalized
+
+
+def _last_candle(
+    candles: list[Candle],
+) -> Optional[Candle]:
     if not candles:
         return None
+
     return candles[-1]
 
 
-def _last_price(candles: list[Candle]) -> float:
+def _last_price(
+    candles: list[Candle],
+) -> float:
     candle = _last_candle(candles)
 
     if candle is None:
         return 0.0
 
-    return _safe_float(candle.close)
+    return _safe_float(
+        _get(
+            candle,
+            "close",
+            0.0,
+        )
+    )
 
 
 def _atr_from_candles(
@@ -206,15 +487,41 @@ def _atr_from_candles(
 
     ranges = []
 
-    start = max(1, len(candles) - period)
+    start = max(
+        1,
+        len(candles) - period,
+    )
 
-    for index in range(start, len(candles)):
+    for index in range(
+        start,
+        len(candles),
+    ):
         current = candles[index]
         previous = candles[index - 1]
 
-        high = _safe_float(current.high)
-        low = _safe_float(current.low)
-        previous_close = _safe_float(previous.close)
+        high = _safe_float(
+            _get(
+                current,
+                "high",
+                0.0,
+            )
+        )
+
+        low = _safe_float(
+            _get(
+                current,
+                "low",
+                0.0,
+            )
+        )
+
+        previous_close = _safe_float(
+            _get(
+                previous,
+                "close",
+                0.0,
+            )
+        )
 
         true_range = max(
             high - low,
@@ -230,18 +537,29 @@ def _atr_from_candles(
     return sum(ranges) / len(ranges)
 
 
-def _call_analyser(function, *args, **kwargs):
+def _call_analyser(
+    function,
+    *args,
+    **kwargs,
+):
     """
     Appelle un moteur spécialisé sans laisser une incompatibilité
     mineure de signature faire tomber tout le pipeline.
     """
+
     try:
-        return function(*args, **kwargs)
+        return function(
+            *args,
+            **kwargs,
+        )
+
     except TypeError:
         try:
             return function(*args)
+
         except Exception:
             return None
+
     except Exception:
         return None
 
@@ -262,19 +580,38 @@ def _analyse_structure(
     )
 
 
-def _structure_direction(result: Any) -> Direction:
+def _structure_direction(
+    result: Any,
+) -> Direction:
     if result is None:
         return Direction.NEUTRAL
 
     direction = _normalize_direction(
-        _get(result, "direction", Direction.NEUTRAL)
+        _get(
+            result,
+            "direction",
+            Direction.NEUTRAL,
+        )
     )
 
     if direction != Direction.NEUTRAL:
         return direction
 
-    bullish = _safe_bool(_get(result, "bullish_structure", False))
-    bearish = _safe_bool(_get(result, "bearish_structure", False))
+    bullish = _safe_bool(
+        _get(
+            result,
+            "bullish_structure",
+            False,
+        )
+    )
+
+    bearish = _safe_bool(
+        _get(
+            result,
+            "bearish_structure",
+            False,
+        )
+    )
 
     if bullish and not bearish:
         return Direction.BUY
@@ -285,7 +622,9 @@ def _structure_direction(result: Any) -> Direction:
     return Direction.NEUTRAL
 
 
-def _structure_strength(result: Any) -> float:
+def _structure_strength(
+    result: Any,
+) -> float:
     if result is None:
         return 0.0
 
@@ -293,7 +632,13 @@ def _structure_strength(result: Any) -> float:
         0.0,
         min(
             100.0,
-            _safe_float(_get(result, "strength", 0.0)),
+            _safe_float(
+                _get(
+                    result,
+                    "strength",
+                    0.0,
+                )
+            ),
         ),
     )
 
@@ -305,7 +650,11 @@ def _structure_has_event(
     if result is None:
         return False
 
-    events = _get(result, event_name, ())
+    events = _get(
+        result,
+        event_name,
+        (),
+    )
 
     if events is None:
         return False
@@ -341,15 +690,27 @@ def _liquidity_sweep(
     if result is None:
         return False
 
-    sweep = _get(result, "sweep", None)
+    sweep = _get(
+        result,
+        "sweep",
+        None,
+    )
 
     if sweep is not None:
         sweep_direction = _normalize_direction(
-            _get(sweep, "direction", Direction.NEUTRAL)
+            _get(
+                sweep,
+                "direction",
+                Direction.NEUTRAL,
+            )
         )
 
         valid = _safe_bool(
-            _get(sweep, "valid", True)
+            _get(
+                sweep,
+                "valid",
+                True,
+            )
         )
 
         if valid:
@@ -358,16 +719,28 @@ def _liquidity_sweep(
 
             return sweep_direction == direction
 
-    sweeps = _get(result, "sweeps", ())
+    sweeps = _get(
+        result,
+        "sweeps",
+        (),
+    )
 
     if sweeps:
         for item in sweeps:
             item_direction = _normalize_direction(
-                _get(item, "direction", Direction.NEUTRAL)
+                _get(
+                    item,
+                    "direction",
+                    Direction.NEUTRAL,
+                )
             )
 
             valid = _safe_bool(
-                _get(item, "valid", True)
+                _get(
+                    item,
+                    "valid",
+                    True,
+                )
             )
 
             if valid and (
@@ -377,11 +750,17 @@ def _liquidity_sweep(
                 return True
 
     return _safe_bool(
-        _get(result, "liquidity_sweep", False)
+        _get(
+            result,
+            "liquidity_sweep",
+            False,
+        )
     )
 
 
-def _liquidity_quality(result: Any) -> float:
+def _liquidity_quality(
+    result: Any,
+) -> float:
     if result is None:
         return 0.0
 
@@ -390,12 +769,19 @@ def _liquidity_quality(result: Any) -> float:
         "quality",
         "score",
     ):
-        value = _get(result, key, None)
+        value = _get(
+            result,
+            key,
+            None,
+        )
 
         if value is not None:
             return max(
                 0.0,
-                min(100.0, _safe_float(value)),
+                min(
+                    100.0,
+                    _safe_float(value),
+                ),
             )
 
     return 0.0
@@ -427,14 +813,22 @@ def _displacement_valid(
         return False
 
     valid = _safe_bool(
-        _get(result, "valid", False)
+        _get(
+            result,
+            "valid",
+            False,
+        )
     )
 
     if not valid:
         return False
 
     result_direction = _normalize_direction(
-        _get(result, "direction", Direction.NEUTRAL)
+        _get(
+            result,
+            "direction",
+            Direction.NEUTRAL,
+        )
     )
 
     if result_direction == Direction.NEUTRAL:
@@ -443,7 +837,9 @@ def _displacement_valid(
     return result_direction == direction
 
 
-def _displacement_strength(result: Any) -> float:
+def _displacement_strength(
+    result: Any,
+) -> float:
     if result is None:
         return 0.0
 
@@ -452,13 +848,19 @@ def _displacement_strength(result: Any) -> float:
         min(
             100.0,
             _safe_float(
-                _get(result, "strength", 0.0)
+                _get(
+                    result,
+                    "strength",
+                    0.0,
+                )
             ),
         ),
     )
 
 
-def _displacement_atr_ratio(result: Any) -> float:
+def _displacement_atr_ratio(
+    result: Any,
+) -> float:
     if result is None:
         return 0.0
 
@@ -467,10 +869,17 @@ def _displacement_atr_ratio(result: Any) -> float:
         "range_atr_ratio",
         "body_atr_ratio",
     ):
-        value = _get(result, key, None)
+        value = _get(
+            result,
+            key,
+            None,
+        )
 
         if value is not None:
-            return max(0.0, _safe_float(value))
+            return max(
+                0.0,
+                _safe_float(value),
+            )
 
     return 0.0
 
@@ -502,13 +911,21 @@ def _best_order_block(
 
     try:
         return get_best_order_block(
-            _get(result, "order_blocks", ()),
+            _get(
+                result,
+                "order_blocks",
+                (),
+            ),
             direction,
         )
     except Exception:
         pass
 
-    best = _get(result, "best", None)
+    best = _get(
+        result,
+        "best",
+        None,
+    )
 
     if best is not None:
         return best
@@ -516,29 +933,45 @@ def _best_order_block(
     return None
 
 
-def _ob_exists(ob: Any) -> bool:
+def _ob_exists(
+    ob: Any,
+) -> bool:
     return ob is not None
 
 
-def _ob_fresh(ob: Any) -> bool:
+def _ob_fresh(
+    ob: Any,
+) -> bool:
     if ob is None:
         return False
 
     return _safe_bool(
-        _get(ob, "fresh", False)
+        _get(
+            ob,
+            "fresh",
+            False,
+        )
     )
 
 
-def _ob_mitigated(ob: Any) -> bool:
+def _ob_mitigated(
+    ob: Any,
+) -> bool:
     if ob is None:
         return False
 
     return _safe_bool(
-        _get(ob, "mitigated", False)
+        _get(
+            ob,
+            "mitigated",
+            False,
+        )
     )
 
 
-def _ob_displacement_origin(ob: Any) -> bool:
+def _ob_displacement_origin(
+    ob: Any,
+) -> bool:
     if ob is None:
         return False
 
@@ -551,7 +984,9 @@ def _ob_displacement_origin(ob: Any) -> bool:
     )
 
 
-def _ob_strength(ob: Any) -> float:
+def _ob_strength(
+    ob: Any,
+) -> float:
     if ob is None:
         return 0.0
 
@@ -560,7 +995,11 @@ def _ob_strength(ob: Any) -> float:
         min(
             100.0,
             _safe_float(
-                _get(ob, "strength", 0.0)
+                _get(
+                    ob,
+                    "strength",
+                    0.0,
+                )
             ),
         ),
     )
@@ -592,17 +1031,26 @@ def _best_fvg(
         return None
 
     try:
-        fvgs = _get(result, "fvgs", None)
+        fvgs = _get(
+            result,
+            "fvgs",
+            None,
+        )
 
         if fvgs is not None:
             return get_best_fvg(
                 fvgs,
                 direction,
             )
+
     except Exception:
         pass
 
-    best = _get(result, "fvg", None)
+    best = _get(
+        result,
+        "fvg",
+        None,
+    )
 
     if best is not None:
         return best
@@ -610,36 +1058,56 @@ def _best_fvg(
     return None
 
 
-def _fvg_exists(fvg: Any) -> bool:
+def _fvg_exists(
+    fvg: Any,
+) -> bool:
     return fvg is not None
 
 
-def _fvg_fresh(fvg: Any) -> bool:
+def _fvg_fresh(
+    fvg: Any,
+) -> bool:
     if fvg is None:
         return False
 
     return _safe_bool(
-        _get(fvg, "fresh", False)
+        _get(
+            fvg,
+            "fresh",
+            False,
+        )
     )
 
 
-def _fvg_filled(fvg: Any) -> bool:
+def _fvg_filled(
+    fvg: Any,
+) -> bool:
     if fvg is None:
         return False
 
     return _safe_bool(
-        _get(fvg, "filled", False)
+        _get(
+            fvg,
+            "filled",
+            False,
+        )
     )
 
 
-def _fvg_atr_ratio(fvg: Any) -> float:
+def _fvg_atr_ratio(
+    fvg: Any,
+) -> float:
     if fvg is None:
         return 0.0
 
     return max(
         0.0,
         _safe_float(
-            _get(fvg, "atr_ratio", 0.0)
+            _get(
+                fvg,
+                "atr_ratio",
+                0.0,
+            )
         ),
     )
 
@@ -664,7 +1132,9 @@ def _analyse_premium_discount(
     )
 
 
-def _premium_discount_zone(result: Any) -> str:
+def _premium_discount_zone(
+    result: Any,
+) -> str:
     if result is None:
         return "EQUILIBRIUM"
 
@@ -677,7 +1147,9 @@ def _premium_discount_zone(result: Any) -> str:
     return str(zone).upper()
 
 
-def _premium_discount_strength(result: Any) -> float:
+def _premium_discount_strength(
+    result: Any,
+) -> float:
     if result is None:
         return 0.0
 
@@ -686,7 +1158,11 @@ def _premium_discount_strength(result: Any) -> float:
         min(
             100.0,
             _safe_float(
-                _get(result, "strength", 0.0)
+                _get(
+                    result,
+                    "strength",
+                    0.0,
+                )
             ),
         ),
     )
@@ -734,18 +1210,28 @@ def _best_support_resistance(
             (),
         )
 
-        levels.extend(list(supports or ()))
-        levels.extend(list(resistances or ()))
+        levels.extend(
+            list(supports or ())
+        )
+
+        levels.extend(
+            list(resistances or ())
+        )
 
         if levels:
             return get_best_support_resistance(
                 levels,
                 direction,
             )
+
     except Exception:
         pass
 
-    return _get(result, "best", None)
+    return _get(
+        result,
+        "best",
+        None,
+    )
 
 
 # ============================================================================
@@ -766,14 +1252,19 @@ def _build_m5_confirmation(
             candle_confirmation=False,
         )
 
-    structure = _analyse_structure(candles)
+    structure = _analyse_structure(
+        candles
+    )
 
     structure_direction = _structure_direction(
         structure
     )
 
     micro_bos = (
-        _structure_has_event(structure, "bos")
+        _structure_has_event(
+            structure,
+            "bos",
+        )
         and (
             structure_direction == direction
             or structure_direction == Direction.NEUTRAL
@@ -800,20 +1291,55 @@ def _build_m5_confirmation(
         direction,
     )
 
-    candle = _last_candle(candles)
+    candle = _last_candle(
+        candles
+    )
 
     if candle is None:
         rejection = False
         candle_confirmation = False
+
     else:
+        candle_open = _safe_float(
+            _get(
+                candle,
+                "open",
+                0.0,
+            )
+        )
+
+        candle_close = _safe_float(
+            _get(
+                candle,
+                "close",
+                0.0,
+            )
+        )
+
+        candle_high = _safe_float(
+            _get(
+                candle,
+                "high",
+                0.0,
+            )
+        )
+
+        candle_low = _safe_float(
+            _get(
+                candle,
+                "low",
+                0.0,
+            )
+        )
+
         body = abs(
-            _safe_float(candle.close)
-            - _safe_float(candle.open)
+            candle_close
+            - candle_open
         )
 
         candle_range = max(
-            _safe_float(candle.high)
-            - _safe_float(candle.low),
+            candle_high
+            - candle_low,
             0.0,
         )
 
@@ -823,26 +1349,44 @@ def _build_m5_confirmation(
             else 0.0
         )
 
+        upper_wick = max(
+            candle_high
+            - max(
+                candle_open,
+                candle_close,
+            ),
+            0.0,
+        )
+
+        lower_wick = max(
+            min(
+                candle_open,
+                candle_close,
+            )
+            - candle_low,
+            0.0,
+        )
+
         if direction == Direction.BUY:
             candle_confirmation = (
-                candle.close > candle.open
+                candle_close > candle_open
                 and body_ratio >= 0.45
             )
 
             rejection = (
-                candle.lower_wick > candle.upper_wick
-                and candle.close >= candle.open
+                lower_wick > upper_wick
+                and candle_close >= candle_open
             )
 
         elif direction == Direction.SELL:
             candle_confirmation = (
-                candle.close < candle.open
+                candle_close < candle_open
                 and body_ratio >= 0.45
             )
 
             rejection = (
-                candle.upper_wick > candle.lower_wick
-                and candle.close <= candle.open
+                upper_wick > lower_wick
+                and candle_close <= candle_open
             )
 
         else:
@@ -966,6 +1510,7 @@ def _determine_scenario(
     bos: bool,
     choch: bool,
 ) -> str:
+
     if (
         liquidity_sweep
         and displacement_valid
@@ -1027,13 +1572,20 @@ def _recent_low(
     candles: list[Candle],
     lookback: int = 20,
 ) -> float:
+
     subset = candles[-lookback:]
 
     if not subset:
         return 0.0
 
     return min(
-        _safe_float(candle.low)
+        _safe_float(
+            _get(
+                candle,
+                "low",
+                0.0,
+            )
+        )
         for candle in subset
     )
 
@@ -1042,26 +1594,45 @@ def _recent_high(
     candles: list[Candle],
     lookback: int = 20,
 ) -> float:
+
     subset = candles[-lookback:]
 
     if not subset:
         return 0.0
 
     return max(
-        _safe_float(candle.high)
+        _safe_float(
+            _get(
+                candle,
+                "high",
+                0.0,
+            )
+        )
         for candle in subset
     )
 
 
-def _zone_low(zone: Any) -> float:
+def _zone_low(
+    zone: Any,
+) -> float:
     return _safe_float(
-        _get(zone, "low", 0.0)
+        _get(
+            zone,
+            "low",
+            0.0,
+        )
     )
 
 
-def _zone_high(zone: Any) -> float:
+def _zone_high(
+    zone: Any,
+) -> float:
     return _safe_float(
-        _get(zone, "high", 0.0)
+        _get(
+            zone,
+            "high",
+            0.0,
+        )
     )
 
 
@@ -1083,11 +1654,12 @@ def _build_trade_geometry(
     4. ATR
 
     TP :
-    - cible structurelle/liquidité si disponible
-    - sinon minimum RR configuré.
+    - minimum RR configuré.
     """
 
-    atr = _atr_from_candles(candles)
+    atr = _atr_from_candles(
+        candles
+    )
 
     if atr <= 0:
         atr = max(
@@ -1101,54 +1673,123 @@ def _build_trade_geometry(
 
     if ob is not None:
         ob_low = _safe_float(
-            _get(ob, "low", 0.0)
+            _get(
+                ob,
+                "low",
+                0.0,
+            )
         )
 
         ob_high = _safe_float(
-            _get(ob, "high", 0.0)
+            _get(
+                ob,
+                "high",
+                0.0,
+            )
         )
 
-        if direction == Direction.BUY and ob_low > 0:
-            stop_loss = ob_low - buffer
+        if (
+            direction == Direction.BUY
+            and ob_low > 0
+        ):
+            stop_loss = (
+                ob_low
+                - buffer
+            )
 
-        elif direction == Direction.SELL and ob_high > 0:
-            stop_loss = ob_high + buffer
+        elif (
+            direction == Direction.SELL
+            and ob_high > 0
+        ):
+            stop_loss = (
+                ob_high
+                + buffer
+            )
 
-    if stop_loss <= 0 and sr is not None:
+    if (
+        stop_loss <= 0
+        and sr is not None
+    ):
         sr_low = _safe_float(
-            _get(sr, "low", 0.0)
+            _get(
+                sr,
+                "low",
+                0.0,
+            )
         )
 
         sr_high = _safe_float(
-            _get(sr, "high", 0.0)
+            _get(
+                sr,
+                "high",
+                0.0,
+            )
         )
 
-        if direction == Direction.BUY and sr_low > 0:
-            stop_loss = sr_low - buffer
+        if (
+            direction == Direction.BUY
+            and sr_low > 0
+        ):
+            stop_loss = (
+                sr_low
+                - buffer
+            )
 
-        elif direction == Direction.SELL and sr_high > 0:
-            stop_loss = sr_high + buffer
+        elif (
+            direction == Direction.SELL
+            and sr_high > 0
+        ):
+            stop_loss = (
+                sr_high
+                + buffer
+            )
 
     if stop_loss <= 0:
         if direction == Direction.BUY:
-            swing_low = _recent_low(candles)
-            stop_loss = swing_low - buffer
+            swing_low = _recent_low(
+                candles
+            )
+
+            stop_loss = (
+                swing_low
+                - buffer
+            )
+
         else:
-            swing_high = _recent_high(candles)
-            stop_loss = swing_high + buffer
+            swing_high = _recent_high(
+                candles
+            )
+
+            stop_loss = (
+                swing_high
+                + buffer
+            )
 
     if direction == Direction.BUY:
-        risk_distance = entry - stop_loss
+        risk_distance = (
+            entry
+            - stop_loss
+        )
     else:
-        risk_distance = stop_loss - entry
+        risk_distance = (
+            stop_loss
+            - entry
+        )
 
     if risk_distance <= 0:
         risk_distance = atr
 
         if direction == Direction.BUY:
-            stop_loss = entry - risk_distance
+            stop_loss = (
+                entry
+                - risk_distance
+            )
+
         else:
-            stop_loss = entry + risk_distance
+            stop_loss = (
+                entry
+                + risk_distance
+            )
 
     target_distance = (
         risk_distance
@@ -1162,9 +1803,16 @@ def _build_trade_geometry(
     )
 
     if direction == Direction.BUY:
-        take_profit = entry + target_distance
+        take_profit = (
+            entry
+            + target_distance
+        )
+
     else:
-        take_profit = entry - target_distance
+        take_profit = (
+            entry
+            - target_distance
+        )
 
     return (
         stop_loss,
@@ -1186,12 +1834,6 @@ def _build_zone(
     structure_confirmed: bool,
     liquidity_nearby: bool,
 ) -> Optional[Zone]:
-    """
-    Construit un vrai objet Zone.
-
-    Le niveau S/R est privilégié.
-    OB/FVG servent de confluences.
-    """
 
     level_type = "NONE"
     key_level = 0.0
@@ -1200,7 +1842,11 @@ def _build_zone(
 
     if sr is not None:
         raw_type = str(
-            _get(sr, "level_type", "NONE")
+            _get(
+                sr,
+                "level_type",
+                "NONE",
+            )
         ).upper()
 
         if raw_type in {
@@ -1208,14 +1854,29 @@ def _build_zone(
             "RESISTANCE",
         }:
             level_type = raw_type
+
             key_level = _safe_float(
-                _get(sr, "key_level", 0.0)
+                _get(
+                    sr,
+                    "key_level",
+                    0.0,
+                )
             )
+
             low = _safe_float(
-                _get(sr, "low", 0.0)
+                _get(
+                    sr,
+                    "low",
+                    0.0,
+                )
             )
+
             high = _safe_float(
-                _get(sr, "high", 0.0)
+                _get(
+                    sr,
+                    "high",
+                    0.0,
+                )
             )
 
     if (
@@ -1223,14 +1884,25 @@ def _build_zone(
         and ob is not None
     ):
         low = _safe_float(
-            _get(ob, "low", 0.0)
+            _get(
+                ob,
+                "low",
+                0.0,
+            )
         )
 
         high = _safe_float(
-            _get(ob, "high", 0.0)
+            _get(
+                ob,
+                "high",
+                0.0,
+            )
         )
 
-        if low > 0 and high > 0:
+        if (
+            low > 0
+            and high > 0
+        ):
             key_level = (
                 low + high
             ) / 2.0
@@ -1246,14 +1918,25 @@ def _build_zone(
         and fvg is not None
     ):
         low = _safe_float(
-            _get(fvg, "low", 0.0)
+            _get(
+                fvg,
+                "low",
+                0.0,
+            )
         )
 
         high = _safe_float(
-            _get(fvg, "high", 0.0)
+            _get(
+                fvg,
+                "high",
+                0.0,
+            )
         )
 
-        if low > 0 and high > 0:
+        if (
+            low > 0
+            and high > 0
+        ):
             key_level = (
                 low + high
             ) / 2.0
@@ -1273,25 +1956,53 @@ def _build_zone(
     if high <= 0:
         high = key_level
 
-    breakout = _safe_bool(
-        _get(sr, "breakout", False)
-    ) if sr is not None else False
-
-    breakout_direction = _normalize_direction(
-        _get(
-            sr,
-            "breakout_direction",
-            Direction.NEUTRAL,
+    breakout = (
+        _safe_bool(
+            _get(
+                sr,
+                "breakout",
+                False,
+            )
         )
-    ) if sr is not None else Direction.NEUTRAL
+        if sr is not None
+        else False
+    )
 
-    retest = _safe_bool(
-        _get(sr, "retest", False)
-    ) if sr is not None else False
+    breakout_direction = (
+        _normalize_direction(
+            _get(
+                sr,
+                "breakout_direction",
+                Direction.NEUTRAL,
+            )
+        )
+        if sr is not None
+        else Direction.NEUTRAL
+    )
 
-    rejection = _safe_bool(
-        _get(sr, "rejection", False)
-    ) if sr is not None else False
+    retest = (
+        _safe_bool(
+            _get(
+                sr,
+                "retest",
+                False,
+            )
+        )
+        if sr is not None
+        else False
+    )
+
+    rejection = (
+        _safe_bool(
+            _get(
+                sr,
+                "rejection",
+                False,
+            )
+        )
+        if sr is not None
+        else False
+    )
 
     return Zone(
         direction=direction,
@@ -1335,6 +2046,7 @@ def _count_confluences(
     sr: Any,
     m5_confirmation: Confirmation,
 ) -> int:
+
     count = 0
 
     if structure_confirmed:
@@ -1385,17 +2097,29 @@ def _check_news(
     try:
         from economic_calendar import economic_filter
 
-        result = economic_filter(symbol)
+        result = economic_filter(
+            symbol
+        )
 
-        if isinstance(result, bool):
+        if isinstance(
+            result,
+            bool,
+        ):
             return result
 
-        if isinstance(result, dict):
+        if isinstance(
+            result,
+            dict,
+        ):
             if "allowed" in result:
-                return bool(result["allowed"])
+                return bool(
+                    result["allowed"]
+                )
 
             if "blocked" in result:
-                return not bool(result["blocked"])
+                return not bool(
+                    result["blocked"]
+                )
 
         return True
 
@@ -1465,10 +2189,8 @@ def _calculate_final_score(
 
     volatility_score = 0.0
 
-    atr_ratio = (
-        _displacement_atr_ratio(
-            displacement_result
-        )
+    atr_ratio = _displacement_atr_ratio(
+        displacement_result
     )
 
     if atr_ratio > 0:
@@ -1494,15 +2216,29 @@ def _calculate_final_score(
                 scenario=scenario,
 
                 liquidity_sweep=liquidity_sweep,
-                liquidity_sweep_quality=liquidity_quality,
+                liquidity_sweep_quality=(
+                    liquidity_quality
+                ),
 
-                displacement_valid=displacement_valid,
-                displacement_direction=displacement_direction,
-                displacement_atr_ratio=displacement_atr_ratio,
+                displacement_valid=(
+                    displacement_valid
+                ),
+                displacement_direction=(
+                    displacement_direction
+                ),
+                displacement_atr_ratio=(
+                    displacement_atr_ratio
+                ),
 
-                order_block=ob is not None,
-                order_block_fresh=_ob_fresh(ob),
-                order_block_mitigated=_ob_mitigated(ob),
+                order_block=(
+                    ob is not None
+                ),
+                order_block_fresh=(
+                    _ob_fresh(ob)
+                ),
+                order_block_mitigated=(
+                    _ob_mitigated(ob)
+                ),
                 order_block_displacement_origin=(
                     _ob_displacement_origin(ob)
                 ),
@@ -1516,12 +2252,22 @@ def _calculate_final_score(
                     )
                 ),
 
-                fvg=fvg is not None,
-                fvg_fresh=_fvg_fresh(fvg),
-                fvg_filled=_fvg_filled(fvg),
-                fvg_atr_ratio=_fvg_atr_ratio(fvg),
+                fvg=(
+                    fvg is not None
+                ),
+                fvg_fresh=(
+                    _fvg_fresh(fvg)
+                ),
+                fvg_filled=(
+                    _fvg_filled(fvg)
+                ),
+                fvg_atr_ratio=(
+                    _fvg_atr_ratio(fvg)
+                ),
 
-                premium_discount=premium_discount,
+                premium_discount=(
+                    premium_discount
+                ),
 
                 support_resistance=(
                     {
@@ -1579,29 +2325,35 @@ def _calculate_final_score(
                     else None
                 ),
 
-                volatility_score=volatility_score,
-                volatility_valid=volatility_score > 0,
+                volatility_score=(
+                    volatility_score
+                ),
+                volatility_valid=(
+                    volatility_score > 0
+                ),
 
                 m5_confirmation=True,
-                m5_direction=m5.direction,
-                m5_retest=m5.retest,
-                m5_rejection=m5.rejection,
-                m5_liquidity_sweep=m5.liquidity_sweep,
-                m5_micro_bos=m5.micro_bos,
-                m5_candle_confirmation=m5.candle_confirmation,
+                m5_direction=(
+                    m5.direction
+                ),
+                m5_retest=(
+                    m5.retest
+                ),
+                m5_rejection=(
+                    m5.rejection
+                ),
+                m5_liquidity_sweep=(
+                    m5.liquidity_sweep
+                ),
+                m5_micro_bos=(
+                    m5.micro_bos
+                ),
+                m5_candle_confirmation=(
+                    m5.candle_confirmation
+                ),
                 m5_displacement=(
-                    _displacement_valid(
-                        _analyse_displacement(
-                            [],
-                            direction,
-                        ),
-                        direction,
-                    )
-                    if False
-                    else (
-                        m5.micro_bos
-                        or m5.liquidity_sweep
-                    )
+                    m5.micro_bos
+                    or m5.liquidity_sweep
                 ),
             )
         )
@@ -1634,7 +2386,9 @@ def analyser_marche(
     Retourne toujours un dictionnaire exploitable par Telegram.
     """
 
-    symbol = str(symbol).upper().strip()
+    symbol = str(
+        symbol
+    ).upper().strip()
 
     requested_direction = _normalize_direction(
         requested_direction
@@ -1647,49 +2401,86 @@ def analyser_marche(
     candles_by_tf: dict[str, list[Candle]] = {}
 
     for tf in TIMEFRAMES:
-        api_interval = TIMEFRAME_TO_API[tf]
+        api_interval = TIMEFRAME_TO_API[
+            tf
+        ]
 
         try:
-            candles = get_candles(
+            raw_candles = get_candles(
                 symbol,
                 api_interval,
             )
 
-            if candles is None:
-                candles = []
-
-            candles_by_tf[tf] = list(candles)
+            # ================================================================
+            # CORRECTION CRITIQUE
+            # ================================================================
+            #
+            # market_data peut retourner :
+            #
+            #     {"open": ..., "high": ..., ...}
+            #
+            # alors que les moteurs utilisent :
+            #
+            #     candle.open
+            #     candle.high
+            #     candle.low
+            #     candle.close
+            #
+            # On normalise donc immédiatement les données.
+            #
+            candles_by_tf[tf] = _normalize_candles(
+                raw_candles
+            )
 
         except Exception:
             candles_by_tf[tf] = []
 
-    h4_candles = candles_by_tf["H4"]
-    h1_candles = candles_by_tf["H1"]
-    m15_candles = candles_by_tf["M15"]
-    m5_candles = candles_by_tf["M5"]
+    h4_candles = candles_by_tf[
+        "H4"
+    ]
+
+    h1_candles = candles_by_tf[
+        "H1"
+    ]
+
+    m15_candles = candles_by_tf[
+        "M15"
+    ]
+
+    m5_candles = candles_by_tf[
+        "M5"
+    ]
 
     if not m15_candles:
         return {
             "status": "NO_DATA",
             "symbol": symbol,
-            "direction": Direction.NEUTRAL.value,
+            "direction": (
+                Direction.NEUTRAL.value
+            ),
             "score": 0.0,
             "rr": 0.0,
             "scenario": "NO_DATA",
-            "reason": "M15_DATA_UNAVAILABLE",
+            "reason": (
+                "M15_DATA_UNAVAILABLE"
+            ),
         }
 
     # ------------------------------------------------------------------------
     # PRICE
     # ------------------------------------------------------------------------
 
-    entry = _last_price(m15_candles)
+    entry = _last_price(
+        m15_candles
+    )
 
     if entry <= 0:
         return {
             "status": "NO_DATA",
             "symbol": symbol,
-            "direction": Direction.NEUTRAL.value,
+            "direction": (
+                Direction.NEUTRAL.value
+            ),
             "score": 0.0,
             "rr": 0.0,
             "scenario": "NO_DATA",
@@ -1744,18 +2535,24 @@ def analyser_marche(
         h4=h4_direction,
         h1=h1_direction,
         m15=m15_direction,
-        requested_direction=requested_direction,
+        requested_direction=(
+            requested_direction
+        ),
     )
 
     if direction == Direction.NEUTRAL:
         return {
             "status": "REJECT",
             "symbol": symbol,
-            "direction": Direction.NEUTRAL.value,
+            "direction": (
+                Direction.NEUTRAL.value
+            ),
             "score": 0.0,
             "rr": 0.0,
             "scenario": "RANGE",
-            "reason": "NO_VALID_DIRECTION",
+            "reason": (
+                "NO_VALID_DIRECTION"
+            ),
             "h4": h4_direction.value,
             "h1": h1_direction.value,
             "m15": m15_direction.value,
@@ -1774,7 +2571,9 @@ def analyser_marche(
             "score": 0.0,
             "rr": 0.0,
             "scenario": "RANGE",
-            "reason": "PRIMARY_STRUCTURE_INVALID",
+            "reason": (
+                "PRIMARY_STRUCTURE_INVALID"
+            ),
         }
 
     # ------------------------------------------------------------------------
@@ -1832,6 +2631,7 @@ def analyser_marche(
                     direction=direction,
                 )
             )
+
         except Exception:
             displacement_after_sweep = (
                 displacement_valid
@@ -1927,7 +2727,7 @@ def analyser_marche(
         m5_confirmation
     )
 
-    # M5 est volontairement NON BLOQUANT.
+    # M5 volontairement NON BLOQUANT.
     m5_direction = (
         m5_confirmation.direction
     )
@@ -1956,8 +2756,15 @@ def analyser_marche(
         "choch",
     )
 
-    bos = h1_bos or m15_bos
-    choch = h1_choch or m15_choch
+    bos = (
+        h1_bos
+        or m15_bos
+    )
+
+    choch = (
+        h1_choch
+        or m15_choch
+    )
 
     # ------------------------------------------------------------------------
     # SCENARIO
@@ -1991,19 +2798,29 @@ def analyser_marche(
     )
 
     confluences = _count_confluences(
-        structure_confirmed=structure_confirmed,
-        liquidity_sweep=liquidity_sweep,
+        structure_confirmed=(
+            structure_confirmed
+        ),
+        liquidity_sweep=(
+            liquidity_sweep
+        ),
         displacement_valid=(
             displacement_valid
             or displacement_after_sweep
         ),
-        order_block=ob is not None,
-        fvg=fvg is not None,
+        order_block=(
+            ob is not None
+        ),
+        fvg=(
+            fvg is not None
+        ),
         premium_discount_valid=(
             premium_discount_valid
         ),
         sr=sr,
-        m5_confirmation=m5_confirmation,
+        m5_confirmation=(
+            m5_confirmation
+        ),
     )
 
     # ------------------------------------------------------------------------
@@ -2017,7 +2834,9 @@ def analyser_marche(
         fvg=fvg,
         h1_strength=h1_strength,
         m15_strength=m15_strength,
-        structure_confirmed=structure_confirmed,
+        structure_confirmed=(
+            structure_confirmed
+        ),
         liquidity_nearby=(
             liquidity_sweep
             or liquidity_quality >= 50
@@ -2044,13 +2863,15 @@ def analyser_marche(
     # SL / TP
     # ------------------------------------------------------------------------
 
-    stop_loss, take_profit = _build_trade_geometry(
-        candles=m15_candles,
-        direction=direction,
-        entry=entry,
-        ob=ob,
-        fvg=fvg,
-        sr=sr,
+    stop_loss, take_profit = (
+        _build_trade_geometry(
+            candles=m15_candles,
+            direction=direction,
+            entry=entry,
+            ob=ob,
+            fvg=fvg,
+            sr=sr,
+        )
     )
 
     # ------------------------------------------------------------------------
@@ -2065,6 +2886,7 @@ def analyser_marche(
                 take_profit=take_profit,
             )
         )
+
     except Exception:
         rr = 0.0
 
@@ -2083,6 +2905,7 @@ def analyser_marche(
                 direction=direction,
             )
         )
+
     except TypeError:
         try:
             geometry_valid = bool(
@@ -2093,10 +2916,16 @@ def analyser_marche(
                     direction,
                 )
             )
+
         except Exception:
-            geometry_valid = rr >= CONFIG.MINIMUM_RR
+            geometry_valid = (
+                rr >= CONFIG.MINIMUM_RR
+            )
+
     except Exception:
-        geometry_valid = rr >= CONFIG.MINIMUM_RR
+        geometry_valid = (
+            rr >= CONFIG.MINIMUM_RR
+        )
 
     if not geometry_valid:
         return {
@@ -2106,7 +2935,9 @@ def analyser_marche(
             "score": 0.0,
             "rr": rr,
             "scenario": scenario,
-            "reason": "INVALID_TRADE_GEOMETRY",
+            "reason": (
+                "INVALID_TRADE_GEOMETRY"
+            ),
             "h4": h4_direction.value,
             "h1": h1_direction.value,
             "m15": m15_direction.value,
@@ -2133,11 +2964,10 @@ def analyser_marche(
     # ------------------------------------------------------------------------
 
     entry_distance = abs(
-        entry - zone.key_level
+        entry
+        - zone.key_level
     )
 
-    # On ne prétend pas qu'un breakout/retest existe
-    # si le moteur S/R ne l'a pas détecté.
     zone = Zone(
         direction=zone.direction,
         timeframe=zone.timeframe,
@@ -2146,16 +2976,30 @@ def analyser_marche(
         h1_strength=zone.h1_strength,
         m15_strength=zone.m15_strength,
         kind=zone.kind,
-        structure_confirmed=zone.structure_confirmed,
-        liquidity_nearby=zone.liquidity_nearby,
-        order_block=zone.order_block,
-        fvg=zone.fvg,
+        structure_confirmed=(
+            zone.structure_confirmed
+        ),
+        liquidity_nearby=(
+            zone.liquidity_nearby
+        ),
+        order_block=(
+            zone.order_block
+        ),
+        fvg=(
+            zone.fvg
+        ),
         created_at=zone.created_at,
         level_type=zone.level_type,
         key_level=zone.key_level,
-        breakout_confirmed=zone.breakout_confirmed,
-        breakout_direction=zone.breakout_direction,
-        retest_confirmed=zone.retest_confirmed,
+        breakout_confirmed=(
+            zone.breakout_confirmed
+        ),
+        breakout_direction=(
+            zone.breakout_direction
+        ),
+        retest_confirmed=(
+            zone.retest_confirmed
+        ),
         rejection_confirmed=(
             zone.rejection_confirmed
             or m5_confirmation.rejection
@@ -2166,8 +3010,12 @@ def analyser_marche(
         entry_valid=(
             zone.low <= entry <= zone.high
             or (
-                entry_distance <= max(
-                    abs(zone.high - zone.low),
+                entry_distance
+                <= max(
+                    abs(
+                        zone.high
+                        - zone.low
+                    ),
                     _atr_from_candles(
                         m15_candles
                     ) * 0.50,
@@ -2192,7 +3040,9 @@ def analyser_marche(
         direction=direction,
         scenario=scenario,
         liquidity_result=liquidity_result,
-        displacement_result=displacement_result,
+        displacement_result=(
+            displacement_result
+        ),
         ob=ob,
         fvg=fvg,
         premium_discount_result=(
@@ -2206,7 +3056,10 @@ def analyser_marche(
 
     score = max(
         0.0,
-        min(100.0, score),
+        min(
+            100.0,
+            score,
+        ),
     )
 
     # ------------------------------------------------------------------------
@@ -2225,7 +3078,9 @@ def analyser_marche(
             "score": score,
             "rr": rr,
             "scenario": scenario,
-            "reason": "HIGH_IMPACT_NEWS",
+            "reason": (
+                "HIGH_IMPACT_NEWS"
+            ),
             "h4": h4_direction.value,
             "h1": h1_direction.value,
             "m15": m15_direction.value,
@@ -2244,28 +3099,50 @@ def analyser_marche(
             "status": "REJECT",
             "symbol": symbol,
             "direction": direction.value,
-            "score": round(score, 2),
-            "rr": round(rr, 2),
+            "score": round(
+                score,
+                2,
+            ),
+            "rr": round(
+                rr,
+                2,
+            ),
             "scenario": scenario,
-            "reason": "SCORE_BELOW_THRESHOLD",
+            "reason": (
+                "SCORE_BELOW_THRESHOLD"
+            ),
             "h4": h4_direction.value,
             "h1": h1_direction.value,
             "m15": m15_direction.value,
             "m5": m5_direction.value,
             "confluences": confluences,
-            "premium_discount": premium_discount_zone,
+            "premium_discount": (
+                premium_discount_zone
+            ),
             "premium_discount_strength": (
                 premium_discount_strength
             ),
-            "liquidity_sweep": liquidity_sweep,
-            "liquidity_quality": liquidity_quality,
-            "displacement": displacement_valid,
+            "liquidity_sweep": (
+                liquidity_sweep
+            ),
+            "liquidity_quality": (
+                liquidity_quality
+            ),
+            "displacement": (
+                displacement_valid
+            ),
             "displacement_after_sweep": (
                 displacement_after_sweep
             ),
-            "order_block": ob is not None,
-            "fvg": fvg is not None,
-            "m5_strength": m5_strength,
+            "order_block": (
+                ob is not None
+            ),
+            "fvg": (
+                fvg is not None
+            ),
+            "m5_strength": (
+                m5_strength
+            ),
         }
 
     # ------------------------------------------------------------------------
@@ -2288,6 +3165,7 @@ def analyser_marche(
             requested_direction=direction,
             scenario=scenario,
         )
+
     except Exception:
         signal = None
 
@@ -2300,10 +3178,18 @@ def analyser_marche(
             "status": "REJECT",
             "symbol": symbol,
             "direction": direction.value,
-            "score": round(score, 2),
-            "rr": round(rr, 2),
+            "score": round(
+                score,
+                2,
+            ),
+            "rr": round(
+                rr,
+                2,
+            ),
             "scenario": scenario,
-            "reason": "SIGNAL_ENGINE_REJECTED",
+            "reason": (
+                "SIGNAL_ENGINE_REJECTED"
+            ),
             "h4": h4_direction.value,
             "h1": h1_direction.value,
             "m15": m15_direction.value,
@@ -2315,6 +3201,7 @@ def analyser_marche(
         "status": "ACTIVE",
         "symbol": symbol,
         "direction": direction.value,
+
         "score": round(
             _safe_float(
                 _get(
@@ -2325,6 +3212,7 @@ def analyser_marche(
             ),
             2,
         ),
+
         "rr": round(
             _safe_float(
                 _get(
@@ -2335,15 +3223,22 @@ def analyser_marche(
             ),
             2,
         ),
-        "entry": round(entry, 8),
+
+        "entry": round(
+            entry,
+            8,
+        ),
+
         "stop_loss": round(
             stop_loss,
             8,
         ),
+
         "take_profit": round(
             take_profit,
             8,
         ),
+
         "scenario": scenario,
 
         "h4": h4_direction.value,
@@ -2355,10 +3250,12 @@ def analyser_marche(
             h4_strength,
             2,
         ),
+
         "h1_strength": round(
             h1_strength,
             2,
         ),
+
         "m15_strength": round(
             m15_strength,
             2,
@@ -2371,28 +3268,52 @@ def analyser_marche(
 
         "confluences": confluences,
 
-        "liquidity_sweep": liquidity_sweep,
+        "liquidity_sweep": (
+            liquidity_sweep
+        ),
+
         "liquidity_quality": round(
             liquidity_quality,
             2,
         ),
 
-        "displacement": displacement_valid,
+        "displacement": (
+            displacement_valid
+        ),
+
         "displacement_after_sweep": (
             displacement_after_sweep
         ),
 
-        "order_block": ob is not None,
-        "order_block_fresh": _ob_fresh(ob),
-        "order_block_mitigated": _ob_mitigated(ob),
+        "order_block": (
+            ob is not None
+        ),
+
+        "order_block_fresh": (
+            _ob_fresh(ob)
+        ),
+
+        "order_block_mitigated": (
+            _ob_mitigated(ob)
+        ),
+
         "order_block_strength": round(
             _ob_strength(ob),
             2,
         ),
 
-        "fvg": fvg is not None,
-        "fvg_fresh": _fvg_fresh(fvg),
-        "fvg_filled": _fvg_filled(fvg),
+        "fvg": (
+            fvg is not None
+        ),
+
+        "fvg_fresh": (
+            _fvg_fresh(fvg)
+        ),
+
+        "fvg_filled": (
+            _fvg_filled(fvg)
+        ),
+
         "fvg_atr_ratio": round(
             _fvg_atr_ratio(fvg),
             4,
@@ -2401,6 +3322,7 @@ def analyser_marche(
         "premium_discount": (
             premium_discount_zone
         ),
+
         "premium_discount_strength": round(
             premium_discount_strength,
             2,
@@ -2463,8 +3385,12 @@ def analyser_marche(
         ),
 
         "m5_confirmation": {
-            "retest": m5_confirmation.retest,
-            "rejection": m5_confirmation.rejection,
+            "retest": (
+                m5_confirmation.retest
+            ),
+            "rejection": (
+                m5_confirmation.rejection
+            ),
             "liquidity_sweep": (
                 m5_confirmation.liquidity_sweep
             ),
@@ -2484,7 +3410,18 @@ def analyser_marche(
 # ALIASES COMPATIBILITE
 # ============================================================================
 
-analyser_marche_complet = analyser_marche
-run_analysis = analyser_marche
-analyze_market = analyser_marche
-analyser_pipeline = analyser_marche
+analyser_marche_complet = (
+    analyser_marche
+)
+
+run_analysis = (
+    analyser_marche
+)
+
+analyze_market = (
+    analyser_marche
+)
+
+analyser_pipeline = (
+    analyser_marche
+)
