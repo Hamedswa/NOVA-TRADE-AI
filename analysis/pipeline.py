@@ -2,264 +2,120 @@
 NOVA TRADE AI
 analysis/pipeline.py
 
-Pipeline principal d'analyse multi-timeframe.
+Pipeline déterministe principal.
 
 Architecture :
 
-    H4
-     ↓
-    BIAIS GLOBAL / PRÉFÉRENCE
-     ↓
-    H1
-     ↓
-    STRUCTURE
-     ↓
-    M15
-     ↓
-    STRUCTURE + LIQUIDITÉ + DISPLACEMENT
-     ↓
-    OB + FVG + PREMIUM/DISCOUNT + SUPPORT/RÉSISTANCE
-     ↓
-    M5
-     ↓
-    TIMING / CONFIRMATION SECONDAIRE
-     ↓
-    SCÉNARIO
-     ↓
-    CONFLUENCES
-     ↓
-    SCORE >= 60
-     ↓
-    RR >= 2
-     ↓
-    FILTRE NEWS
-     ↓
-    SIGNAL ACTIF
+DATA
+ ↓
+H4 : biais global
+ ↓
+H1 : structure
+ ↓
+M15 : structure + contexte SMC
+ ↓
+Liquidity / Displacement / OB / FVG
+ ↓
+Premium / Discount
+ ↓
+Support / Resistance
+ ↓
+M5 : confirmation secondaire
+ ↓
+Scenario
+ ↓
+Confluence
+ ↓
+Score
+ ↓
+RR / Risk
+ ↓
+News filter
+ ↓
+Signal final
 
-IMPORTANT :
-- H4 est une préférence directionnelle, PAS un blocage absolu.
-- H1 et M15 déterminent principalement la structure.
-- M5 est non bloquant.
-- Aucun signal n'est forcé.
-- D1 n'est pas utilisé.
-- Le score final provient du scoring_engine.
-- RR minimum = CONFIG.MINIMUM_RR.
+Règles principales :
+- D1 exclu.
+- H4 donne une préférence directionnelle mais ne bloque pas
+  automatiquement un setup valide.
+- H1 + M15 constituent la validation structurelle principale.
+- M5 est secondaire et non bloquant.
+- Aucun signal forcé.
+- Score minimum : CONFIG.SIGNAL_THRESHOLD.
+- RR minimum : CONFIG.MINIMUM_RR.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Optional
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-try:
-    from config import CONFIG
-except Exception:
-    CONFIG = None
-
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-try:
-    from market_data import market_data
-except Exception:
-    market_data = None
-
-# ============================================================
-# CORE
-# ============================================================
+from config import CONFIG
 
 from core.models import (
+    Candle,
     Confirmation,
     Direction,
     TrendContext,
     Zone,
 )
 
-# ============================================================
-# STRUCTURE
-# ============================================================
+from market_data import get_candles
 
-from analysis.structure import analyze_structure
+from analysis.structure import (
+    analyze_structure,
+)
 
-# ============================================================
-# LIQUIDITY
-# ============================================================
-
-from analysis.liquidity import analyze_liquidity
-
-# ============================================================
-# DISPLACEMENT
-# ============================================================
+from analysis.liquidity import (
+    analyze_liquidity,
+)
 
 from analysis.displacement import (
     analyze_displacement,
     detect_displacement_after_sweep,
 )
 
-# ============================================================
-# ORDER BLOCKS
-# ============================================================
-
 from analysis.order_blocks import (
     analyze_order_blocks,
+    get_best_order_block,
 )
-
-# ============================================================
-# FVG
-# ============================================================
 
 from analysis.fvg import (
     analyze_fvg,
+    get_best_fvg,
 )
-
-# ============================================================
-# PREMIUM / DISCOUNT
-# ============================================================
 
 from analysis.premium_discount import (
     analyze_premium_discount,
 )
 
-# ============================================================
-# SUPPORT / RESISTANCE
-# ============================================================
-
 from analysis.support_resistance import (
     analyze_support_resistance,
+    get_best_support_resistance,
 )
 
-# ============================================================
-# RISK
-# ============================================================
+from analysis.confirmation import (
+    validate_m5_confirmation,
+    confirmation_strength,
+)
 
-try:
-    from risk.risk_manager import (
-        calculate_rr,
-        validate_trade_geometry,
-    )
-except Exception:
+from scoring.scoring_engine import (
+    calculate_score,
+    should_send_signal,
+)
 
-    def calculate_rr(
-        entry: float,
-        stop_loss: float,
-        take_profit: float,
-    ) -> float:
+from risk.risk_manager import (
+    calculate_rr,
+    validate_trade_geometry,
+)
 
-        risk = abs(
-            float(entry) - float(stop_loss)
-        )
-
-        if risk <= 0:
-            return 0.0
-
-        reward = abs(
-            float(take_profit) - float(entry)
-        )
-
-        return round(
-            reward / risk,
-            2,
-        )
-
-    def validate_trade_geometry(
-        direction: Any,
-        entry: float,
-        stop_loss: float,
-        take_profit: float,
-    ) -> bool:
-
-        direction = str(direction).upper()
-
-        if direction == "BUY":
-            return (
-                stop_loss < entry
-                and take_profit > entry
-            )
-
-        if direction == "SELL":
-            return (
-                stop_loss > entry
-                and take_profit < entry
-            )
-
-        return False
-
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
-
-try:
-    from signals.signal_engine import (
-        build_signal,
-        resolve_trade_direction,
-    )
-except Exception:
-
-    build_signal = None
-
-    def resolve_trade_direction(
-        h4: Any,
-        h1: Any,
-        m15: Any,
-        requested_direction: Any = None,
-    ) -> Direction:
-
-        directions = [
-            _normalize_direction(requested_direction),
-            _normalize_direction(h1)
-            if _normalize_direction(h1)
-            != Direction.NEUTRAL
-            else Direction.NEUTRAL,
-            _normalize_direction(m15)
-            if _normalize_direction(m15)
-            != Direction.NEUTRAL
-            else Direction.NEUTRAL,
-            _normalize_direction(h4),
-        ]
-
-        if (
-            _normalize_direction(h1)
-            == _normalize_direction(m15)
-            and _normalize_direction(h1)
-            != Direction.NEUTRAL
-        ):
-            return _normalize_direction(h1)
-
-        for direction in directions:
-            if direction != Direction.NEUTRAL:
-                return direction
-
-        return Direction.NEUTRAL
-
-# ============================================================
-# SCORING
-# ============================================================
-
-try:
-    from scoring.scoring_engine import (
-        calculate_score,
-    )
-except Exception:
-    calculate_score = None
-
-# ============================================================
-# NEWS
-# ============================================================
-
-try:
-    from economic_calendar import economic_filter
-except Exception:
-    economic_filter = None
+from signals.signal_engine import (
+    build_signal,
+)
 
 
-# ============================================================
+# ============================================================================
 # CONSTANTES
-# ============================================================
+# ============================================================================
 
 TIMEFRAMES = (
     "H4",
@@ -268,52 +124,33 @@ TIMEFRAMES = (
     "M5",
 )
 
-PRIMARY_TIMEFRAMES = (
-    "H4",
-    "H1",
-    "M15",
-)
-
-MINIMUM_CANDLES = 20
-
-DEFAULT_ATR_PERIOD = 14
-
-DEFAULT_TP_RR = 2.5
-
-ATR_SL_BUFFER = 0.25
-
-MAX_DATA_ATTEMPTS = 4
+TIMEFRAME_TO_API = {
+    "H4": "4h",
+    "H1": "1h",
+    "M15": "15min",
+    "M5": "5min",
+}
 
 
-# ============================================================
-# UTILITAIRES
-# ============================================================
+# ============================================================================
+# OUTILS GENERIQUES
+# ============================================================================
 
-def _safe_float(
-    value: Any,
-    default: float = 0.0,
-) -> float:
-
+def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-
-        if value is None:
+        result = float(value)
+        if result != result:
             return default
-
-        number = float(value)
-
-        if number != number:
-            return default
-
-        return number
-
-    except Exception:
+        return result
+    except (TypeError, ValueError):
         return default
 
 
-def _normalize_direction(
-    value: Any,
-) -> Direction:
+def _safe_bool(value: Any) -> bool:
+    return bool(value)
 
+
+def _normalize_direction(value: Any) -> Direction:
     if isinstance(value, Direction):
         return value
 
@@ -322,334 +159,826 @@ def _normalize_direction(
 
     text = str(value).upper().strip()
 
-    aliases = {
-        "LONG": "BUY",
-        "BULLISH": "BUY",
-        "UP": "BUY",
-        "BUY": "BUY",
+    if text in {"BUY", "LONG", "BULLISH"}:
+        return Direction.BUY
 
-        "SHORT": "SELL",
-        "BEARISH": "SELL",
-        "DOWN": "SELL",
-        "SELL": "SELL",
+    if text in {"SELL", "SHORT", "BEARISH"}:
+        return Direction.SELL
 
-        "FLAT": "NEUTRAL",
-        "SIDEWAYS": "NEUTRAL",
-        "RANGE": "NEUTRAL",
-        "NEUTRAL": "NEUTRAL",
-    }
-
-    return Direction(
-        aliases.get(
-            text,
-            "NEUTRAL",
-        )
-    )
+    return Direction.NEUTRAL
 
 
-def _direction_text(
-    value: Any,
-) -> str:
-
+def _direction_value(value: Any) -> str:
     return _normalize_direction(value).value
 
 
-def _is_directional(
-    value: Any,
-) -> bool:
-
-    return _normalize_direction(value) in {
-        Direction.BUY,
-        Direction.SELL,
-    }
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-# ============================================================
-# CANDLES
-# ============================================================
-
-def _extract_candles(
-    raw: Any,
-) -> List[Any]:
-
-    if raw is None:
-        return []
-
-    if isinstance(raw, dict):
-
-        for key in (
-            "candles",
-            "data",
-            "values",
-            "results",
-            "items",
-        ):
-
-            value = raw.get(key)
-
-            if isinstance(value, list):
-                return value
-
-        return []
-
-    if isinstance(
-        raw,
-        (list, tuple),
-    ):
-        return list(raw)
-
-    return []
-
-
-def _validate_candles(
-    candles: Iterable[Any],
-) -> bool:
-
-    try:
-        return len(list(candles)) >= MINIMUM_CANDLES
-    except Exception:
-        return False
-
-
-# ============================================================
-# OHLC
-# ============================================================
-
-def _get_value(
-    candle: Any,
-    key: str,
-    default: float = 0.0,
-) -> float:
-
-    if isinstance(candle, dict):
-
-        return _safe_float(
-            candle.get(key),
-            default,
-        )
-
-    try:
-
-        return _safe_float(
-            getattr(candle, key),
-            default,
-        )
-
-    except Exception:
-
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
         return default
 
+    if isinstance(obj, dict):
+        return obj.get(key, default)
 
-def _open(candle: Any) -> float:
-    return _get_value(
-        candle,
-        "open",
-    )
+    return getattr(obj, key, default)
 
 
-def _high(candle: Any) -> float:
-    return _get_value(
-        candle,
-        "high",
-    )
+def _last_candle(candles: list[Candle]) -> Optional[Candle]:
+    if not candles:
+        return None
+    return candles[-1]
 
 
-def _low(candle: Any) -> float:
-    return _get_value(
-        candle,
-        "low",
-    )
+def _last_price(candles: list[Candle]) -> float:
+    candle = _last_candle(candles)
+
+    if candle is None:
+        return 0.0
+
+    return _safe_float(candle.close)
 
 
-def _close(candle: Any) -> float:
-    return _get_value(
-        candle,
-        "close",
-    )
-
-
-# ============================================================
-# ATR
-# ============================================================
-
-def _calculate_atr(
-    candles: List[Any],
-    period: int = DEFAULT_ATR_PERIOD,
+def _atr_from_candles(
+    candles: list[Candle],
+    period: int = 14,
 ) -> float:
-
     if len(candles) < 2:
         return 0.0
 
-    true_ranges: List[float] = []
+    ranges = []
 
-    start = max(
-        1,
-        len(candles) - period,
-    )
+    start = max(1, len(candles) - period)
 
-    for index in range(
-        start,
-        len(candles),
-    ):
-
+    for index in range(start, len(candles)):
         current = candles[index]
         previous = candles[index - 1]
 
-        high = _high(current)
-        low = _low(current)
-        previous_close = _close(previous)
+        high = _safe_float(current.high)
+        low = _safe_float(current.low)
+        previous_close = _safe_float(previous.close)
 
-        tr = max(
+        true_range = max(
             high - low,
             abs(high - previous_close),
             abs(low - previous_close),
         )
 
-        if tr > 0:
-            true_ranges.append(tr)
+        ranges.append(true_range)
 
-    if not true_ranges:
+    if not ranges:
         return 0.0
 
-    return sum(
-        true_ranges
-    ) / len(true_ranges)
+    return sum(ranges) / len(ranges)
 
 
-# ============================================================
-# STRUCTURE HELPERS
-# ============================================================
+def _call_analyser(function, *args, **kwargs):
+    """
+    Appelle un moteur spécialisé sans laisser une incompatibilité
+    mineure de signature faire tomber tout le pipeline.
+    """
+    try:
+        return function(*args, **kwargs)
+    except TypeError:
+        try:
+            return function(*args)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
-def _structure_direction(
-    structure: Any,
-) -> Direction:
 
-    if structure is None:
+# ============================================================================
+# STRUCTURE
+# ============================================================================
+
+def _analyse_structure(
+    candles: list[Candle],
+):
+    if not candles:
+        return None
+
+    return _call_analyser(
+        analyze_structure,
+        candles,
+    )
+
+
+def _structure_direction(result: Any) -> Direction:
+    if result is None:
         return Direction.NEUTRAL
 
-    value = getattr(
-        structure,
-        "direction",
-        Direction.NEUTRAL,
+    direction = _normalize_direction(
+        _get(result, "direction", Direction.NEUTRAL)
     )
 
-    return _normalize_direction(value)
+    if direction != Direction.NEUTRAL:
+        return direction
+
+    bullish = _safe_bool(_get(result, "bullish_structure", False))
+    bearish = _safe_bool(_get(result, "bearish_structure", False))
+
+    if bullish and not bearish:
+        return Direction.BUY
+
+    if bearish and not bullish:
+        return Direction.SELL
+
+    return Direction.NEUTRAL
 
 
-def _structure_strength(
-    structure: Any,
-) -> float:
-
-    if structure is None:
+def _structure_strength(result: Any) -> float:
+    if result is None:
         return 0.0
 
-    return _safe_float(
-        getattr(
-            structure,
-            "strength",
-            0.0,
-        )
+    return max(
+        0.0,
+        min(
+            100.0,
+            _safe_float(_get(result, "strength", 0.0)),
+        ),
     )
 
 
-def _structure_events(
-    structure: Any,
+def _structure_has_event(
+    result: Any,
     event_name: str,
-) -> tuple:
-
-    if structure is None:
-        return ()
-
-    value = getattr(
-        structure,
-        event_name,
-        (),
-    )
-
-    if value is None:
-        return ()
-
-    return tuple(value)
-
-
-def _has_directional_structure_event(
-    structure: Any,
-    direction: Direction,
 ) -> bool:
-
-    if direction == Direction.NEUTRAL:
+    if result is None:
         return False
 
-    events = (
-        _structure_events(
-            structure,
-            "bos",
+    events = _get(result, event_name, ())
+
+    if events is None:
+        return False
+
+    try:
+        return len(events) > 0
+    except TypeError:
+        return False
+
+
+# ============================================================================
+# LIQUIDITY
+# ============================================================================
+
+def _analyse_liquidity(
+    candles: list[Candle],
+    direction: Direction,
+):
+    if not candles:
+        return None
+
+    return _call_analyser(
+        analyze_liquidity,
+        candles,
+        direction=direction,
+    )
+
+
+def _liquidity_sweep(
+    result: Any,
+    direction: Direction,
+) -> bool:
+    if result is None:
+        return False
+
+    sweep = _get(result, "sweep", None)
+
+    if sweep is not None:
+        sweep_direction = _normalize_direction(
+            _get(sweep, "direction", Direction.NEUTRAL)
         )
-        + _structure_events(
-            structure,
-            "choch",
+
+        valid = _safe_bool(
+            _get(sweep, "valid", True)
+        )
+
+        if valid:
+            if sweep_direction == Direction.NEUTRAL:
+                return True
+
+            return sweep_direction == direction
+
+    sweeps = _get(result, "sweeps", ())
+
+    if sweeps:
+        for item in sweeps:
+            item_direction = _normalize_direction(
+                _get(item, "direction", Direction.NEUTRAL)
+            )
+
+            valid = _safe_bool(
+                _get(item, "valid", True)
+            )
+
+            if valid and (
+                item_direction == Direction.NEUTRAL
+                or item_direction == direction
+            ):
+                return True
+
+    return _safe_bool(
+        _get(result, "liquidity_sweep", False)
+    )
+
+
+def _liquidity_quality(result: Any) -> float:
+    if result is None:
+        return 0.0
+
+    for key in (
+        "strength",
+        "quality",
+        "score",
+    ):
+        value = _get(result, key, None)
+
+        if value is not None:
+            return max(
+                0.0,
+                min(100.0, _safe_float(value)),
+            )
+
+    return 0.0
+
+
+# ============================================================================
+# DISPLACEMENT
+# ============================================================================
+
+def _analyse_displacement(
+    candles: list[Candle],
+    direction: Direction,
+):
+    if not candles:
+        return None
+
+    return _call_analyser(
+        analyze_displacement,
+        candles,
+        direction=direction,
+    )
+
+
+def _displacement_valid(
+    result: Any,
+    direction: Direction,
+) -> bool:
+    if result is None:
+        return False
+
+    valid = _safe_bool(
+        _get(result, "valid", False)
+    )
+
+    if not valid:
+        return False
+
+    result_direction = _normalize_direction(
+        _get(result, "direction", Direction.NEUTRAL)
+    )
+
+    if result_direction == Direction.NEUTRAL:
+        return True
+
+    return result_direction == direction
+
+
+def _displacement_strength(result: Any) -> float:
+    if result is None:
+        return 0.0
+
+    return max(
+        0.0,
+        min(
+            100.0,
+            _safe_float(
+                _get(result, "strength", 0.0)
+            ),
+        ),
+    )
+
+
+def _displacement_atr_ratio(result: Any) -> float:
+    if result is None:
+        return 0.0
+
+    for key in (
+        "atr_ratio",
+        "range_atr_ratio",
+        "body_atr_ratio",
+    ):
+        value = _get(result, key, None)
+
+        if value is not None:
+            return max(0.0, _safe_float(value))
+
+    return 0.0
+
+
+# ============================================================================
+# ORDER BLOCK
+# ============================================================================
+
+def _analyse_order_blocks(
+    candles: list[Candle],
+    direction: Direction,
+):
+    if not candles:
+        return None
+
+    return _call_analyser(
+        analyze_order_blocks,
+        candles,
+        direction=direction,
+    )
+
+
+def _best_order_block(
+    result: Any,
+    direction: Direction,
+):
+    if result is None:
+        return None
+
+    try:
+        return get_best_order_block(
+            _get(result, "order_blocks", ()),
+            direction,
+        )
+    except Exception:
+        pass
+
+    best = _get(result, "best", None)
+
+    if best is not None:
+        return best
+
+    return None
+
+
+def _ob_exists(ob: Any) -> bool:
+    return ob is not None
+
+
+def _ob_fresh(ob: Any) -> bool:
+    if ob is None:
+        return False
+
+    return _safe_bool(
+        _get(ob, "fresh", False)
+    )
+
+
+def _ob_mitigated(ob: Any) -> bool:
+    if ob is None:
+        return False
+
+    return _safe_bool(
+        _get(ob, "mitigated", False)
+    )
+
+
+def _ob_displacement_origin(ob: Any) -> bool:
+    if ob is None:
+        return False
+
+    return _safe_bool(
+        _get(
+            ob,
+            "displacement_origin",
+            False,
         )
     )
+
+
+def _ob_strength(ob: Any) -> float:
+    if ob is None:
+        return 0.0
+
+    return max(
+        0.0,
+        min(
+            100.0,
+            _safe_float(
+                _get(ob, "strength", 0.0)
+            ),
+        ),
+    )
+
+
+# ============================================================================
+# FVG
+# ============================================================================
+
+def _analyse_fvg(
+    candles: list[Candle],
+    direction: Direction,
+):
+    if not candles:
+        return None
+
+    return _call_analyser(
+        analyze_fvg,
+        candles,
+        direction=direction,
+    )
+
+
+def _best_fvg(
+    result: Any,
+    direction: Direction,
+):
+    if result is None:
+        return None
+
+    try:
+        fvgs = _get(result, "fvgs", None)
+
+        if fvgs is not None:
+            return get_best_fvg(
+                fvgs,
+                direction,
+            )
+    except Exception:
+        pass
+
+    best = _get(result, "fvg", None)
+
+    if best is not None:
+        return best
+
+    return None
+
+
+def _fvg_exists(fvg: Any) -> bool:
+    return fvg is not None
+
+
+def _fvg_fresh(fvg: Any) -> bool:
+    if fvg is None:
+        return False
+
+    return _safe_bool(
+        _get(fvg, "fresh", False)
+    )
+
+
+def _fvg_filled(fvg: Any) -> bool:
+    if fvg is None:
+        return False
+
+    return _safe_bool(
+        _get(fvg, "filled", False)
+    )
+
+
+def _fvg_atr_ratio(fvg: Any) -> float:
+    if fvg is None:
+        return 0.0
+
+    return max(
+        0.0,
+        _safe_float(
+            _get(fvg, "atr_ratio", 0.0)
+        ),
+    )
+
+
+# ============================================================================
+# PREMIUM / DISCOUNT
+# ============================================================================
+
+def _analyse_premium_discount(
+    candles: list[Candle],
+    price: float,
+    direction: Direction,
+):
+    if not candles:
+        return None
+
+    return _call_analyser(
+        analyze_premium_discount,
+        candles,
+        price=price,
+        direction=direction,
+    )
+
+
+def _premium_discount_zone(result: Any) -> str:
+    if result is None:
+        return "EQUILIBRIUM"
+
+    zone = _get(
+        result,
+        "zone",
+        "EQUILIBRIUM",
+    )
+
+    return str(zone).upper()
+
+
+def _premium_discount_strength(result: Any) -> float:
+    if result is None:
+        return 0.0
+
+    return max(
+        0.0,
+        min(
+            100.0,
+            _safe_float(
+                _get(result, "strength", 0.0)
+            ),
+        ),
+    )
+
+
+# ============================================================================
+# SUPPORT / RESISTANCE
+# ============================================================================
+
+def _analyse_support_resistance(
+    candles: list[Candle],
+    price: float,
+    direction: Direction,
+):
+    if not candles:
+        return None
+
+    return _call_analyser(
+        analyze_support_resistance,
+        candles,
+        price=price,
+        direction=direction,
+    )
+
+
+def _best_support_resistance(
+    result: Any,
+    direction: Direction,
+):
+    if result is None:
+        return None
+
+    try:
+        levels = []
+
+        supports = _get(
+            result,
+            "supports",
+            (),
+        )
+
+        resistances = _get(
+            result,
+            "resistances",
+            (),
+        )
+
+        levels.extend(list(supports or ()))
+        levels.extend(list(resistances or ()))
+
+        if levels:
+            return get_best_support_resistance(
+                levels,
+                direction,
+            )
+    except Exception:
+        pass
+
+    return _get(result, "best", None)
+
+
+# ============================================================================
+# M5 CONFIRMATION
+# ============================================================================
+
+def _build_m5_confirmation(
+    candles: list[Candle],
+    direction: Direction,
+):
+    if not candles:
+        return validate_m5_confirmation(
+            direction=direction,
+            retest=False,
+            rejection=False,
+            liquidity_sweep=False,
+            micro_bos=False,
+            candle_confirmation=False,
+        )
+
+    structure = _analyse_structure(candles)
+
+    structure_direction = _structure_direction(
+        structure
+    )
+
+    micro_bos = (
+        _structure_has_event(structure, "bos")
+        and (
+            structure_direction == direction
+            or structure_direction == Direction.NEUTRAL
+        )
+    )
+
+    liquidity = _analyse_liquidity(
+        candles,
+        direction,
+    )
+
+    sweep = _liquidity_sweep(
+        liquidity,
+        direction,
+    )
+
+    displacement = _analyse_displacement(
+        candles,
+        direction,
+    )
+
+    displacement_valid = _displacement_valid(
+        displacement,
+        direction,
+    )
+
+    candle = _last_candle(candles)
+
+    if candle is None:
+        rejection = False
+        candle_confirmation = False
+    else:
+        body = abs(
+            _safe_float(candle.close)
+            - _safe_float(candle.open)
+        )
+
+        candle_range = max(
+            _safe_float(candle.high)
+            - _safe_float(candle.low),
+            0.0,
+        )
+
+        body_ratio = (
+            body / candle_range
+            if candle_range > 0
+            else 0.0
+        )
+
+        if direction == Direction.BUY:
+            candle_confirmation = (
+                candle.close > candle.open
+                and body_ratio >= 0.45
+            )
+
+            rejection = (
+                candle.lower_wick > candle.upper_wick
+                and candle.close >= candle.open
+            )
+
+        elif direction == Direction.SELL:
+            candle_confirmation = (
+                candle.close < candle.open
+                and body_ratio >= 0.45
+            )
+
+            rejection = (
+                candle.upper_wick > candle.lower_wick
+                and candle.close <= candle.open
+            )
+
+        else:
+            candle_confirmation = False
+            rejection = False
+
+    retest = (
+        sweep
+        and rejection
+    ) or (
+        displacement_valid
+        and rejection
+    )
+
+    return validate_m5_confirmation(
+        direction=direction,
+        retest=retest,
+        rejection=rejection,
+        liquidity_sweep=sweep,
+        micro_bos=micro_bos,
+        candle_confirmation=candle_confirmation,
+    )
+
+
+# ============================================================================
+# DIRECTION
+# ============================================================================
+
+def resolve_direction(
+    h4: Direction,
+    h1: Direction,
+    m15: Direction,
+    requested_direction: Optional[Direction] = None,
+) -> Direction:
+    """
+    Priorité :
+
+    1. Direction explicitement demandée.
+    2. H1 + M15 alignés.
+    3. H4 + H1 alignés.
+    4. H4 + M15 alignés.
+    5. H4 seul.
+    6. H1 seul.
+    7. M15 seul.
+    8. Neutral.
+    """
+
+    requested = _normalize_direction(
+        requested_direction
+    )
+
+    if requested != Direction.NEUTRAL:
+        return requested
+
+    h4 = _normalize_direction(h4)
+    h1 = _normalize_direction(h1)
+    m15 = _normalize_direction(m15)
+
+    if (
+        h1 != Direction.NEUTRAL
+        and h1 == m15
+    ):
+        return h1
+
+    if (
+        h4 != Direction.NEUTRAL
+        and h4 == h1
+    ):
+        return h4
+
+    if (
+        h4 != Direction.NEUTRAL
+        and h4 == m15
+    ):
+        return h4
+
+    if h4 != Direction.NEUTRAL:
+        return h4
+
+    if h1 != Direction.NEUTRAL:
+        return h1
+
+    if m15 != Direction.NEUTRAL:
+        return m15
+
+    return Direction.NEUTRAL
+
+
+def _primary_alignment_valid(
+    h4: Direction,
+    h1: Direction,
+    m15: Direction,
+) -> bool:
+    """
+    Validation principale souple.
+
+    H4 n'est pas un blocage absolu.
+    """
 
     return any(
-        _normalize_direction(
-            getattr(
-                event,
-                "direction",
-                Direction.NEUTRAL,
-            )
+        direction != Direction.NEUTRAL
+        for direction in (
+            h4,
+            h1,
+            m15,
         )
-        == direction
-        for event in events
     )
 
 
-# ============================================================
-# SCÉNARIO
-# ============================================================
+# ============================================================================
+# SCENARIO
+# ============================================================================
 
 def _determine_scenario(
     h4: Direction,
     h1: Direction,
     m15: Direction,
-    m5: Direction,
-    h1_structure: Any = None,
-    m15_structure: Any = None,
-    liquidity: Any = None,
-    displacement: Any = None,
-) -> Dict[str, Any]:
-
-    h4 = _normalize_direction(h4)
-    h1 = _normalize_direction(h1)
-    m15 = _normalize_direction(m15)
-    m5 = _normalize_direction(m5)
-
-    # --------------------------------------------------------
-    # CONTINUATION
-    # --------------------------------------------------------
+    direction: Direction,
+    liquidity_sweep: bool,
+    displacement_valid: bool,
+    bos: bool,
+    choch: bool,
+) -> str:
+    if (
+        liquidity_sweep
+        and displacement_valid
+        and (bos or choch)
+    ):
+        return "LIQUIDITY_REVERSAL"
 
     if (
-        h4 == h1 == m15
-        and h4 != Direction.NEUTRAL
+        h4 != Direction.NEUTRAL
+        and h1 == h4
+        and m15 == h4
     ):
-
-        return {
-            "type": "CONTINUATION",
-            "direction": h4,
-            "h4_preference": h4,
-            "confidence": 90.0,
-        }
-
-    # --------------------------------------------------------
-    # CORRECTION
-    #
-    # H4 + H1 gardent le biais.
-    # M15 travaille temporairement contre eux.
-    # --------------------------------------------------------
+        return "CONTINUATION"
 
     if (
         h4 != Direction.NEUTRAL
@@ -657,1850 +986,512 @@ def _determine_scenario(
         and m15 != Direction.NEUTRAL
         and m15 != h4
     ):
-
-        displacement_direction = _normalize_direction(
-            getattr(
-                displacement,
-                "direction",
-                Direction.NEUTRAL,
-            )
-        )
-
-        if displacement_direction == h4:
-
-            return {
-                "type": "CORRECTION",
-                "direction": h4,
-                "h4_preference": h4,
-                "correction_direction": m15,
-                "confidence": 85.0,
-            }
-
-        return {
-            "type": "CORRECTION",
-            "direction": h4,
-            "h4_preference": h4,
-            "correction_direction": m15,
-            "confidence": 70.0,
-        }
-
-    # --------------------------------------------------------
-    # REVERSAL STRUCTUREL
-    # --------------------------------------------------------
+        return "CORRECTION"
 
     if (
         h4 != Direction.NEUTRAL
         and h1 != Direction.NEUTRAL
-        and m15 != Direction.NEUTRAL
-        and h1 == m15
         and h1 != h4
+        and m15 == h1
     ):
-
-        structure_confirmation = (
-            _has_directional_structure_event(
-                h1_structure,
-                h1,
-            )
-            or _has_directional_structure_event(
-                m15_structure,
-                m15,
-            )
-        )
-
-        if structure_confirmation:
-
-            return {
-                "type": "POTENTIAL_REVERSAL",
-                "direction": h1,
-                "h4_preference": h4,
-                "confidence": 80.0,
-            }
-
-        return {
-            "type": "COUNTER_TREND",
-            "direction": h1,
-            "h4_preference": h4,
-            "confidence": 60.0,
-        }
-
-    # --------------------------------------------------------
-    # H4 + M15 ALIGNMENT
-    # --------------------------------------------------------
+        return "POTENTIAL_REVERSAL"
 
     if (
         h4 != Direction.NEUTRAL
-        and m15 == h4
+        and direction != h4
+        and h1 == direction
+        and m15 == direction
     ):
+        return "COUNTER_TREND"
 
-        return {
-            "type": "CONTINUATION",
-            "direction": h4,
-            "h4_preference": h4,
-            "confidence": 75.0,
-        }
+    if choch:
+        return "STRUCTURAL_REVERSAL"
 
-    # --------------------------------------------------------
-    # H1 + M15 ALIGNÉS
-    # --------------------------------------------------------
+    if bos:
+        return "STRUCTURAL_CONTINUATION"
+
+    if direction == Direction.BUY:
+        return "SHORT_TERM_BULLISH"
+
+    if direction == Direction.SELL:
+        return "SHORT_TERM_BEARISH"
+
+    return "RANGE"
+
+
+# ============================================================================
+# SL / TP
+# ============================================================================
+
+def _recent_low(
+    candles: list[Candle],
+    lookback: int = 20,
+) -> float:
+    subset = candles[-lookback:]
+
+    if not subset:
+        return 0.0
+
+    return min(
+        _safe_float(candle.low)
+        for candle in subset
+    )
+
+
+def _recent_high(
+    candles: list[Candle],
+    lookback: int = 20,
+) -> float:
+    subset = candles[-lookback:]
+
+    if not subset:
+        return 0.0
+
+    return max(
+        _safe_float(candle.high)
+        for candle in subset
+    )
+
+
+def _zone_low(zone: Any) -> float:
+    return _safe_float(
+        _get(zone, "low", 0.0)
+    )
+
+
+def _zone_high(zone: Any) -> float:
+    return _safe_float(
+        _get(zone, "high", 0.0)
+    )
+
+
+def _build_trade_geometry(
+    candles: list[Candle],
+    direction: Direction,
+    entry: float,
+    ob: Any = None,
+    fvg: Any = None,
+    sr: Any = None,
+) -> tuple[float, float]:
+    """
+    Construit SL/TP à partir du contexte structurel.
+
+    Priorité SL :
+    1. OB
+    2. S/R
+    3. swing récent
+    4. ATR
+
+    TP :
+    - cible structurelle/liquidité si disponible
+    - sinon minimum RR configuré.
+    """
+
+    atr = _atr_from_candles(candles)
+
+    if atr <= 0:
+        atr = max(
+            abs(entry) * 0.001,
+            0.00001,
+        )
+
+    buffer = atr * 0.25
+
+    stop_loss = 0.0
+
+    if ob is not None:
+        ob_low = _safe_float(
+            _get(ob, "low", 0.0)
+        )
+
+        ob_high = _safe_float(
+            _get(ob, "high", 0.0)
+        )
+
+        if direction == Direction.BUY and ob_low > 0:
+            stop_loss = ob_low - buffer
+
+        elif direction == Direction.SELL and ob_high > 0:
+            stop_loss = ob_high + buffer
+
+    if stop_loss <= 0 and sr is not None:
+        sr_low = _safe_float(
+            _get(sr, "low", 0.0)
+        )
+
+        sr_high = _safe_float(
+            _get(sr, "high", 0.0)
+        )
+
+        if direction == Direction.BUY and sr_low > 0:
+            stop_loss = sr_low - buffer
+
+        elif direction == Direction.SELL and sr_high > 0:
+            stop_loss = sr_high + buffer
+
+    if stop_loss <= 0:
+        if direction == Direction.BUY:
+            swing_low = _recent_low(candles)
+            stop_loss = swing_low - buffer
+        else:
+            swing_high = _recent_high(candles)
+            stop_loss = swing_high + buffer
+
+    if direction == Direction.BUY:
+        risk_distance = entry - stop_loss
+    else:
+        risk_distance = stop_loss - entry
+
+    if risk_distance <= 0:
+        risk_distance = atr
+
+        if direction == Direction.BUY:
+            stop_loss = entry - risk_distance
+        else:
+            stop_loss = entry + risk_distance
+
+    target_distance = (
+        risk_distance
+        * max(
+            2.0,
+            _safe_float(
+                CONFIG.MINIMUM_RR,
+                2.0,
+            ),
+        )
+    )
+
+    if direction == Direction.BUY:
+        take_profit = entry + target_distance
+    else:
+        take_profit = entry - target_distance
+
+    return (
+        stop_loss,
+        take_profit,
+    )
+
+
+# ============================================================================
+# ZONE
+# ============================================================================
+
+def _build_zone(
+    direction: Direction,
+    sr: Any,
+    ob: Any,
+    fvg: Any,
+    h1_strength: float,
+    m15_strength: float,
+    structure_confirmed: bool,
+    liquidity_nearby: bool,
+) -> Optional[Zone]:
+    """
+    Construit un vrai objet Zone.
+
+    Le niveau S/R est privilégié.
+    OB/FVG servent de confluences.
+    """
+
+    level_type = "NONE"
+    key_level = 0.0
+    low = 0.0
+    high = 0.0
+
+    if sr is not None:
+        raw_type = str(
+            _get(sr, "level_type", "NONE")
+        ).upper()
+
+        if raw_type in {
+            "SUPPORT",
+            "RESISTANCE",
+        }:
+            level_type = raw_type
+            key_level = _safe_float(
+                _get(sr, "key_level", 0.0)
+            )
+            low = _safe_float(
+                _get(sr, "low", 0.0)
+            )
+            high = _safe_float(
+                _get(sr, "high", 0.0)
+            )
 
     if (
-        h1 == m15
-        and h1 != Direction.NEUTRAL
+        key_level <= 0
+        and ob is not None
     ):
+        low = _safe_float(
+            _get(ob, "low", 0.0)
+        )
 
-        return {
-            "type": (
-                "COUNTER_TREND"
-                if (
-                    h4 != Direction.NEUTRAL
-                    and h1 != h4
-                )
-                else "STRUCTURAL_ALIGNMENT"
-            ),
-            "direction": h1,
-            "h4_preference": h4,
-            "confidence": 70.0,
-        }
+        high = _safe_float(
+            _get(ob, "high", 0.0)
+        )
 
-    # --------------------------------------------------------
-    # M15 SEUL MAIS STRUCTURELLEMENT CONFIRMÉ
-    # --------------------------------------------------------
+        if low > 0 and high > 0:
+            key_level = (
+                low + high
+            ) / 2.0
+
+            level_type = (
+                "SUPPORT"
+                if direction == Direction.BUY
+                else "RESISTANCE"
+            )
 
     if (
-        m15 != Direction.NEUTRAL
-        and _has_directional_structure_event(
-            m15_structure,
-            m15,
-        )
+        key_level <= 0
+        and fvg is not None
     ):
+        low = _safe_float(
+            _get(fvg, "low", 0.0)
+        )
 
-        return {
-            "type": "M15_STRUCTURE",
-            "direction": m15,
-            "h4_preference": h4,
-            "confidence": 60.0,
-        }
+        high = _safe_float(
+            _get(fvg, "high", 0.0)
+        )
 
-    # --------------------------------------------------------
-    # H1 SEUL
-    # --------------------------------------------------------
+        if low > 0 and high > 0:
+            key_level = (
+                low + high
+            ) / 2.0
 
-    if h1 != Direction.NEUTRAL:
+            level_type = (
+                "SUPPORT"
+                if direction == Direction.BUY
+                else "RESISTANCE"
+            )
 
-        return {
-            "type": "H1_STRUCTURE",
-            "direction": h1,
-            "h4_preference": h4,
-            "confidence": 55.0,
-        }
+    if key_level <= 0:
+        return None
 
-    return {
-        "type": "RANGE",
-        "direction": Direction.NEUTRAL,
-        "h4_preference": h4,
-        "confidence": 0.0,
-    }
+    if low <= 0:
+        low = key_level
+
+    if high <= 0:
+        high = key_level
+
+    breakout = _safe_bool(
+        _get(sr, "breakout", False)
+    ) if sr is not None else False
+
+    breakout_direction = _normalize_direction(
+        _get(
+            sr,
+            "breakout_direction",
+            Direction.NEUTRAL,
+        )
+    ) if sr is not None else Direction.NEUTRAL
+
+    retest = _safe_bool(
+        _get(sr, "retest", False)
+    ) if sr is not None else False
+
+    rejection = _safe_bool(
+        _get(sr, "rejection", False)
+    ) if sr is not None else False
+
+    return Zone(
+        direction=direction,
+        timeframe="H1+M15",
+        low=low,
+        high=high,
+        h1_strength=h1_strength,
+        m15_strength=m15_strength,
+        kind=(
+            "SUPPORT"
+            if direction == Direction.BUY
+            else "RESISTANCE"
+        ),
+        structure_confirmed=structure_confirmed,
+        liquidity_nearby=liquidity_nearby,
+        order_block=ob is not None,
+        fvg=fvg is not None,
+        level_type=level_type,
+        key_level=key_level,
+        breakout_confirmed=breakout,
+        breakout_direction=breakout_direction,
+        retest_confirmed=retest,
+        rejection_confirmed=rejection,
+        candle_confirmation=False,
+        entry_valid=False,
+        entry_distance=0.0,
+    )
 
 
-# ============================================================
-# LIQUIDITY CONVERSION
-# ============================================================
+# ============================================================================
+# CONFLUENCE
+# ============================================================================
 
-def _liquidity_to_dict(
-    result: Any,
+def _count_confluences(
+    structure_confirmed: bool,
+    liquidity_sweep: bool,
+    displacement_valid: bool,
+    order_block: bool,
+    fvg: bool,
+    premium_discount_valid: bool,
+    sr: Any,
+    m5_confirmation: Confirmation,
+) -> int:
+    count = 0
+
+    if structure_confirmed:
+        count += 1
+
+    if liquidity_sweep:
+        count += 1
+
+    if displacement_valid:
+        count += 1
+
+    if order_block:
+        count += 1
+
+    if fvg:
+        count += 1
+
+    if premium_discount_valid:
+        count += 1
+
+    if sr is not None:
+        count += 1
+
+    if (
+        m5_confirmation.rejection
+        or m5_confirmation.micro_bos
+        or m5_confirmation.liquidity_sweep
+    ):
+        count += 1
+
+    return count
+
+
+# ============================================================================
+# NEWS
+# ============================================================================
+
+def _check_news(
+    symbol: str,
+) -> bool:
+    """
+    Filtre économique.
+
+    Fail-open : une panne du calendrier ne doit pas
+    inventer un blocage de marché.
+    """
+
+    try:
+        from economic_calendar import economic_filter
+
+        result = economic_filter(symbol)
+
+        if isinstance(result, bool):
+            return result
+
+        if isinstance(result, dict):
+            if "allowed" in result:
+                return bool(result["allowed"])
+
+            if "blocked" in result:
+                return not bool(result["blocked"])
+
+        return True
+
+    except Exception:
+        return True
+
+
+# ============================================================================
+# SCORE
+# ============================================================================
+
+def _calculate_final_score(
+    *,
+    trend: TrendContext,
+    zone: Zone,
+    confirmation: Confirmation,
+    rr: float,
+    h4: Direction,
+    h1: Direction,
+    m15: Direction,
     direction: Direction,
-) -> Dict[str, Any]:
+    scenario: str,
+    liquidity_result: Any,
+    displacement_result: Any,
+    ob: Any,
+    fvg: Any,
+    premium_discount_result: Any,
+    sr: Any,
+    m5: Confirmation,
+    spread_ok: bool = True,
+    session_ok: bool = True,
+) -> float:
 
-    if result is None:
-
-        return {
-            "detected": False,
-            "quality": 0.0,
-            "level": 0.0,
-            "type": "NONE",
-            "score": 0.0,
-            "sweep": None,
-        }
-
-    sweeps = list(
-        getattr(
-            result,
-            "sweeps",
-            (),
-        )
-        or ()
+    liquidity_sweep = _liquidity_sweep(
+        liquidity_result,
+        direction,
     )
 
-    directional_sweeps = [
-        sweep
-        for sweep in sweeps
-        if _normalize_direction(
-            getattr(
-                sweep,
-                "direction",
-                Direction.NEUTRAL,
-            )
-        )
-        == direction
-    ]
-
-    best_sweep = (
-        max(
-            directional_sweeps,
-            key=lambda item: _safe_float(
-                getattr(
-                    item,
-                    "strength",
-                    0.0,
-                )
-            ),
-        )
-        if directional_sweeps
-        else None
+    liquidity_quality = _liquidity_quality(
+        liquidity_result
     )
 
-    if best_sweep is None:
-
-        return {
-            "detected": False,
-            "quality": 0.0,
-            "level": 0.0,
-            "type": "NONE",
-            "score": _safe_float(
-                getattr(
-                    result,
-                    "score",
-                    0.0,
-                )
-            ),
-            "sweep": None,
-        }
-
-    return {
-        "detected": True,
-        "quality": _safe_float(
-            getattr(
-                best_sweep,
-                "strength",
-                0.0,
-            )
-        ),
-        "level": _safe_float(
-            getattr(
-                best_sweep,
-                "level",
-                0.0,
-            )
-        ),
-        "type": str(
-            getattr(
-                best_sweep,
-                "kind",
-                "LIQUIDITY_SWEEP",
-            )
-        ),
-        "score": _safe_float(
-            getattr(
-                result,
-                "score",
-                0.0,
-            )
-        ),
-        "sweep": best_sweep,
-    }
-
-
-# ============================================================
-# DISPLACEMENT CONVERSION
-# ============================================================
-
-def _displacement_to_dict(
-    result: Any,
-    direction: Direction,
-) -> Dict[str, Any]:
-
-    if result is None:
-
-        return {
-            "valid": False,
-            "direction": direction,
-            "atr_ratio": 0.0,
-            "body_ratio": 0.0,
-            "strength": 0.0,
-            "displacement": None,
-        }
-
-    displacement = getattr(
-        result,
-        "displacement",
-        None,
+    displacement_valid = _displacement_valid(
+        displacement_result,
+        direction,
     )
 
-    result_direction = _normalize_direction(
-        getattr(
-            result,
+    displacement_direction = _normalize_direction(
+        _get(
+            displacement_result,
             "direction",
             Direction.NEUTRAL,
         )
     )
 
-    return {
-        "valid": bool(
-            getattr(
-                result,
-                "valid",
-                False,
-            )
-        ),
-        "direction": result_direction,
-        "atr_ratio": _safe_float(
-            getattr(
-                result,
-                "atr_ratio",
-                0.0,
-            )
-        ),
-        "body_ratio": _safe_float(
-            getattr(
-                result,
-                "body_ratio",
-                0.0,
-            )
-        ),
-        "strength": _safe_float(
-            getattr(
-                result,
-                "strength",
-                0.0,
-            )
-        ),
-        "displacement": displacement,
-    }
-
-
-# ============================================================
-# ORDER BLOCK CONVERSION
-# ============================================================
-
-def _order_block_to_dict(
-    result: Any,
-) -> Dict[str, Any]:
-
-    if result is None:
-
-        return {
-            "present": False,
-            "fresh": False,
-            "mitigated": False,
-            "displacement_origin": False,
-            "direction": Direction.NEUTRAL,
-            "low": 0.0,
-            "high": 0.0,
-            "strength": 0.0,
-            "order_block": None,
-        }
-
-    block = getattr(
-        result,
-        "order_block",
-        None,
-    )
-
-    if block is None:
-
-        return {
-            "present": False,
-            "fresh": False,
-            "mitigated": False,
-            "displacement_origin": False,
-            "direction": _normalize_direction(
-                getattr(
-                    result,
-                    "direction",
-                    Direction.NEUTRAL,
-                )
-            ),
-            "low": 0.0,
-            "high": 0.0,
-            "strength": 0.0,
-            "order_block": None,
-        }
-
-    return {
-        "present": True,
-        "fresh": bool(
-            getattr(
-                block,
-                "fresh",
-                False,
-            )
-        ),
-        "mitigated": bool(
-            getattr(
-                block,
-                "mitigated",
-                False,
-            )
-        ),
-        "displacement_origin": bool(
-            getattr(
-                block,
-                "displacement_origin",
-                False,
-            )
-        ),
-        "direction": _normalize_direction(
-            getattr(
-                block,
-                "direction",
-                Direction.NEUTRAL,
-            )
-        ),
-        "low": _safe_float(
-            getattr(
-                block,
-                "low",
-                0.0,
-            )
-        ),
-        "high": _safe_float(
-            getattr(
-                block,
-                "high",
-                0.0,
-            )
-        ),
-        "strength": _safe_float(
-            getattr(
-                block,
-                "strength",
-                0.0,
-            )
-        ),
-        "order_block": block,
-    }
-
-
-# ============================================================
-# FVG CONVERSION
-# ============================================================
-
-def _fvg_to_dict(
-    result: Any,
-) -> Dict[str, Any]:
-
-    if result is None:
-
-        return {
-            "present": False,
-            "fresh": False,
-            "filled": False,
-            "atr_ratio": 0.0,
-            "low": 0.0,
-            "high": 0.0,
-            "strength": 0.0,
-            "fvg": None,
-        }
-
-    fvg = getattr(
-        result,
-        "fvg",
-        None,
-    )
-
-    if fvg is None:
-
-        return {
-            "present": False,
-            "fresh": False,
-            "filled": False,
-            "atr_ratio": 0.0,
-            "low": 0.0,
-            "high": 0.0,
-            "strength": 0.0,
-            "fvg": None,
-        }
-
-    return {
-        "present": True,
-        "fresh": bool(
-            getattr(
-                fvg,
-                "fresh",
-                False,
-            )
-        ),
-        "filled": bool(
-            getattr(
-                fvg,
-                "filled",
-                False,
-            )
-        ),
-        "atr_ratio": _safe_float(
-            getattr(
-                fvg,
-                "atr_ratio",
-                0.0,
-            )
-        ),
-        "low": _safe_float(
-            getattr(
-                fvg,
-                "low",
-                0.0,
-            )
-        ),
-        "high": _safe_float(
-            getattr(
-                fvg,
-                "high",
-                0.0,
-            )
-        ),
-        "strength": _safe_float(
-            getattr(
-                fvg,
-                "strength",
-                0.0,
-            )
-        ),
-        "direction": _normalize_direction(
-            getattr(
-                fvg,
-                "direction",
-                Direction.NEUTRAL,
-            )
-        ),
-        "fvg": fvg,
-    }
-
-
-# ============================================================
-# PREMIUM / DISCOUNT
-# ============================================================
-
-def _premium_discount_to_dict(
-    result: Any,
-) -> Dict[str, Any]:
-
-    if result is None:
-
-        return {
-            "valid": False,
-            "zone": "EQUILIBRIUM",
-            "ratio": 0.5,
-            "strength": 0.0,
-        }
-
-    return {
-        "valid": bool(
-            getattr(
-                result,
-                "valid",
-                False,
-            )
-        ),
-        "zone": str(
-            getattr(
-                result,
-                "zone",
-                "EQUILIBRIUM",
-            )
-        ).upper(),
-        "ratio": _safe_float(
-            getattr(
-                result,
-                "position",
-                0.5,
-            ),
-            0.5,
-        ),
-        "strength": _safe_float(
-            getattr(
-                result,
-                "strength",
-                0.0,
-            )
-        ),
-        "result": result,
-    }
-
-
-# ============================================================
-# SUPPORT / RESISTANCE
-# ============================================================
-
-def _support_resistance_to_dict(
-    result: Any,
-) -> Dict[str, Any]:
-
-    if result is None:
-
-        return {
-            "type": "NONE",
-            "level": 0.0,
-            "strength": 0.0,
-            "reactions": 0,
-            "breakout": False,
-            "retest": False,
-            "rejection": False,
-            "distance": 0.0,
-            "valid": False,
-        }
-
-    best = getattr(
-        result,
-        "best",
-        None,
-    )
-
-    if best is None:
-
-        return {
-            "type": "NONE",
-            "level": 0.0,
-            "strength": 0.0,
-            "reactions": 0,
-            "breakout": False,
-            "retest": False,
-            "rejection": False,
-            "distance": 0.0,
-            "valid": False,
-        }
-
-    return {
-        "type": str(
-            getattr(
-                best,
-                "level_type",
-                "NONE",
-            )
-        ).upper(),
-        "level": _safe_float(
-            getattr(
-                best,
-                "key_level",
-                0.0,
-            )
-        ),
-        "strength": _safe_float(
-            getattr(
-                best,
-                "strength",
-                0.0,
-            )
-        ),
-        "reactions": int(
-            _safe_float(
-                getattr(
-                    best,
-                    "reactions",
-                    0,
-                )
-            )
-        ),
-        "breakout": bool(
-            getattr(
-                best,
-                "breakout",
-                False,
-            )
-        ),
-        "retest": bool(
-            getattr(
-                best,
-                "retest",
-                False,
-            )
-        ),
-        "rejection": bool(
-            getattr(
-                best,
-                "rejection",
-                False,
-            )
-        ),
-        "distance": _safe_float(
-            getattr(
-                best,
-                "distance",
-                0.0,
-            )
-        ),
-        "valid": bool(
-            getattr(
-                result,
-                "valid",
-                False,
-            )
-        ),
-        "result": result,
-    }
-
-
-# ============================================================
-# M5 CONFIRMATION
-# ============================================================
-
-def _m5_confirmation(
-    candles: List[Any],
-    direction: Direction,
-    atr: float,
-) -> Dict[str, Any]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    result = {
-        "direction": direction,
-        "retest": False,
-        "rejection": False,
-        "liquidity_sweep": False,
-        "liquidity_quality": 0.0,
-        "micro_bos": False,
-        "candle_confirmation": False,
-        "displacement": False,
-        "displacement_strength": 0.0,
-        "valid": False,
-    }
-
-    if not candles:
-        return result
-
-    # --------------------------------------------------------
-    # Structure M5
-    # --------------------------------------------------------
-
-    structure = analyze_structure(
-        candles
-    )
-
-    micro_direction = _structure_direction(
-        structure
-    )
-
-    result["micro_bos"] = (
-        micro_direction == direction
-        or _has_directional_structure_event(
-            structure,
-            direction,
+    displacement_atr_ratio = (
+        _displacement_atr_ratio(
+            displacement_result
         )
     )
 
-    # --------------------------------------------------------
-    # Bougie M5
-    # --------------------------------------------------------
-
-    current = candles[-1]
-
-    candle_range = (
-        _high(current)
-        - _low(current)
-    )
-
-    body = abs(
-        _close(current)
-        - _open(current)
-    )
-
-    body_ratio = (
-        body / candle_range
-        if candle_range > 0
-        else 0.0
-    )
-
-    if direction == Direction.BUY:
-
-        result["candle_confirmation"] = (
-            _close(current)
-            > _open(current)
-            and body_ratio >= 0.50
-        )
-
-        lower_wick = (
-            min(
-                _open(current),
-                _close(current),
-            )
-            - _low(current)
-        )
-
-        result["rejection"] = (
-            lower_wick >= max(
-                body * 0.75,
-                1e-8,
-            )
-        )
-
-    elif direction == Direction.SELL:
-
-        result["candle_confirmation"] = (
-            _close(current)
-            < _open(current)
-            and body_ratio >= 0.50
-        )
-
-        upper_wick = (
-            _high(current)
-            - max(
-                _open(current),
-                _close(current),
-            )
-        )
-
-        result["rejection"] = (
-            upper_wick >= max(
-                body * 0.75,
-                1e-8,
-            )
-        )
-
-    # --------------------------------------------------------
-    # Liquidité M5
-    # --------------------------------------------------------
-
-    liquidity_result = analyze_liquidity(
-        candles,
-        current_price=_close(current),
-        atr=atr,
-    )
-
-    liquidity = _liquidity_to_dict(
-        liquidity_result,
-        direction,
-    )
-
-    result["liquidity_sweep"] = bool(
-        liquidity["detected"]
-    )
-
-    result["liquidity_quality"] = (
-        liquidity["quality"]
-    )
-
-    # --------------------------------------------------------
-    # Displacement M5
-    # --------------------------------------------------------
-
-    displacement_result = analyze_displacement(
-        candles,
-        atr,
-    )
-
-    displacement = _displacement_to_dict(
-        displacement_result,
-        direction,
-    )
-
-    result["displacement"] = (
-        displacement["valid"]
-        and displacement["direction"]
-        == direction
-    )
-
-    result["displacement_strength"] = (
-        displacement["strength"]
-    )
-
-    # --------------------------------------------------------
-    # Retest
-    #
-    # Un M5 retest est volontairement secondaire.
-    # --------------------------------------------------------
-
-    result["retest"] = (
-        result["rejection"]
-        or result["liquidity_sweep"]
-    )
-
-    result["valid"] = (
-        result["candle_confirmation"]
-        and (
-            result["micro_bos"]
-            or result["liquidity_sweep"]
-            or result["displacement"]
+    premium_discount = (
+        _premium_discount_zone(
+            premium_discount_result
         )
     )
 
-    return result
-
-
-# ============================================================
-# SL / TP
-# ============================================================
-
-def _build_sl_tp(
-    candles: List[Any],
-    direction: Direction,
-    entry: float,
-    atr: float,
-    order_block: Dict[str, Any],
-    support_resistance: Dict[str, Any],
-    liquidity_result: Any,
-) -> Tuple[float, float]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    if atr <= 0:
-
-        atr = max(
-            abs(entry) * 0.001,
-            1e-8,
-        )
-
-    buffer = atr * ATR_SL_BUFFER
-
-    candidates_below: List[float] = []
-    candidates_above: List[float] = []
-
-    # --------------------------------------------------------
-    # Order Block
-    # --------------------------------------------------------
-
-    if order_block.get("present"):
-
-        ob_low = _safe_float(
-            order_block.get("low")
-        )
-
-        ob_high = _safe_float(
-            order_block.get("high")
-        )
-
-        if ob_low > 0:
-            candidates_below.append(
-                ob_low
-            )
-
-        if ob_high > 0:
-            candidates_above.append(
-                ob_high
-            )
-
-    # --------------------------------------------------------
-    # Support / Resistance
-    # --------------------------------------------------------
-
-    sr_level = _safe_float(
-        support_resistance.get("level")
-    )
-
-    if sr_level > 0:
-
-        if sr_level < entry:
-            candidates_below.append(
-                sr_level
-            )
-
-        elif sr_level > entry:
-            candidates_above.append(
-                sr_level
-            )
-
-    # --------------------------------------------------------
-    # Structure récente
-    # --------------------------------------------------------
-
-    recent = candles[-20:]
-
-    recent_low = min(
-        (
-            _low(candle)
-            for candle in recent
-            if _low(candle) > 0
-        ),
-        default=0.0,
-    )
-
-    recent_high = max(
-        (
-            _high(candle)
-            for candle in recent
-            if _high(candle) > 0
-        ),
-        default=0.0,
-    )
-
-    if recent_low > 0:
-        candidates_below.append(
-            recent_low
-        )
-
-    if recent_high > 0:
-        candidates_above.append(
-            recent_high
-        )
-
-    # --------------------------------------------------------
-    # BUY
-    # --------------------------------------------------------
-
-    if direction == Direction.BUY:
-
-        below = [
-            value
-            for value in candidates_below
-            if value < entry
-        ]
-
-        if below:
-
-            structural_sl = min(
-                below
-            )
-
-        else:
-
-            structural_sl = (
-                entry - atr
-            )
-
-        stop_loss = structural_sl - buffer
-
-        risk = abs(
-            entry - stop_loss
-        )
-
-        # Minimum de protection.
-        minimum_risk = atr * 0.75
-
-        if risk < minimum_risk:
-
-            stop_loss = (
-                entry
-                - minimum_risk
-            )
-
-            risk = minimum_risk
-
-        take_profit = (
-            entry
-            + risk * DEFAULT_TP_RR
-        )
-
-        # ----------------------------------------------------
-        # Liquidité supérieure :
-        # utilisée comme cible si elle respecte RR.
-        # ----------------------------------------------------
-
-        nearest_above = getattr(
-            liquidity_result,
-            "nearest_above",
-            None,
-        )
-
-        if nearest_above is not None:
-
-            liquidity_price = _safe_float(
-                getattr(
-                    nearest_above,
-                    "price",
-                    0.0,
-                )
-            )
-
-            if liquidity_price > entry:
-
-                liquidity_rr = (
-                    liquidity_price - entry
-                ) / risk
-
-                if liquidity_rr >= 2.0:
-
-                    take_profit = (
-                        liquidity_price
-                    )
-
-    # --------------------------------------------------------
-    # SELL
-    # --------------------------------------------------------
-
-    elif direction == Direction.SELL:
-
-        above = [
-            value
-            for value in candidates_above
-            if value > entry
-        ]
-
-        if above:
-
-            structural_sl = max(
-                above
-            )
-
-        else:
-
-            structural_sl = (
-                entry + atr
-            )
-
-        stop_loss = structural_sl + buffer
-
-        risk = abs(
-            entry - stop_loss
-        )
-
-        minimum_risk = atr * 0.75
-
-        if risk < minimum_risk:
-
-            stop_loss = (
-                entry
-                + minimum_risk
-            )
-
-            risk = minimum_risk
-
-        take_profit = (
-            entry
-            - risk * DEFAULT_TP_RR
-        )
-
-        nearest_below = getattr(
-            liquidity_result,
-            "nearest_below",
-            None,
-        )
-
-        if nearest_below is not None:
-
-            liquidity_price = _safe_float(
-                getattr(
-                    nearest_below,
-                    "price",
-                    0.0,
-                )
-            )
-
-            if liquidity_price < entry:
-
-                liquidity_rr = (
-                    entry - liquidity_price
-                ) / risk
-
-                if liquidity_rr >= 2.0:
-
-                    take_profit = (
-                        liquidity_price
-                    )
-
-    else:
-
-        return (
-            entry,
-            entry,
-        )
-
-    return (
-        round(
-            stop_loss,
-            8,
-        ),
-        round(
-            take_profit,
-            8,
-        ),
-    )
-
-
-# ============================================================
-# ZONE CONSTRUCTION
-# ============================================================
-
-def _build_zone(
-    direction: Direction,
-    candles_m15: List[Any],
-    structure_m15: Any,
-    liquidity: Dict[str, Any],
-    displacement: Dict[str, Any],
-    order_block: Dict[str, Any],
-    fvg: Dict[str, Any],
-    premium_discount: Dict[str, Any],
-    support_resistance: Dict[str, Any],
-    current_price: float,
-) -> Optional[Zone]:
-
-    direction = _normalize_direction(
-        direction
-    )
-
-    if direction == Direction.NEUTRAL:
-        return None
-
-    low = 0.0
-    high = 0.0
-    kind = "SMC"
-
-    # --------------------------------------------------------
-    # OB prioritaire
-    # --------------------------------------------------------
-
-    if order_block.get("present"):
-
-        ob_low = _safe_float(
-            order_block.get("low")
-        )
-
-        ob_high = _safe_float(
-            order_block.get("high")
-        )
-
-        if (
-            ob_low > 0
-            and ob_high > ob_low
-        ):
-
-            low = ob_low
-            high = ob_high
-            kind = "ORDER_BLOCK"
-
-    # --------------------------------------------------------
-    # FVG si aucun OB exploitable
-    # --------------------------------------------------------
-
-    elif fvg.get("present"):
-
-        fvg_low = _safe_float(
-            fvg.get("low")
-        )
-
-        fvg_high = _safe_float(
-            fvg.get("high")
-        )
-
-        if (
-            fvg_low > 0
-            and fvg_high > fvg_low
-        ):
-
-            low = fvg_low
-            high = fvg_high
-            kind = "FVG"
-
-    # --------------------------------------------------------
-    # Support / Résistance
-    # --------------------------------------------------------
-
-    if low <= 0 or high <= 0:
-
-        sr_level = _safe_float(
-            support_resistance.get(
-                "level"
-            )
-        )
-
-        if sr_level > 0:
-
-            width = max(
-                abs(current_price)
-                * 0.0005,
-                1e-8,
-            )
-
-            low = sr_level - width
-            high = sr_level + width
-
-            kind = (
-                "SUPPORT"
-                if direction == Direction.BUY
-                else "RESISTANCE"
-            )
-
-    # --------------------------------------------------------
-    # Dernier recours : zone ATR
-    # --------------------------------------------------------
-
-    if low <= 0 or high <= low:
-
-        atr_reference = max(
-            abs(current_price)
-            * 0.001,
-            1e-8,
-        )
-
-        if direction == Direction.BUY:
-
-            low = (
-                current_price
-                - atr_reference
-            )
-
-            high = current_price
-
-            kind = "BUY_ZONE"
-
-        else:
-
-            low = current_price
-
-            high = (
-                current_price
-                + atr_reference
-            )
-
-            kind = "SELL_ZONE"
-
-    # --------------------------------------------------------
-    # Structure
-    # --------------------------------------------------------
-
-    structure_strength = _structure_strength(
-        structure_m15
-    )
-
-    liquidity_nearby = (
-        liquidity.get("detected", False)
-        or bool(
-            support_resistance.get(
-                "valid",
-                False,
-            )
+    volatility_score = 0.0
+
+    atr_ratio = (
+        _displacement_atr_ratio(
+            displacement_result
         )
     )
 
-    # --------------------------------------------------------
-    # Confirmation logique
-    #
-    # IMPORTANT :
-    # On ne force plus breakout/retest/rejection.
-    #
-    # Une séquence SMC valide peut être :
-    #
-    # sweep
-    # +
-    # rejection
-    # +
-    # displacement
-    # +
-    # BOS/CHoCH
-    # +
-    # OB/FVG
-    # --------------------------------------------------------
-
-    sweep_confirmed = bool(
-        liquidity.get("detected")
-    )
-
-    displacement_confirmed = (
-        displacement.get("valid")
-        and _normalize_direction(
-            displacement.get(
-                "direction"
-            )
+    if atr_ratio > 0:
+        volatility_score = min(
+            100.0,
+            atr_ratio * 50.0,
         )
-        == direction
-    )
-
-    structure_confirmed = (
-        _has_directional_structure_event(
-            structure_m15,
-            direction,
-        )
-        or (
-            _structure_direction(
-                structure_m15
-            )
-            == direction
-        )
-    )
-
-    # --------------------------------------------------------
-    # Compatibilité avec Zone.is_valid_setup
-    #
-    # Ces champs représentent désormais une validation
-    # structurelle globale, et non obligatoirement un simple
-    # breakout/retest mécanique.
-    # --------------------------------------------------------
-
-    breakout_confirmed = (
-        structure_confirmed
-        or bool(
-            support_resistance.get(
-                "breakout",
-                False,
-            )
-        )
-    )
-
-    retest_confirmed = (
-        bool(
-            order_block.get(
-                "present",
-                False,
-            )
-        )
-        or bool(
-            fvg.get(
-                "present",
-                False,
-            )
-        )
-        or bool(
-            support_resistance.get(
-                "retest",
-                False,
-            )
-        )
-    )
-
-    rejection_confirmed = (
-        sweep_confirmed
-        or bool(
-            support_resistance.get(
-                "rejection",
-                False,
-            )
-        )
-    )
-
-    candle_confirmation = (
-        displacement_confirmed
-        or structure_confirmed
-        or rejection_confirmed
-    )
-
-    entry_valid = (
-        low <= current_price <= high
-        or liquidity_nearby
-        or (
-            order_block.get(
-                "present",
-                False,
-            )
-        )
-        or (
-            fvg.get(
-                "present",
-                False,
-            )
-        )
-    )
-
-    # --------------------------------------------------------
-    # Pour une zone située loin du prix :
-    # entry_valid peut rester valide si la structure est
-    # exploitable et le prix est dans la proximité logique.
-    # --------------------------------------------------------
-
-    if not entry_valid:
-
-        distance = min(
-            abs(
-                current_price - low
-            ),
-            abs(
-                current_price - high
-            ),
-        )
-
-        reference_distance = max(
-            abs(current_price) * 0.003,
-            1e-8,
-        )
-
-        entry_valid = (
-            distance
-            <= reference_distance
-        )
-
-    return Zone(
-        direction=direction,
-        timeframe="H1+M15",
-        low=round(low, 8),
-        high=round(high, 8),
-        h1_strength=0.0,
-        m15_strength=structure_strength,
-        kind=kind,
-        structure_confirmed=structure_confirmed,
-        liquidity_nearby=liquidity_nearby,
-        order_block=bool(
-            order_block.get(
-                "present"
-            )
-        ),
-        fvg=bool(
-            fvg.get(
-                "present"
-            )
-        ),
-        level_type=(
-            support_resistance.get(
-                "type",
-                "NONE",
-            )
-            if support_resistance.get(
-                "type",
-                "NONE",
-            )
-            in {
-                "SUPPORT",
-                "RESISTANCE",
-            }
-            else (
-                "SUPPORT"
-                if direction == Direction.BUY
-                else "RESISTANCE"
-            )
-        ),
-        key_level=(
-            _safe_float(
-                support_resistance.get(
-                    "level"
-                )
-            )
-            or (
-                (low + high) / 2.0
-            )
-        ),
-        breakout_confirmed=breakout_confirmed,
-        breakout_direction=direction,
-        retest_confirmed=retest_confirmed,
-        rejection_confirmed=rejection_confirmed,
-        candle_confirmation=candle_confirmation,
-        entry_valid=entry_valid,
-        entry_distance=min(
-            abs(
-                current_price - low
-            ),
-            abs(
-                current_price - high
-            ),
-        ),
-    )
-
-
-# ============================================================
-# SCORE
-# ============================================================
-
-def _calculate_final_score(
-    symbol: str,
-    direction: Direction,
-    h4_direction: Direction,
-    h1_direction: Direction,
-    m15_direction: Direction,
-    m5: Dict[str, Any],
-    rr: float,
-    zone: Zone,
-    scenario: Dict[str, Any],
-    liquidity: Dict[str, Any],
-    displacement: Dict[str, Any],
-    order_block: Dict[str, Any],
-    fvg: Dict[str, Any],
-    premium_discount: Dict[str, Any],
-    support_resistance: Dict[str, Any],
-    atr: float,
-) -> float:
-
-    if calculate_score is None:
-        return 0.0
-
-    # --------------------------------------------------------
-    # Données enrichies
-    # --------------------------------------------------------
-
-    liquidity_sweep = bool(
-        liquidity.get(
-            "detected",
-            False,
-        )
-    )
-
-    liquidity_quality = _safe_float(
-        liquidity.get(
-            "quality",
-            0.0,
-        )
-    )
-
-    displacement_valid = bool(
-        displacement.get(
-            "valid",
-            False,
-        )
-    )
-
-    displacement_direction = (
-        _normalize_direction(
-            displacement.get(
-                "direction",
-                Direction.NEUTRAL,
-            )
-        )
-    )
-
-    displacement_atr_ratio = _safe_float(
-        displacement.get(
-            "atr_ratio",
-            0.0,
-        )
-    )
-
-    # --------------------------------------------------------
-    # M5
-    # --------------------------------------------------------
-
-    m5_confirmation = bool(
-        m5.get(
-            "valid",
-            False,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Scoring engine
-    # --------------------------------------------------------
 
     try:
-
-        score = calculate_score(
-            symbol=symbol,
-            direction=direction,
-            h4_direction=h4_direction,
-            h1_direction=h1_direction,
-            m15_direction=m15_direction,
-
-            m5_confirmation=m5_confirmation,
-            confirmation=m5,
-
-            rr=rr,
-
-            zone=zone,
-
-            liquidity=liquidity,
-            displacement=displacement,
-            order_block=order_block,
-            fvg=fvg,
-            premium_discount=premium_discount,
-            support_resistance=support_resistance,
-
-            atr=atr,
-
-            scenario=scenario,
-
-            # ------------------------------------------------
-            # Paramètres explicites du moteur actuel
-            # ------------------------------------------------
-
-            h4=h4_direction,
-            h1=h1_direction,
-            m15=m15_direction,
-            m5=m5.get(
-                "direction",
-                Direction.NEUTRAL,
-            ),
-
-            liquidity_sweep=liquidity_sweep,
-            liquidity_sweep_quality=liquidity_quality,
-
-            displacement_valid=displacement_valid,
-            displacement_direction=displacement_direction,
-            displacement_atr_ratio=displacement_atr_ratio,
-
-            order_block=bool(
-                order_block.get(
-                    "present",
-                    False,
-                )
-            ),
-            order_block_fresh=bool(
-                order_block.get(
-                    "fresh",
-                    False,
-                )
-            ),
-            order_block_mitigated=bool(
-                order_block.get(
-                    "mitigated",
-                    False,
-                )
-            ),
-            order_block_displacement_origin=bool(
-                order_block.get(
-                    "displacement_origin",
-                    False,
-                )
-            ),
-            order_block_direction=_normalize_direction(
-                order_block.get(
-                    "direction",
-                    Direction.NEUTRAL,
-                )
-            ),
-
-            fvg=bool(
-                fvg.get(
-                    "present",
-                    False,
-                )
-            ),
-            fvg_fresh=bool(
-                fvg.get(
-                    "fresh",
-                    False,
-                )
-            ),
-            fvg_filled=bool(
-                fvg.get(
-                    "filled",
-                    False,
-                )
-            ),
-            fvg_atr_ratio=_safe_float(
-                fvg.get(
-                    "atr_ratio",
-                    0.0,
-                )
-            ),
-
-            premium_discount=premium_discount.get(
-                "zone",
-                "EQUILIBRIUM",
-            ),
-
-            support_resistance=support_resistance,
-
-            volatility_score=min(
-                100.0,
-                max(
-                    0.0,
-                    (
-                        displacement_atr_ratio
-                        / 2.0
-                    )
-                    * 100.0,
-                ),
-            ),
-
-            volatility_valid=(
-                atr > 0
-            ),
-
-            m5_direction=_normalize_direction(
-                m5.get(
-                    "direction",
-                    Direction.NEUTRAL,
-                )
-            ),
-            m5_retest=bool(
-                m5.get(
-                    "retest",
-                    False,
-                )
-            ),
-            m5_rejection=bool(
-                m5.get(
-                    "rejection",
-                    False,
-                )
-            ),
-            m5_liquidity_sweep=bool(
-                m5.get(
-                    "liquidity_sweep",
-                    False,
-                )
-            ),
-            m5_micro_bos=bool(
-                m5.get(
-                    "micro_bos",
-                    False,
-                )
-            ),
-            m5_candle_confirmation=bool(
-                m5.get(
-                    "candle_confirmation",
-                    False,
-                )
-            ),
-            m5_displacement=bool(
-                m5.get(
-                    "displacement",
-                    False,
-                )
-            ),
-
-            spread_ok=True,
-            session_ok=True,
-        )
-
-        return round(
-            max(
-                0.0,
-                min(
-                    100.0,
-                    _safe_float(
-                        score
-                    ),
-                ),
-            ),
-            2,
-        )
-
-    except TypeError:
-
-        # ----------------------------------------------------
-        # Compatibilité avec une ancienne signature éventuelle
-        # ----------------------------------------------------
-
-        try:
-
-            score = calculate_score(
-                trend=TrendContext(
-                    h4=h4_direction,
-                    h4_strength=100.0,
-                ),
+        return float(
+            calculate_score(
+                trend=trend,
                 zone=zone,
-                confirmation=Confirmation(
-                    direction=direction,
-                    retest=bool(
-                        m5.get(
-                            "retest",
-                            False,
-                        )
-                    ),
-                    rejection=bool(
-                        m5.get(
-                            "rejection",
-                            False,
-                        )
-                    ),
-                    liquidity_sweep=bool(
-                        m5.get(
-                            "liquidity_sweep",
-                            False,
-                        )
-                    ),
-                    micro_bos=bool(
-                        m5.get(
-                            "micro_bos",
-                            False,
-                        )
-                    ),
-                    candle_confirmation=bool(
-                        m5.get(
-                            "candle_confirmation",
-                            False,
-                        )
-                    ),
-                ),
+                confirmation=confirmation,
                 rr=rr,
-                spread_ok=True,
-                session_ok=True,
+                spread_ok=spread_ok,
+                session_ok=session_ok,
 
-                h4=h4_direction,
-                h1=h1_direction,
-                m15=m15_direction,
+                h4=h4,
+                h1=h1,
+                m15=m15,
                 direction=direction,
-
-                scenario=scenario.get(
-                    "type",
-                    "RANGE",
-                ),
+                scenario=scenario,
 
                 liquidity_sweep=liquidity_sweep,
                 liquidity_sweep_quality=liquidity_quality,
@@ -2509,1563 +1500,991 @@ def _calculate_final_score(
                 displacement_direction=displacement_direction,
                 displacement_atr_ratio=displacement_atr_ratio,
 
-                order_block=bool(
-                    order_block.get(
-                        "present",
-                        False,
-                    )
+                order_block=ob is not None,
+                order_block_fresh=_ob_fresh(ob),
+                order_block_mitigated=_ob_mitigated(ob),
+                order_block_displacement_origin=(
+                    _ob_displacement_origin(ob)
                 ),
-                order_block_fresh=bool(
-                    order_block.get(
-                        "fresh",
-                        False,
-                    )
-                ),
-                order_block_mitigated=bool(
-                    order_block.get(
-                        "mitigated",
-                        False,
-                    )
-                ),
-                order_block_displacement_origin=bool(
-                    order_block.get(
-                        "displacement_origin",
-                        False,
-                    )
-                ),
-                order_block_direction=_normalize_direction(
-                    order_block.get(
-                        "direction",
-                        Direction.NEUTRAL,
+                order_block_direction=(
+                    _normalize_direction(
+                        _get(
+                            ob,
+                            "direction",
+                            Direction.NEUTRAL,
+                        )
                     )
                 ),
 
-                fvg=bool(
-                    fvg.get(
-                        "present",
-                        False,
-                    )
-                ),
-                fvg_fresh=bool(
-                    fvg.get(
-                        "fresh",
-                        False,
-                    )
-                ),
-                fvg_filled=bool(
-                    fvg.get(
-                        "filled",
-                        False,
-                    )
-                ),
-                fvg_atr_ratio=_safe_float(
-                    fvg.get(
-                        "atr_ratio",
-                        0.0,
-                    )
-                ),
+                fvg=fvg is not None,
+                fvg_fresh=_fvg_fresh(fvg),
+                fvg_filled=_fvg_filled(fvg),
+                fvg_atr_ratio=_fvg_atr_ratio(fvg),
 
-                premium_discount=premium_discount.get(
-                    "zone",
-                    "EQUILIBRIUM",
-                ),
+                premium_discount=premium_discount,
 
-                support_resistance=support_resistance,
-
-                volatility_score=min(
-                    100.0,
-                    (
-                        displacement_atr_ratio
-                        / 2.0
-                    ) * 100.0,
-                ),
-
-                volatility_valid=atr > 0,
-
-                m5_confirmation=m5_confirmation,
-                m5_direction=_normalize_direction(
-                    m5.get(
-                        "direction",
-                        Direction.NEUTRAL,
-                    )
-                ),
-                m5_retest=bool(
-                    m5.get(
-                        "retest",
-                        False,
-                    )
-                ),
-                m5_rejection=bool(
-                    m5.get(
-                        "rejection",
-                        False,
-                    )
-                ),
-                m5_liquidity_sweep=bool(
-                    m5.get(
-                        "liquidity_sweep",
-                        False,
-                    )
-                ),
-                m5_micro_bos=bool(
-                    m5.get(
-                        "micro_bos",
-                        False,
-                    )
-                ),
-                m5_candle_confirmation=bool(
-                    m5.get(
-                        "candle_confirmation",
-                        False,
-                    )
-                ),
-                m5_displacement=bool(
-                    m5.get(
-                        "displacement",
-                        False,
-                    )
-                ),
-            )
-
-            return round(
-                max(
-                    0.0,
-                    min(
-                        100.0,
-                        _safe_float(
-                            score
+                support_resistance=(
+                    {
+                        "type": _get(
+                            sr,
+                            "level_type",
+                            "NONE",
                         ),
-                    ),
+                        "strength": _safe_float(
+                            _get(
+                                sr,
+                                "strength",
+                                0.0,
+                            )
+                        ),
+                        "reactions": int(
+                            _safe_float(
+                                _get(
+                                    sr,
+                                    "reactions",
+                                    0,
+                                )
+                            )
+                        ),
+                        "breakout": _safe_bool(
+                            _get(
+                                sr,
+                                "breakout",
+                                False,
+                            )
+                        ),
+                        "retest": _safe_bool(
+                            _get(
+                                sr,
+                                "retest",
+                                False,
+                            )
+                        ),
+                        "rejection": _safe_bool(
+                            _get(
+                                sr,
+                                "rejection",
+                                False,
+                            )
+                        ),
+                        "distance": _safe_float(
+                            _get(
+                                sr,
+                                "distance",
+                                0.0,
+                            )
+                        ),
+                    }
+                    if sr is not None
+                    else None
                 ),
-                2,
+
+                volatility_score=volatility_score,
+                volatility_valid=volatility_score > 0,
+
+                m5_confirmation=True,
+                m5_direction=m5.direction,
+                m5_retest=m5.retest,
+                m5_rejection=m5.rejection,
+                m5_liquidity_sweep=m5.liquidity_sweep,
+                m5_micro_bos=m5.micro_bos,
+                m5_candle_confirmation=m5.candle_confirmation,
+                m5_displacement=(
+                    _displacement_valid(
+                        _analyse_displacement(
+                            [],
+                            direction,
+                        ),
+                        direction,
+                    )
+                    if False
+                    else (
+                        m5.micro_bos
+                        or m5.liquidity_sweep
+                    )
+                ),
             )
+        )
+
+    except TypeError:
+        return float(
+            calculate_score(
+                trend=trend,
+                zone=zone,
+                confirmation=confirmation,
+                rr=rr,
+                spread_ok=spread_ok,
+                session_ok=session_ok,
+            )
+        )
+
+
+# ============================================================================
+# ANALYSE PRINCIPALE
+# ============================================================================
+
+def analyser_marche(
+    symbol: str = "XAU/USD",
+    timeframe: str = "15min",
+    requested_direction: Optional[Direction] = None,
+) -> dict[str, Any]:
+    """
+    Analyse complète multi-timeframe.
+
+    Retourne toujours un dictionnaire exploitable par Telegram.
+    """
+
+    symbol = str(symbol).upper().strip()
+
+    requested_direction = _normalize_direction(
+        requested_direction
+    )
+
+    # ------------------------------------------------------------------------
+    # DATA
+    # ------------------------------------------------------------------------
+
+    candles_by_tf: dict[str, list[Candle]] = {}
+
+    for tf in TIMEFRAMES:
+        api_interval = TIMEFRAME_TO_API[tf]
+
+        try:
+            candles = get_candles(
+                symbol,
+                api_interval,
+            )
+
+            if candles is None:
+                candles = []
+
+            candles_by_tf[tf] = list(candles)
 
         except Exception:
+            candles_by_tf[tf] = []
 
-            return 0.0
+    h4_candles = candles_by_tf["H4"]
+    h1_candles = candles_by_tf["H1"]
+    m15_candles = candles_by_tf["M15"]
+    m5_candles = candles_by_tf["M5"]
 
-    except Exception:
-
-        return 0.0
-
-
-# ============================================================
-# NEWS
-# ============================================================
-
-def _check_news(
-    symbol: str,
-) -> Dict[str, Any]:
-
-    if economic_filter is None:
-
+    if not m15_candles:
         return {
-            "blocked": False,
-            "reason": "",
+            "status": "NO_DATA",
+            "symbol": symbol,
+            "direction": Direction.NEUTRAL.value,
+            "score": 0.0,
+            "rr": 0.0,
+            "scenario": "NO_DATA",
+            "reason": "M15_DATA_UNAVAILABLE",
         }
 
-    try:
+    # ------------------------------------------------------------------------
+    # PRICE
+    # ------------------------------------------------------------------------
 
-        result = economic_filter(
-            symbol
-        )
+    entry = _last_price(m15_candles)
 
-        if isinstance(
-            result,
-            bool,
-        ):
-
-            return {
-                "blocked": result,
-                "reason": (
-                    "Filtre économique actif."
-                    if result
-                    else ""
-                ),
-            }
-
-        if isinstance(
-            result,
-            dict,
-        ):
-
-            blocked = bool(
-                result.get(
-                    "blocked"
-                )
-                or result.get(
-                    "is_blocked"
-                )
-                or result.get(
-                    "danger"
-                )
-            )
-
-            return {
-                "blocked": blocked,
-                "reason": str(
-                    result.get(
-                        "reason",
-                        "",
-                    )
-                ),
-            }
-
+    if entry <= 0:
         return {
-            "blocked": False,
-            "reason": "",
+            "status": "NO_DATA",
+            "symbol": symbol,
+            "direction": Direction.NEUTRAL.value,
+            "score": 0.0,
+            "rr": 0.0,
+            "scenario": "NO_DATA",
+            "reason": "INVALID_PRICE",
         }
 
-    except Exception:
+    # ------------------------------------------------------------------------
+    # H4 / H1 / M15 STRUCTURE
+    # ------------------------------------------------------------------------
 
-        return {
-            "blocked": False,
-            "reason": "",
-        }
-
-
-# ============================================================
-# MARKET OPEN
-# ============================================================
-
-def _market_open(
-    symbol: str,
-) -> bool:
-
-    if market_data is None:
-        return True
-
-    try:
-
-        method = getattr(
-            market_data,
-            "is_market_open",
-            None,
-        )
-
-        if callable(method):
-
-            return bool(
-                method(symbol)
-            )
-
-    except Exception:
-        pass
-
-    return True
-
-
-# ============================================================
-# DATA PROVIDER
-# ============================================================
-
-def _get_market_data(
-    symbol: str,
-    timeframe: str,
-) -> List[Any]:
-
-    if market_data is None:
-        return []
-
-    methods = (
-        "get_candles",
-        "fetch_candles",
-        "get_ohlc",
-        "get_data",
+    h4_structure = _analyse_structure(
+        h4_candles
     )
 
-    for method_name in methods:
-
-        method = getattr(
-            market_data,
-            method_name,
-            None,
-        )
-
-        if not callable(method):
-            continue
-
-        attempts = (
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-            },
-            {
-                "symbol": symbol,
-                "interval": timeframe,
-            },
-        )
-
-        for kwargs in attempts:
-
-            try:
-
-                raw = method(
-                    **kwargs
-                )
-
-                candles = _extract_candles(
-                    raw
-                )
-
-                if _validate_candles(
-                    candles
-                ):
-
-                    return candles
-
-            except TypeError:
-                continue
-
-            except Exception:
-                continue
-
-    return []
-
-
-# ============================================================
-# RESULTATS
-# ============================================================
-
-def _base_result(
-    symbol: str,
-    timeframe: str = "M15",
-) -> Dict[str, Any]:
-
-    return {
-        "success": False,
-        "status": "WAIT",
-
-        "symbol": symbol,
-        "market": symbol,
-        "timeframe": timeframe,
-
-        "direction": "NEUTRAL",
-
-        "score": 0.0,
-        "rr": 0.0,
-        "quality": "NO_SIGNAL",
-
-        "entry": 0.0,
-        "stop_loss": 0.0,
-        "take_profit": 0.0,
-
-        "reason": "",
-
-        "scenario": "RANGE",
-
-        "h4_direction": "NEUTRAL",
-        "h1_direction": "NEUTRAL",
-        "m15_direction": "NEUTRAL",
-        "m5_direction": "NEUTRAL",
-    }
-
-
-def _wait_result(
-    base: Dict[str, Any],
-    reason: str,
-) -> Dict[str, Any]:
-
-    result = dict(base)
-
-    result.update(
-        {
-            "success": False,
-            "status": "WAIT",
-            "reason": reason,
-        }
+    h1_structure = _analyse_structure(
+        h1_candles
     )
 
-    return result
-
-
-def _reject_result(
-    base: Dict[str, Any],
-    reason: str,
-) -> Dict[str, Any]:
-
-    result = dict(base)
-
-    result.update(
-        {
-            "success": False,
-            "status": "REJECT",
-            "reason": reason,
-        }
-    )
-
-    return result
-
-
-# ============================================================
-# ANALYSE PRINCIPALE
-# ============================================================
-
-def analyze_market(
-    symbol: str = "XAU/USD",
-    timeframe: str = "M15",
-) -> Dict[str, Any]:
-
-    symbol = str(
-        symbol
-    ).upper().strip()
-
-    result = _base_result(
-        symbol,
-        timeframe,
-    )
-
-    # ========================================================
-    # CONFIG
-    # ========================================================
-
-    threshold = _safe_float(
-        getattr(
-            CONFIG,
-            "SIGNAL_THRESHOLD",
-            60.0,
-        ),
-        60.0,
-    )
-
-    minimum_rr = _safe_float(
-        getattr(
-            CONFIG,
-            "MINIMUM_RR",
-            2.0,
-        ),
-        2.0,
-    )
-
-    # ========================================================
-    # MARKET
-    # ========================================================
-
-    if not _market_open(
-        symbol
-    ):
-
-        return _wait_result(
-            result,
-            "Marché actuellement fermé.",
-        )
-
-    # ========================================================
-    # DATA
-    # ========================================================
-
-    candles_h4 = _get_market_data(
-        symbol,
-        "H4",
-    )
-
-    candles_h1 = _get_market_data(
-        symbol,
-        "H1",
-    )
-
-    candles_m15 = _get_market_data(
-        symbol,
-        "M15",
-    )
-
-    candles_m5 = _get_market_data(
-        symbol,
-        "M5",
-    )
-
-    if not _validate_candles(
-        candles_h4
-    ):
-
-        return _wait_result(
-            result,
-            "Données H4 insuffisantes.",
-        )
-
-    if not _validate_candles(
-        candles_h1
-    ):
-
-        return _wait_result(
-            result,
-            "Données H1 insuffisantes.",
-        )
-
-    if not _validate_candles(
-        candles_m15
-    ):
-
-        return _wait_result(
-            result,
-            "Données M15 insuffisantes.",
-        )
-
-    if not _validate_candles(
-        candles_m5
-    ):
-
-        return _wait_result(
-            result,
-            "Données M5 insuffisantes.",
-        )
-
-    # ========================================================
-    # STRUCTURE H4
-    # ========================================================
-
-    structure_h4 = analyze_structure(
-        candles_h4
-    )
-
-    structure_h1 = analyze_structure(
-        candles_h1
-    )
-
-    structure_m15 = analyze_structure(
-        candles_m15
-    )
-
-    structure_m5 = analyze_structure(
-        candles_m5
+    m15_structure = _analyse_structure(
+        m15_candles
     )
 
     h4_direction = _structure_direction(
-        structure_h4
+        h4_structure
     )
 
     h1_direction = _structure_direction(
-        structure_h1
+        h1_structure
     )
 
     m15_direction = _structure_direction(
-        structure_m15
+        m15_structure
     )
 
-    m5_direction = _structure_direction(
-        structure_m5
+    h4_strength = _structure_strength(
+        h4_structure
     )
 
-    result.update(
-        {
-            "h4_direction": h4_direction.value,
-            "h1_direction": h1_direction.value,
-            "m15_direction": m15_direction.value,
-            "m5_direction": m5_direction.value,
+    h1_strength = _structure_strength(
+        h1_structure
+    )
+
+    m15_strength = _structure_strength(
+        m15_structure
+    )
+
+    # ------------------------------------------------------------------------
+    # DIRECTION
+    # ------------------------------------------------------------------------
+
+    direction = resolve_direction(
+        h4=h4_direction,
+        h1=h1_direction,
+        m15=m15_direction,
+        requested_direction=requested_direction,
+    )
+
+    if direction == Direction.NEUTRAL:
+        return {
+            "status": "REJECT",
+            "symbol": symbol,
+            "direction": Direction.NEUTRAL.value,
+            "score": 0.0,
+            "rr": 0.0,
+            "scenario": "RANGE",
+            "reason": "NO_VALID_DIRECTION",
+            "h4": h4_direction.value,
+            "h1": h1_direction.value,
+            "m15": m15_direction.value,
+            "m5": Direction.NEUTRAL.value,
         }
-    )
 
-    # ========================================================
-    # ATR
-    # ========================================================
-
-    atr_h4 = _calculate_atr(
-        candles_h4
-    )
-
-    atr_h1 = _calculate_atr(
-        candles_h1
-    )
-
-    atr_m15 = _calculate_atr(
-        candles_m15
-    )
-
-    atr_m5 = _calculate_atr(
-        candles_m5
-    )
-
-    atr = (
-        atr_m15
-        or atr_h1
-        or atr_h4
-    )
-
-    if atr <= 0:
-
-        return _wait_result(
-            result,
-            "ATR invalide ou volatilité insuffisante.",
-        )
-
-    # ========================================================
-    # LIQUIDITÉ
-    # ========================================================
-
-    liquidity_h1_result = (
-        analyze_liquidity(
-            candles_h1,
-            current_price=_close(
-                candles_h1[-1]
-            ),
-            atr=atr_h1,
-        )
-    )
-
-    liquidity_m15_result = (
-        analyze_liquidity(
-            candles_m15,
-            current_price=_close(
-                candles_m15[-1]
-            ),
-            atr=atr_m15,
-        )
-    )
-
-    liquidity_m5_result = (
-        analyze_liquidity(
-            candles_m5,
-            current_price=_close(
-                candles_m5[-1]
-            ),
-            atr=atr_m5,
-        )
-    )
-
-    # ========================================================
-    # DIRECTION INITIALE
-    #
-    # H1 + M15 ont priorité pour le mouvement exploitable.
-    # H4 reste la préférence globale.
-    # ========================================================
-
-    direction = resolve_trade_direction(
+    if not _primary_alignment_valid(
         h4_direction,
         h1_direction,
         m15_direction,
+    ):
+        return {
+            "status": "REJECT",
+            "symbol": symbol,
+            "direction": direction.value,
+            "score": 0.0,
+            "rr": 0.0,
+            "scenario": "RANGE",
+            "reason": "PRIMARY_STRUCTURE_INVALID",
+        }
+
+    # ------------------------------------------------------------------------
+    # TREND CONTEXT
+    # ------------------------------------------------------------------------
+
+    trend = TrendContext(
+        h4=h4_direction,
+        h4_strength=h4_strength,
     )
 
-    direction = _normalize_direction(
-        direction
-    )
+    # ------------------------------------------------------------------------
+    # M15 LIQUIDITY
+    # ------------------------------------------------------------------------
 
-    # --------------------------------------------------------
-    # Si H1/M15 sont neutres, H4 peut fournir la préférence.
-    # --------------------------------------------------------
-
-    if direction == Direction.NEUTRAL:
-
-        if h4_direction != Direction.NEUTRAL:
-
-            direction = h4_direction
-
-    if direction == Direction.NEUTRAL:
-
-        return _wait_result(
-            result,
-            (
-                "Aucune structure directionnelle "
-                "suffisamment exploitable."
-            ),
-        )
-
-    # ========================================================
-    # LIQUIDITÉ DIRECTIONNELLE
-    # ========================================================
-
-    liquidity_h1 = _liquidity_to_dict(
-        liquidity_h1_result,
+    liquidity_result = _analyse_liquidity(
+        m15_candles,
         direction,
     )
 
-    liquidity_m15 = _liquidity_to_dict(
-        liquidity_m15_result,
+    liquidity_sweep = _liquidity_sweep(
+        liquidity_result,
         direction,
     )
 
-    liquidity_m5 = _liquidity_to_dict(
-        liquidity_m5_result,
+    liquidity_quality = _liquidity_quality(
+        liquidity_result
+    )
+
+    # ------------------------------------------------------------------------
+    # M15 DISPLACEMENT
+    # ------------------------------------------------------------------------
+
+    displacement_result = _analyse_displacement(
+        m15_candles,
         direction,
     )
 
-    liquidity_candidates = [
-        liquidity_h1,
-        liquidity_m15,
-        liquidity_m5,
-    ]
-
-    liquidity = max(
-        liquidity_candidates,
-        key=lambda item: _safe_float(
-            item.get(
-                "quality",
-                0.0,
-            )
-        ),
-    )
-
-    # ========================================================
-    # DISPLACEMENT H1 / M15
-    # ========================================================
-
-    displacement_h1_result = (
-        analyze_displacement(
-            candles_h1,
-            atr_h1 or atr,
-        )
-    )
-
-    displacement_m15_result = (
-        analyze_displacement(
-            candles_m15,
-            atr_m15 or atr,
-        )
-    )
-
-    displacement_h1 = _displacement_to_dict(
-        displacement_h1_result,
+    displacement_valid = _displacement_valid(
+        displacement_result,
         direction,
     )
 
-    displacement_m15 = _displacement_to_dict(
-        displacement_m15_result,
-        direction,
-    )
+    # ------------------------------------------------------------------------
+    # DISPLACEMENT AFTER SWEEP
+    # ------------------------------------------------------------------------
 
-    displacement_candidates = [
-        displacement_h1,
-        displacement_m15,
-    ]
+    displacement_after_sweep = False
 
-    directional_displacements = [
-        item
-        for item in displacement_candidates
-        if (
-            item.get("valid")
-            and _normalize_direction(
-                item.get(
-                    "direction"
-                )
-            )
-            == direction
-        )
-    ]
-
-    if directional_displacements:
-
-        displacement = max(
-            directional_displacements,
-            key=lambda item: _safe_float(
-                item.get(
-                    "strength",
-                    0.0,
-                )
-            ),
-        )
-
-    else:
-
-        displacement = max(
-            displacement_candidates,
-            key=lambda item: _safe_float(
-                item.get(
-                    "strength",
-                    0.0,
-                )
-            ),
-        )
-
-    # ========================================================
-    # SWEEP → DISPLACEMENT
-    # ========================================================
-
-    directional_sweep = liquidity.get(
-        "sweep"
-    )
-
-    post_sweep_displacement = None
-
-    if directional_sweep is not None:
-
-        sweep_object = directional_sweep
-
-        sweep_index = getattr(
-            sweep_object,
-            "index",
-            None,
-        )
-
-        if sweep_index is not None:
-
-            post_sweep_displacement = (
+    if liquidity_sweep:
+        try:
+            displacement_after_sweep = bool(
                 detect_displacement_after_sweep(
-                    candles_m15,
-                    atr_m15 or atr,
-                    direction,
-                    sweep_index,
+                    m15_candles,
+                    direction=direction,
                 )
             )
-
-    if post_sweep_displacement is not None:
-
-        displacement = _displacement_to_dict(
-            analyze_displacement(
-                candles_m15,
-                atr_m15 or atr,
-                after_liquidity_sweep=True,
-            ),
-            direction,
-        )
-
-        # On conserve explicitement le displacement
-        # détecté après sweep si celui-ci est valide.
-        if post_sweep_displacement.valid:
-
-            displacement.update(
-                {
-                    "valid": True,
-                    "direction": (
-                        post_sweep_displacement.direction
-                    ),
-                    "atr_ratio": (
-                        post_sweep_displacement.atr_ratio
-                    ),
-                    "body_ratio": (
-                        post_sweep_displacement.body_ratio
-                    ),
-                    "strength": (
-                        post_sweep_displacement.strength
-                    ),
-                    "displacement": (
-                        post_sweep_displacement
-                    ),
-                }
+        except Exception:
+            displacement_after_sweep = (
+                displacement_valid
             )
 
-    # ========================================================
+    # ------------------------------------------------------------------------
     # ORDER BLOCK
-    # ========================================================
+    # ------------------------------------------------------------------------
 
-    order_block_result = (
-        analyze_order_blocks(
-            candles_m15,
-            atr_m15 or atr,
-            direction,
-        )
-    )
-
-    order_block = _order_block_to_dict(
-        order_block_result
-    )
-
-    # ========================================================
-    # FVG
-    # ========================================================
-
-    fvg_result = analyze_fvg(
-        candles_m15,
-        atr_m15 or atr,
+    ob_result = _analyse_order_blocks(
+        m15_candles,
         direction,
     )
 
-    fvg = _fvg_to_dict(
-        fvg_result
+    ob = _best_order_block(
+        ob_result,
+        direction,
     )
 
-    # ========================================================
+    # ------------------------------------------------------------------------
+    # FVG
+    # ------------------------------------------------------------------------
+
+    fvg_result = _analyse_fvg(
+        m15_candles,
+        direction,
+    )
+
+    fvg = _best_fvg(
+        fvg_result,
+        direction,
+    )
+
+    # ------------------------------------------------------------------------
     # PREMIUM / DISCOUNT
-    # ========================================================
-
-    current_price = _close(
-        candles_m5[-1]
-    )
+    # ------------------------------------------------------------------------
 
     premium_discount_result = (
-        analyze_premium_discount(
-            candles_m15,
-            price=current_price,
-            direction=direction,
+        _analyse_premium_discount(
+            m15_candles,
+            entry,
+            direction,
         )
     )
 
-    premium_discount = (
-        _premium_discount_to_dict(
+    premium_discount_zone = (
+        _premium_discount_zone(
             premium_discount_result
         )
     )
 
-    # ========================================================
-    # SUPPORT / RESISTANCE
-    # ========================================================
-
-    support_resistance_result = (
-        analyze_support_resistance(
-            candles_m15,
-            price=current_price,
-            direction=direction,
-            atr=atr_m15 or atr,
+    premium_discount_strength = (
+        _premium_discount_strength(
+            premium_discount_result
         )
     )
 
-    support_resistance = (
-        _support_resistance_to_dict(
-            support_resistance_result
-        )
-    )
-
-    # ========================================================
-    # SCÉNARIO
-    # ========================================================
-
-    scenario = _determine_scenario(
-        h4_direction,
-        h1_direction,
-        m15_direction,
-        m5_direction,
-        h1_structure=structure_h1,
-        m15_structure=structure_m15,
-        liquidity=liquidity,
-        displacement=displacement,
-    )
-
-    scenario_direction = _normalize_direction(
-        scenario.get(
-            "direction",
-            Direction.NEUTRAL,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Si le scénario possède une direction valide, elle devient
-    # la direction de travail.
-    # --------------------------------------------------------
-
-    if scenario_direction != Direction.NEUTRAL:
-
-        direction = scenario_direction
-
-    result["scenario"] = scenario.get(
-        "type",
-        "RANGE",
-    )
-
-    result["direction"] = (
-        direction.value
-    )
-
-    # ========================================================
-    # VALIDATION STRUCTURELLE
-    # ========================================================
-
-    structure_confirmed = (
-        _has_directional_structure_event(
-            structure_h1,
-            direction,
-        )
-        or _has_directional_structure_event(
-            structure_m15,
-            direction,
-        )
-        or (
-            h1_direction == direction
-        )
-        or (
-            m15_direction == direction
-        )
-    )
-
-    # --------------------------------------------------------
-    # Une vraie configuration SMC peut être confirmée par :
-    #
-    # sweep
-    # +
-    # displacement
-    # +
-    # structure
-    #
-    # même sans breakout classique de S/R.
-    # --------------------------------------------------------
-
-    smc_sequence = (
-        liquidity.get(
-            "detected",
-            False,
-        )
-        and displacement.get(
-            "valid",
-            False,
-        )
-        and _normalize_direction(
-            displacement.get(
-                "direction",
-                Direction.NEUTRAL,
+    premium_discount_valid = (
+        _safe_bool(
+            _get(
+                premium_discount_result,
+                "valid",
+                False,
             )
         )
-        == direction
-        and structure_confirmed
     )
 
-    zone_confluence = (
-        order_block.get(
-            "present",
-            False,
-        )
-        or fvg.get(
-            "present",
-            False,
-        )
-        or support_resistance.get(
-            "valid",
-            False,
-        )
-    )
+    # ------------------------------------------------------------------------
+    # SUPPORT / RESISTANCE
+    # ------------------------------------------------------------------------
 
-    # --------------------------------------------------------
-    # On ne force pas un signal.
-    # Il faut au minimum une structure exploitable ou une
-    # séquence SMC claire.
-    # --------------------------------------------------------
-
-    if not structure_confirmed and not smc_sequence:
-
-        return _wait_result(
-            result,
-            (
-                "Structure directionnelle insuffisante "
-                "sur H1/M15."
-            ),
-        )
-
-    # ========================================================
-    # M5
-    # ========================================================
-
-    m5 = _m5_confirmation(
-        candles_m5,
+    sr_result = _analyse_support_resistance(
+        m15_candles,
+        entry,
         direction,
-        atr_m5 or atr,
     )
 
-    # ========================================================
+    sr = _best_support_resistance(
+        sr_result,
+        direction,
+    )
+
+    # ------------------------------------------------------------------------
+    # M5 CONFIRMATION
+    # ------------------------------------------------------------------------
+
+    m5_confirmation = _build_m5_confirmation(
+        m5_candles,
+        direction,
+    )
+
+    m5_strength = confirmation_strength(
+        m5_confirmation
+    )
+
+    # M5 est volontairement NON BLOQUANT.
+    m5_direction = (
+        m5_confirmation.direction
+    )
+
+    # ------------------------------------------------------------------------
+    # BOS / CHOCH
+    # ------------------------------------------------------------------------
+
+    h1_bos = _structure_has_event(
+        h1_structure,
+        "bos",
+    )
+
+    h1_choch = _structure_has_event(
+        h1_structure,
+        "choch",
+    )
+
+    m15_bos = _structure_has_event(
+        m15_structure,
+        "bos",
+    )
+
+    m15_choch = _structure_has_event(
+        m15_structure,
+        "choch",
+    )
+
+    bos = h1_bos or m15_bos
+    choch = h1_choch or m15_choch
+
+    # ------------------------------------------------------------------------
+    # SCENARIO
+    # ------------------------------------------------------------------------
+
+    scenario = _determine_scenario(
+        h4=h4_direction,
+        h1=h1_direction,
+        m15=m15_direction,
+        direction=direction,
+        liquidity_sweep=liquidity_sweep,
+        displacement_valid=(
+            displacement_valid
+            or displacement_after_sweep
+        ),
+        bos=bos,
+        choch=choch,
+    )
+
+    # ------------------------------------------------------------------------
+    # CONFLUENCE
+    # ------------------------------------------------------------------------
+
+    structure_confirmed = (
+        h1_direction == direction
+        or m15_direction == direction
+        or (
+            h4_direction == direction
+            and h1_direction == Direction.NEUTRAL
+        )
+    )
+
+    confluences = _count_confluences(
+        structure_confirmed=structure_confirmed,
+        liquidity_sweep=liquidity_sweep,
+        displacement_valid=(
+            displacement_valid
+            or displacement_after_sweep
+        ),
+        order_block=ob is not None,
+        fvg=fvg is not None,
+        premium_discount_valid=(
+            premium_discount_valid
+        ),
+        sr=sr,
+        m5_confirmation=m5_confirmation,
+    )
+
+    # ------------------------------------------------------------------------
     # ZONE
-    # ========================================================
+    # ------------------------------------------------------------------------
 
     zone = _build_zone(
         direction=direction,
-        candles_m15=candles_m15,
-        structure_m15=structure_m15,
-        liquidity=liquidity,
-        displacement=displacement,
-        order_block=order_block,
+        sr=sr,
+        ob=ob,
         fvg=fvg,
-        premium_discount=premium_discount,
-        support_resistance=support_resistance,
-        current_price=current_price,
+        h1_strength=h1_strength,
+        m15_strength=m15_strength,
+        structure_confirmed=structure_confirmed,
+        liquidity_nearby=(
+            liquidity_sweep
+            or liquidity_quality >= 50
+        ),
     )
 
     if zone is None:
-
-        return _wait_result(
-            result,
-            "Aucune zone exploitable.",
-        )
-
-    # ========================================================
-    # ENTRY
-    # ========================================================
-
-    entry = current_price
-
-    # ========================================================
-    # SL / TP
-    # ========================================================
-
-    stop_loss, take_profit = _build_sl_tp(
-        candles_m15,
-        direction,
-        entry,
-        atr,
-        order_block,
-        support_resistance,
-        liquidity_m15_result,
-    )
-
-    # ========================================================
-    # GEOMETRY
-    # ========================================================
-
-    if not validate_trade_geometry(
-        direction,
-        entry,
-        stop_loss,
-        take_profit,
-    ):
-
-        return _reject_result(
-            result,
-            "Géométrie Entry / SL / TP invalide.",
-        )
-
-    # ========================================================
-    # RR
-    # ========================================================
-
-    rr = _safe_float(
-        calculate_rr(
-            entry,
-            stop_loss,
-            take_profit,
-        ),
-        0.0,
-    )
-
-    result.update(
-        {
-            "entry": round(
-                entry,
-                8,
-            ),
-            "stop_loss": round(
-                stop_loss,
-                8,
-            ),
-            "take_profit": round(
-                take_profit,
-                8,
-            ),
-            "rr": round(
-                rr,
-                2,
-            ),
+        return {
+            "status": "REJECT",
+            "symbol": symbol,
+            "direction": direction.value,
+            "score": 0.0,
+            "rr": 0.0,
+            "scenario": scenario,
+            "reason": "NO_VALID_ZONE",
+            "h4": h4_direction.value,
+            "h1": h1_direction.value,
+            "m15": m15_direction.value,
+            "m5": m5_direction.value,
+            "confluences": confluences,
         }
+
+    # ------------------------------------------------------------------------
+    # SL / TP
+    # ------------------------------------------------------------------------
+
+    stop_loss, take_profit = _build_trade_geometry(
+        candles=m15_candles,
+        direction=direction,
+        entry=entry,
+        ob=ob,
+        fvg=fvg,
+        sr=sr,
     )
 
-    if rr < minimum_rr:
+    # ------------------------------------------------------------------------
+    # RR
+    # ------------------------------------------------------------------------
 
-        return _reject_result(
-            result,
-            (
-                f"RR insuffisant : "
-                f"{rr:.2f} < "
-                f"{minimum_rr:.2f}."
-            ),
+    try:
+        rr = float(
+            calculate_rr(
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
         )
+    except Exception:
+        rr = 0.0
 
-    # ========================================================
+    # ------------------------------------------------------------------------
+    # GEOMETRY
+    # ------------------------------------------------------------------------
+
+    geometry_valid = False
+
+    try:
+        geometry_valid = bool(
+            validate_trade_geometry(
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                direction=direction,
+            )
+        )
+    except TypeError:
+        try:
+            geometry_valid = bool(
+                validate_trade_geometry(
+                    entry,
+                    stop_loss,
+                    take_profit,
+                    direction,
+                )
+            )
+        except Exception:
+            geometry_valid = rr >= CONFIG.MINIMUM_RR
+    except Exception:
+        geometry_valid = rr >= CONFIG.MINIMUM_RR
+
+    if not geometry_valid:
+        return {
+            "status": "REJECT",
+            "symbol": symbol,
+            "direction": direction.value,
+            "score": 0.0,
+            "rr": rr,
+            "scenario": scenario,
+            "reason": "INVALID_TRADE_GEOMETRY",
+            "h4": h4_direction.value,
+            "h1": h1_direction.value,
+            "m15": m15_direction.value,
+            "m5": m5_direction.value,
+        }
+
+    if rr < CONFIG.MINIMUM_RR:
+        return {
+            "status": "REJECT",
+            "symbol": symbol,
+            "direction": direction.value,
+            "score": 0.0,
+            "rr": rr,
+            "scenario": scenario,
+            "reason": "RR_BELOW_MINIMUM",
+            "h4": h4_direction.value,
+            "h1": h1_direction.value,
+            "m15": m15_direction.value,
+            "m5": m5_direction.value,
+        }
+
+    # ------------------------------------------------------------------------
+    # FINAL ZONE VALIDATION
+    # ------------------------------------------------------------------------
+
+    entry_distance = abs(
+        entry - zone.key_level
+    )
+
+    # On ne prétend pas qu'un breakout/retest existe
+    # si le moteur S/R ne l'a pas détecté.
+    zone = Zone(
+        direction=zone.direction,
+        timeframe=zone.timeframe,
+        low=zone.low,
+        high=zone.high,
+        h1_strength=zone.h1_strength,
+        m15_strength=zone.m15_strength,
+        kind=zone.kind,
+        structure_confirmed=zone.structure_confirmed,
+        liquidity_nearby=zone.liquidity_nearby,
+        order_block=zone.order_block,
+        fvg=zone.fvg,
+        created_at=zone.created_at,
+        level_type=zone.level_type,
+        key_level=zone.key_level,
+        breakout_confirmed=zone.breakout_confirmed,
+        breakout_direction=zone.breakout_direction,
+        retest_confirmed=zone.retest_confirmed,
+        rejection_confirmed=(
+            zone.rejection_confirmed
+            or m5_confirmation.rejection
+        ),
+        candle_confirmation=(
+            m5_confirmation.candle_confirmation
+        ),
+        entry_valid=(
+            zone.low <= entry <= zone.high
+            or (
+                entry_distance <= max(
+                    abs(zone.high - zone.low),
+                    _atr_from_candles(
+                        m15_candles
+                    ) * 0.50,
+                )
+            )
+        ),
+        entry_distance=entry_distance,
+    )
+
+    # ------------------------------------------------------------------------
     # SCORE
-    # ========================================================
+    # ------------------------------------------------------------------------
 
     score = _calculate_final_score(
-        symbol=symbol,
-        direction=direction,
-        h4_direction=h4_direction,
-        h1_direction=h1_direction,
-        m15_direction=m15_direction,
-        m5=m5,
-        rr=rr,
+        trend=trend,
         zone=zone,
+        confirmation=m5_confirmation,
+        rr=rr,
+        h4=h4_direction,
+        h1=h1_direction,
+        m15=m15_direction,
+        direction=direction,
         scenario=scenario,
-        liquidity=liquidity,
-        displacement=displacement,
-        order_block=order_block,
+        liquidity_result=liquidity_result,
+        displacement_result=displacement_result,
+        ob=ob,
         fvg=fvg,
-        premium_discount=premium_discount,
-        support_resistance=support_resistance,
-        atr=atr,
+        premium_discount_result=(
+            premium_discount_result
+        ),
+        sr=sr,
+        m5=m5_confirmation,
+        spread_ok=True,
+        session_ok=True,
     )
 
-    result["score"] = round(
-        score,
-        2,
+    score = max(
+        0.0,
+        min(100.0, score),
     )
 
-    # ========================================================
-    # SCORE MINIMUM
-    # ========================================================
-
-    if score < threshold:
-
-        return _reject_result(
-            result,
-            (
-                f"Score insuffisant : "
-                f"{score:.1f}/100 "
-                f"< {threshold:.1f}."
-            ),
-        )
-
-    # ========================================================
+    # ------------------------------------------------------------------------
     # NEWS
-    # ========================================================
+    # ------------------------------------------------------------------------
 
-    news = _check_news(
+    news_allowed = _check_news(
         symbol
     )
 
-    if news.get(
-        "blocked"
+    if not news_allowed:
+        return {
+            "status": "NEWS_BLOCKED",
+            "symbol": symbol,
+            "direction": direction.value,
+            "score": score,
+            "rr": rr,
+            "scenario": scenario,
+            "reason": "HIGH_IMPACT_NEWS",
+            "h4": h4_direction.value,
+            "h1": h1_direction.value,
+            "m15": m15_direction.value,
+            "m5": m5_direction.value,
+        }
+
+    # ------------------------------------------------------------------------
+    # SCORE THRESHOLD
+    # ------------------------------------------------------------------------
+
+    if not should_send_signal(
+        score,
+        CONFIG.SIGNAL_THRESHOLD,
     ):
-
-        return _reject_result(
-            result,
-            (
-                "Signal bloqué par le filtre "
-                "économique : "
-                f"{news.get(
-                    'reason',
-                    'événement à risque'
-                )}."
+        return {
+            "status": "REJECT",
+            "symbol": symbol,
+            "direction": direction.value,
+            "score": round(score, 2),
+            "rr": round(rr, 2),
+            "scenario": scenario,
+            "reason": "SCORE_BELOW_THRESHOLD",
+            "h4": h4_direction.value,
+            "h1": h1_direction.value,
+            "m15": m15_direction.value,
+            "m5": m5_direction.value,
+            "confluences": confluences,
+            "premium_discount": premium_discount_zone,
+            "premium_discount_strength": (
+                premium_discount_strength
             ),
-        )
+            "liquidity_sweep": liquidity_sweep,
+            "liquidity_quality": liquidity_quality,
+            "displacement": displacement_valid,
+            "displacement_after_sweep": (
+                displacement_after_sweep
+            ),
+            "order_block": ob is not None,
+            "fvg": fvg is not None,
+            "m5_strength": m5_strength,
+        }
 
-    # ========================================================
-    # QUALITÉ
-    # ========================================================
-
-    if score >= 90:
-        quality = "A+"
-
-    elif score >= 80:
-        quality = "A"
-
-    elif score >= 70:
-        quality = "B"
-
-    else:
-        quality = "C"
-
-    # ========================================================
+    # ------------------------------------------------------------------------
     # BUILD SIGNAL
-    # ========================================================
+    # ------------------------------------------------------------------------
 
     signal = None
 
-    if build_signal is None:
-
-        return _reject_result(
-            result,
-            (
-                "Signal engine indisponible : "
-                "build_signal non chargé."
-            ),
-        )
-
-    trend_context = TrendContext(
-        h4=h4_direction,
-        h4_strength=_structure_strength(
-            structure_h4
-        ),
-    )
-
-    confirmation = Confirmation(
-        direction=direction,
-        retest=bool(
-            m5.get(
-                "retest",
-                False,
-            )
-        ),
-        rejection=bool(
-            m5.get(
-                "rejection",
-                False,
-            )
-        ),
-        liquidity_sweep=bool(
-            m5.get(
-                "liquidity_sweep",
-                False,
-            )
-        ),
-        micro_bos=bool(
-            m5.get(
-                "micro_bos",
-                False,
-            )
-        ),
-        candle_confirmation=bool(
-            m5.get(
-                "candle_confirmation",
-                False,
-            )
-        ),
-    )
-
     try:
-
         signal = build_signal(
             symbol=symbol,
-
-            trend=trend_context,
-
+            trend=trend,
             zone=zone,
-
-            confirmation=confirmation,
-
+            confirmation=m5_confirmation,
             entry=entry,
             stop_loss=stop_loss,
             take_profit=take_profit,
-
             spread_ok=True,
             session_ok=True,
-
             requested_direction=direction,
-
-            scenario=scenario.get(
-                "type",
-                "RANGE",
-            ),
-
-            risk_percent=_safe_float(
-                getattr(
-                    CONFIG,
-                    "DEFAULT_RISK_PERCENT",
-                    1.0,
-                ),
-                1.0,
-            ),
-
-            # Données supplémentaires.
-            h4=h4_direction,
-            h1=h1_direction,
-            m15=m15_direction,
-            m5=m5_direction,
-
-            liquidity=liquidity,
-            displacement=displacement,
-            order_block=order_block,
-            fvg=fvg,
-            premium_discount=premium_discount,
-            support_resistance=support_resistance,
+            scenario=scenario,
         )
+    except Exception:
+        signal = None
 
-    except Exception as exc:
-
-        # ----------------------------------------------------
-        # IMPORTANT :
-        # Un échec de construction du Signal ne peut plus
-        # produire un faux ACTIVE.
-        # ----------------------------------------------------
-
-        return _reject_result(
-            result,
-            (
-                "Échec de construction du signal : "
-                f"{type(exc).__name__}: {exc}"
-            ),
-        )
+    # ------------------------------------------------------------------------
+    # FINAL
+    # ------------------------------------------------------------------------
 
     if signal is None:
+        return {
+            "status": "REJECT",
+            "symbol": symbol,
+            "direction": direction.value,
+            "score": round(score, 2),
+            "rr": round(rr, 2),
+            "scenario": scenario,
+            "reason": "SIGNAL_ENGINE_REJECTED",
+            "h4": h4_direction.value,
+            "h1": h1_direction.value,
+            "m15": m15_direction.value,
+            "m5": m5_direction.value,
+            "confluences": confluences,
+        }
 
-        return _reject_result(
-            result,
-            (
-                "Configuration validée par le moteur "
-                "d'analyse mais build_signal() a refusé "
-                "la création du signal."
+    return {
+        "status": "ACTIVE",
+        "symbol": symbol,
+        "direction": direction.value,
+        "score": round(
+            _safe_float(
+                _get(
+                    signal,
+                    "score",
+                    score,
+                )
             ),
-        )
+            2,
+        ),
+        "rr": round(
+            _safe_float(
+                _get(
+                    signal,
+                    "rr",
+                    rr,
+                )
+            ),
+            2,
+        ),
+        "entry": round(entry, 8),
+        "stop_loss": round(
+            stop_loss,
+            8,
+        ),
+        "take_profit": round(
+            take_profit,
+            8,
+        ),
+        "scenario": scenario,
 
-    # ========================================================
-    # RÉSULTAT FINAL
-    # ========================================================
+        "h4": h4_direction.value,
+        "h1": h1_direction.value,
+        "m15": m15_direction.value,
+        "m5": m5_direction.value,
 
-    scenario_type = scenario.get(
-        "type",
-        "RANGE",
-    )
+        "h4_strength": round(
+            h4_strength,
+            2,
+        ),
+        "h1_strength": round(
+            h1_strength,
+            2,
+        ),
+        "m15_strength": round(
+            m15_strength,
+            2,
+        ),
 
-    h4_preference = scenario.get(
-        "h4_preference",
-        h4_direction,
-    )
+        "m5_strength": round(
+            m5_strength,
+            2,
+        ),
 
-    if isinstance(
-        h4_preference,
-        Direction,
-    ):
+        "confluences": confluences,
 
-        h4_preference = (
-            h4_preference.value
-        )
+        "liquidity_sweep": liquidity_sweep,
+        "liquidity_quality": round(
+            liquidity_quality,
+            2,
+        ),
 
-    # --------------------------------------------------------
-    # Description scénario
-    # --------------------------------------------------------
+        "displacement": displacement_valid,
+        "displacement_after_sweep": (
+            displacement_after_sweep
+        ),
 
-    scenario_descriptions = {
+        "order_block": ob is not None,
+        "order_block_fresh": _ob_fresh(ob),
+        "order_block_mitigated": _ob_mitigated(ob),
+        "order_block_strength": round(
+            _ob_strength(ob),
+            2,
+        ),
 
-        "CONTINUATION":
-            "continuation dans le contexte directionnel dominant",
+        "fvg": fvg is not None,
+        "fvg_fresh": _fvg_fresh(fvg),
+        "fvg_filled": _fvg_filled(fvg),
+        "fvg_atr_ratio": round(
+            _fvg_atr_ratio(fvg),
+            4,
+        ),
 
-        "CORRECTION":
-            "correction M15/M5 dans le contexte directionnel H4/H1",
+        "premium_discount": (
+            premium_discount_zone
+        ),
+        "premium_discount_strength": round(
+            premium_discount_strength,
+            2,
+        ),
 
-        "POTENTIAL_REVERSAL":
-            "possible changement de structure confirmé par H1/M15",
+        "support_resistance": (
+            {
+                "type": _get(
+                    sr,
+                    "level_type",
+                    "NONE",
+                ),
+                "key_level": _safe_float(
+                    _get(
+                        sr,
+                        "key_level",
+                        0.0,
+                    )
+                ),
+                "strength": _safe_float(
+                    _get(
+                        sr,
+                        "strength",
+                        0.0,
+                    )
+                ),
+                "reactions": int(
+                    _safe_float(
+                        _get(
+                            sr,
+                            "reactions",
+                            0,
+                        )
+                    )
+                ),
+                "breakout": _safe_bool(
+                    _get(
+                        sr,
+                        "breakout",
+                        False,
+                    )
+                ),
+                "retest": _safe_bool(
+                    _get(
+                        sr,
+                        "retest",
+                        False,
+                    )
+                ),
+                "rejection": _safe_bool(
+                    _get(
+                        sr,
+                        "rejection",
+                        False,
+                    )
+                ),
+            }
+            if sr is not None
+            else None
+        ),
 
-        "COUNTER_TREND":
-            "configuration contre le biais H4 avec structure inférieure confirmée",
+        "m5_confirmation": {
+            "retest": m5_confirmation.retest,
+            "rejection": m5_confirmation.rejection,
+            "liquidity_sweep": (
+                m5_confirmation.liquidity_sweep
+            ),
+            "micro_bos": (
+                m5_confirmation.micro_bos
+            ),
+            "candle_confirmation": (
+                m5_confirmation.candle_confirmation
+            ),
+        },
 
-        "STRUCTURAL_ALIGNMENT":
-            "alignement structurel H1/M15",
-
-        "M15_STRUCTURE":
-            "structure directionnelle M15 exploitable",
-
-        "H1_STRUCTURE":
-            "structure directionnelle H1 exploitable",
-
-        "RANGE":
-            "marché en range ou structure indéterminée",
+        "signal": signal,
     }
 
-    scenario_description = (
-        scenario_descriptions.get(
-            scenario_type,
-            "configuration directionnelle exploitable",
-        )
-    )
 
-    # ========================================================
-    # FINAL
-    # ========================================================
+# ============================================================================
+# ALIASES COMPATIBILITE
+# ============================================================================
 
-    result.update(
-        {
-            "success": True,
-            "status": "ACTIVE",
-
-            "direction": direction.value,
-
-            "quality": quality,
-
-            "score": round(
-                score,
-                2,
-            ),
-
-            "rr": round(
-                rr,
-                2,
-            ),
-
-            "entry": round(
-                entry,
-                8,
-            ),
-
-            "stop_loss": round(
-                stop_loss,
-                8,
-            ),
-
-            "take_profit": round(
-                take_profit,
-                8,
-            ),
-
-            "scenario": scenario_type,
-
-            "scenario_description":
-                scenario_description,
-
-            "h4_preference":
-                h4_preference,
-
-            "m5_confirmation":
-                m5,
-
-            "liquidity":
-                liquidity,
-
-            "liquidity_h1":
-                liquidity_h1,
-
-            "liquidity_m15":
-                liquidity_m15,
-
-            "liquidity_m5":
-                liquidity_m5,
-
-            "displacement":
-                displacement,
-
-            "order_block":
-                order_block,
-
-            "fvg":
-                fvg,
-
-            "premium_discount":
-                premium_discount,
-
-            "support_resistance":
-                support_resistance,
-
-            "zone":
-                zone,
-
-            "signal":
-                signal,
-
-            "structure_h4":
-                structure_h4,
-
-            "structure_h1":
-                structure_h1,
-
-            "structure_m15":
-                structure_m15,
-
-            "structure_m5":
-                structure_m5,
-
-            "reason":
-                (
-                    f"Signal validé : "
-                    f"scénario {scenario_type}, "
-                    f"biais H4 {h4_preference}, "
-                    f"structure H1/M15 exploitable, "
-                    f"liquidité "
-                    f"{'confirmée' if liquidity.get('detected') else 'non obligatoire'}, "
-                    f"displacement "
-                    f"{'confirmé' if displacement.get('valid') else 'non bloquant'}, "
-                    f"confluences "
-                    f"{'OB/FVG/SR présentes' if zone_confluence else 'structurelles'}, "
-                    f"RR {rr:.2f}, "
-                    f"score {score:.1f}/100. "
-                    f"M5 utilisé comme confirmation "
-                    f"secondaire non bloquante."
-                ),
-        }
-    )
-
-    return result
-
-
-# ============================================================
-# ALIASES COMPATIBILITÉ
-# ============================================================
-
-def analyser_marche(
-    symbol: str = "XAU/USD",
-    timeframe: str = "M15",
-) -> Dict[str, Any]:
-
-    return analyze_market(
-        symbol=symbol,
-        timeframe=timeframe,
-    )
-
-
-def analyser_marche_complet(
-    symbol: str = "XAU/USD",
-    timeframe: str = "M15",
-) -> Dict[str, Any]:
-
-    return analyze_market(
-        symbol=symbol,
-        timeframe=timeframe,
-    )
-
-
-def run_analysis(
-    symbol: str = "XAU/USD",
-    timeframe: str = "M15",
-) -> Dict[str, Any]:
-
-    return analyze_market(
-        symbol=symbol,
-        timeframe=timeframe,
-    )
+analyser_marche_complet = analyser_marche
+run_analysis = analyser_marche
+analyze_market = analyser_marche
+analyser_pipeline = analyser_marche
