@@ -687,24 +687,46 @@ def format_analysis(
         )
     )
 
+    # ========================================================
+    # CORRECTION H4 / H1 / M15 / M5
+    #
+    # Le pipeline renvoie désormais directement :
+    # h4, h1, m15, m5
+    #
+    # Les anciennes clés *_direction restent acceptées
+    # comme fallback pour éviter toute régression.
+    # ========================================================
+
     h4 = result.get(
-        "h4_direction",
-        "N/A"
+        "h4",
+        result.get(
+            "h4_direction",
+            "N/A"
+        )
     )
 
     h1 = result.get(
-        "h1_direction",
-        "N/A"
+        "h1",
+        result.get(
+            "h1_direction",
+            "N/A"
+        )
     )
 
     m15 = result.get(
-        "m15_direction",
-        "N/A"
+        "m15",
+        result.get(
+            "m15_direction",
+            "N/A"
+        )
     )
 
     m5 = result.get(
-        "m5_direction",
-        "N/A"
+        "m5",
+        result.get(
+            "m5_direction",
+            "N/A"
+        )
     )
 
     # --------------------------------------------------------
