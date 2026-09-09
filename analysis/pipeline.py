@@ -1262,7 +1262,6 @@ def analyze_market(
 
     # --------------------------------------------------------
     # DISPLACEMENT M15
-    # ATR M15 est transmis explicitement.
     # --------------------------------------------------------
 
     displacement = analyze_displacement(
@@ -1272,7 +1271,6 @@ def analyze_market(
 
     # --------------------------------------------------------
     # ORDER BLOCK M15
-    # ATR M15 est transmis explicitement.
     # --------------------------------------------------------
 
     order_blocks = analyze_order_blocks(
@@ -1318,7 +1316,6 @@ def analyze_market(
 
     # --------------------------------------------------------
     # DISPLACEMENT M5
-    # ATR M5 est transmis explicitement.
     # --------------------------------------------------------
 
     m5_displacement = (
@@ -1470,6 +1467,12 @@ def analyze_market(
 
     # --------------------------------------------------------
     # GÉOMÉTRIE TRADE
+    #
+    # La géométrie est calculée en interne afin de
+    # permettre le calcul du RR et du score.
+    #
+    # Elle ne sera exposée dans le résultat final
+    # que si le signal devient ACTIVE.
     # --------------------------------------------------------
 
     entry, stop_loss, take_profit = (
@@ -1532,6 +1535,26 @@ def analyze_market(
         status = "REJECT"
 
     # --------------------------------------------------------
+    # EXPOSITION DE LA GÉOMÉTRIE
+    #
+    # IMPORTANT :
+    # Un signal REJECT ne possède pas de Entry/SL/TP
+    # exploitable.
+    #
+    # Les valeurs calculées précédemment restent
+    # uniquement internes au pipeline pour la validation.
+    # --------------------------------------------------------
+
+    if status == "ACTIVE":
+        result_entry = entry
+        result_stop_loss = stop_loss
+        result_take_profit = take_profit
+    else:
+        result_entry = None
+        result_stop_loss = None
+        result_take_profit = None
+
+    # --------------------------------------------------------
     # RÉSULTAT
     # --------------------------------------------------------
 
@@ -1579,9 +1602,13 @@ def analyze_market(
 
         "zone": zone,
 
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
+        # ----------------------------------------------------
+        # ENTRY / SL / TP UNIQUEMENT SI ACTIVE
+        # ----------------------------------------------------
+
+        "entry": result_entry,
+        "stop_loss": result_stop_loss,
+        "take_profit": result_take_profit,
 
         "trend_context": trend_context,
 
