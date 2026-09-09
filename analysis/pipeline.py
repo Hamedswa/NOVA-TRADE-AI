@@ -172,6 +172,56 @@ def _normalize_candles(
     ]
 
 
+def _calculate_atr(
+    candles: list[Candle],
+    period: int = 14,
+) -> float:
+    """
+    Calcule l'ATR simple nécessaire au moteur
+    de displacement.
+
+    Aucun appel API.
+    Aucun appel IA.
+    """
+
+    if not candles:
+        return 0.0
+
+    if len(candles) < 2:
+        return 0.0
+
+    true_ranges: list[float] = []
+
+    for index in range(1, len(candles)):
+        current = candles[index]
+        previous = candles[index - 1]
+
+        high = float(current.high)
+        low = float(current.low)
+        previous_close = float(
+            previous.close
+        )
+
+        true_range = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close),
+        )
+
+        true_ranges.append(
+            max(0.0, true_range)
+        )
+
+    if not true_ranges:
+        return 0.0
+
+    selected = true_ranges[
+        -max(1, period):
+    ]
+
+    return sum(selected) / len(selected)
+
+
 def _normalize_direction(
     value: Any,
 ) -> Direction:
@@ -1075,6 +1125,25 @@ def analyze_market(
             "rr": 0.0,
         }
 
+    # ========================================================
+    # ATR
+    # ========================================================
+    #
+    # analyze_displacement() exige obligatoirement un ATR.
+    # Chaque timeframe utilise son propre ATR afin de mesurer
+    # correctement la force relative de ses bougies.
+    #
+
+    m15_atr = _calculate_atr(
+        m15_candles,
+        period=14,
+    )
+
+    m5_atr = _calculate_atr(
+        m5_candles,
+        period=14,
+    )
+
     h4_structure = analyze_structure(
         h4_candles
     )
@@ -1133,7 +1202,8 @@ def analyze_market(
     )
 
     displacement = analyze_displacement(
-        m15_candles
+        m15_candles,
+        m15_atr,
     )
 
     order_blocks = analyze_order_blocks(
@@ -1162,7 +1232,8 @@ def analyze_market(
 
     m5_displacement = (
         analyze_displacement(
-            m5_candles
+            m5_candles,
+            m5_atr,
         )
     )
 
@@ -1278,29 +1349,9 @@ def analyze_market(
         )
     )
 
-    atr = 0.0
-
-    for result in (
-        displacement,
-        m5_displacement,
-    ):
-        if isinstance(result, dict):
-            try:
-                atr = float(
-                    result.get(
-                        "atr",
-                        0.0,
-                    )
-                    or 0.0
-                )
-            except (
-                TypeError,
-                ValueError,
-            ):
-                atr = 0.0
-
-        if atr > 0:
-            break
+    # L'ATR M15 sert de référence pour la
+    # géométrie principale du trade.
+    atr = m15_atr
 
     zone = _build_zone(
         direction=direction,
