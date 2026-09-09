@@ -118,7 +118,7 @@ CACHE_TTL_SECONDS = {
     "H4": 8 * 60 * 60,
     "H1": 2 * 60 * 60,
     "M15": 30 * 60,
-    "M5": 60,
+    "M5": 10 * 60,
 }
 
 _cache: Dict[str, Dict[str, Any]] = {}
@@ -1539,7 +1539,7 @@ def get_latest_price(
 
         logger.error(
             "PRICE Twelve Data %s : "
-            "HTTP %s",
+            "HTTP %s.",
             symbol,
             response.status_code,
         )
