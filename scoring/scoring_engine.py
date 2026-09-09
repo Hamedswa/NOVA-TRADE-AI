@@ -40,7 +40,7 @@ Facteurs du score :
 
 Règles :
 
-- Score minimum : 60/100
+- Score minimum historique : 60/100
 - RR minimum : 2.0
 - H4 influence le score mais ne bloque pas automatiquement
 - M5 influence le score mais ne bloque pas automatiquement
@@ -48,6 +48,9 @@ Règles :
 - Le score qualifie le setup
 - Le score ne remplace PAS les validations structurelles
   obligatoires du pipeline
+- IMPORTANT : le score NE BLOQUE PLUS un signal
+
+Le score est uniquement un indicateur de qualité/confiance.
 
 IMPORTANT :
 
@@ -91,7 +94,10 @@ if TOTAL_WEIGHT != 100.0:
         f"Total actuel : {TOTAL_WEIGHT}"
     )
 
+# Seuil historique conservé uniquement pour compatibilité.
+# Il NE BLOQUE PLUS les signaux.
 DEFAULT_THRESHOLD = 60.0
+
 DEFAULT_MINIMUM_RR = 2.0
 
 
@@ -108,6 +114,7 @@ def _clamp(
 
     try:
         value = float(value)
+
     except (TypeError, ValueError):
         return minimum
 
@@ -117,7 +124,9 @@ def _clamp(
     )
 
 
-def _bool_score(value: Any) -> float:
+def _bool_score(
+    value: Any,
+) -> float:
     """Convertit une valeur booléenne en score 0-100."""
 
     return 100.0 if bool(value) else 0.0
@@ -131,6 +140,7 @@ def _numeric_score(
 
     try:
         return _clamp(float(value))
+
     except (TypeError, ValueError):
         return default
 
@@ -146,9 +156,16 @@ def _get(
         return default
 
     if isinstance(data, Mapping):
-        return data.get(key, default)
+        return data.get(
+            key,
+            default,
+        )
 
-    return getattr(data, key, default)
+    return getattr(
+        data,
+        key,
+        default,
+    )
 
 
 def _first(
@@ -163,7 +180,12 @@ def _first(
     """
 
     for key in keys:
-        value = _get(data, key, None)
+
+        value = _get(
+            data,
+            key,
+            None,
+        )
 
         if value is not None:
             return value
@@ -171,13 +193,20 @@ def _first(
     return default
 
 
-def _direction(value: Any) -> Direction:
+def _direction(
+    value: Any,
+) -> Direction:
     """Normalise une direction."""
 
-    if isinstance(value, Direction):
+    if isinstance(
+        value,
+        Direction,
+    ):
         return value
 
-    text = str(value or "").upper().strip()
+    text = str(
+        value or ""
+    ).upper().strip()
 
     if text in {
         "BUY",
@@ -218,9 +247,15 @@ def _extract_score(
     """Récupère le premier score disponible."""
 
     for key in keys:
-        value = _get(data, key, None)
+
+        value = _get(
+            data,
+            key,
+            None,
+        )
 
         if value is not None:
+
             return _numeric_score(
                 value,
                 default,
@@ -268,11 +303,14 @@ def _score_structure_htf(
     """
 
     if structure_score is not None:
-        return _numeric_score(structure_score)
+        return _numeric_score(
+            structure_score
+        )
 
     h4_direction = Direction.NEUTRAL
 
     if trend is not None:
+
         h4_direction = _direction(
             getattr(
                 trend,
@@ -281,7 +319,9 @@ def _score_structure_htf(
             )
         )
 
-    h1 = _direction(h1_direction)
+    h1 = _direction(
+        h1_direction
+    )
 
     h4_strength_value = _numeric_score(
         h4_strength
@@ -323,7 +363,10 @@ def _score_structure_htf(
         )
 
         return _clamp(
-            max(70.0, strength)
+            max(
+                70.0,
+                strength,
+            )
         )
 
     # --------------------------------------------------------
@@ -334,6 +377,7 @@ def _score_structure_htf(
         h4_match
         and h1 == Direction.NEUTRAL
     ):
+
         return _clamp(
             55.0
             + h4_strength_value * 0.25
@@ -347,6 +391,7 @@ def _score_structure_htf(
         h1_match
         and h4_direction == Direction.NEUTRAL
     ):
+
         return _clamp(
             60.0
             + h1_strength_value * 0.25
@@ -354,8 +399,6 @@ def _score_structure_htf(
 
     # --------------------------------------------------------
     # H4 opposé / H1 confirme
-    #
-    # Possible retournement ou contre-tendance.
     # --------------------------------------------------------
 
     if (
@@ -363,6 +406,7 @@ def _score_structure_htf(
         and h4_direction != direction
         and h1_match
     ):
+
         return _clamp(
             45.0
             + h1_strength_value * 0.25
@@ -378,6 +422,7 @@ def _score_structure_htf(
         and h1 != Direction.NEUTRAL
         and h1 != direction
     ):
+
         return 15.0
 
     return 35.0
@@ -414,6 +459,7 @@ def _score_liquidity(
     """
 
     if liquidity_score is not None:
+
         return _numeric_score(
             liquidity_score
         )
@@ -422,7 +468,11 @@ def _score_liquidity(
 
     sweep = liquidity_sweep
 
-    if sweep is None and confirmation is not None:
+    if (
+        sweep is None
+        and confirmation is not None
+    ):
+
         sweep = getattr(
             confirmation,
             "liquidity_sweep",
@@ -447,7 +497,7 @@ def _score_liquidity(
             )
 
     # --------------------------------------------------------
-    # Liquidité proche de la zone
+    # Liquidité proche
     # --------------------------------------------------------
 
     if zone is not None:
@@ -457,6 +507,7 @@ def _score_liquidity(
             "liquidity_nearby",
             False,
         ):
+
             score += 15.0
 
     # --------------------------------------------------------
@@ -510,9 +561,12 @@ def _score_liquidity(
             )
         )
     ):
+
         score += 10.0
 
-    return _clamp(score)
+    return _clamp(
+        score
+    )
 
 
 # ============================================================
@@ -530,6 +584,7 @@ def _score_displacement(
     """Score du displacement."""
 
     if displacement_score is not None:
+
         return _numeric_score(
             displacement_score
         )
@@ -546,11 +601,13 @@ def _score_displacement(
             direction,
         )
     ):
+
         score += 20.0
 
     if displacement_atr_ratio is not None:
 
         try:
+
             ratio = float(
                 displacement_atr_ratio
             )
@@ -564,10 +621,15 @@ def _score_displacement(
             elif ratio >= 0.75:
                 score += 8.0
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             pass
 
-    return _clamp(score)
+    return _clamp(
+        score
+    )
 
 
 # ============================================================
@@ -587,13 +649,18 @@ def _score_order_block(
     """Score d'un Order Block."""
 
     if order_block_score is not None:
+
         return _numeric_score(
             order_block_score
         )
 
     has_ob = order_block
 
-    if has_ob is None and zone is not None:
+    if (
+        has_ob is None
+        and zone is not None
+    ):
+
         has_ob = getattr(
             zone,
             "order_block",
@@ -621,9 +688,12 @@ def _score_order_block(
             direction,
         )
     ):
+
         score += 10.0
 
-    return _clamp(score)
+    return _clamp(
+        score
+    )
 
 
 # ============================================================
@@ -641,13 +711,18 @@ def _score_fvg(
     """Score d'un FVG."""
 
     if fvg_score is not None:
+
         return _numeric_score(
             fvg_score
         )
 
     has_fvg = fvg
 
-    if has_fvg is None and zone is not None:
+    if (
+        has_fvg is None
+        and zone is not None
+    ):
+
         has_fvg = getattr(
             zone,
             "fvg",
@@ -668,6 +743,7 @@ def _score_fvg(
     if fvg_atr_ratio is not None:
 
         try:
+
             ratio = float(
                 fvg_atr_ratio
             )
@@ -681,10 +757,15 @@ def _score_fvg(
             elif ratio > 0.0:
                 score += 5.0
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             pass
 
-    return _clamp(score)
+    return _clamp(
+        score
+    )
 
 
 # ============================================================
@@ -701,6 +782,7 @@ def _score_premium_discount(
     """BUY préfère Discount / SELL préfère Premium."""
 
     if premium_discount_score is not None:
+
         return _numeric_score(
             premium_discount_score
         )
@@ -749,6 +831,7 @@ def _score_support_resistance(
     """Score du support/résistance."""
 
     if support_resistance_score is not None:
+
         return _numeric_score(
             support_resistance_score
         )
@@ -756,6 +839,7 @@ def _score_support_resistance(
     if zone is not None:
 
         if level_type is None:
+
             level_type = getattr(
                 zone,
                 "level_type",
@@ -763,6 +847,7 @@ def _score_support_resistance(
             )
 
         if strength is None:
+
             strength = getattr(
                 zone,
                 "h1_strength",
@@ -770,6 +855,7 @@ def _score_support_resistance(
             )
 
         if reactions is None:
+
             reactions = getattr(
                 zone,
                 "reactions",
@@ -777,6 +863,7 @@ def _score_support_resistance(
             )
 
         if retest_confirmed is None:
+
             retest_confirmed = getattr(
                 zone,
                 "retest_confirmed",
@@ -784,6 +871,7 @@ def _score_support_resistance(
             )
 
         if rejection_confirmed is None:
+
             rejection_confirmed = getattr(
                 zone,
                 "rejection_confirmed",
@@ -791,6 +879,7 @@ def _score_support_resistance(
             )
 
         if breakout_confirmed is None:
+
             breakout_confirmed = getattr(
                 zone,
                 "breakout_confirmed",
@@ -828,7 +917,9 @@ def _score_support_resistance(
     # --------------------------------------------------------
 
     score += (
-        _numeric_score(strength)
+        _numeric_score(
+            strength
+        )
         * 0.25
     )
 
@@ -837,6 +928,7 @@ def _score_support_resistance(
     # --------------------------------------------------------
 
     try:
+
         reaction_count = int(
             reactions or 0
         )
@@ -853,7 +945,10 @@ def _score_support_resistance(
         elif reaction_count >= 1:
             score += 5.0
 
-    except (TypeError, ValueError):
+    except (
+        TypeError,
+        ValueError,
+    ):
         pass
 
     # --------------------------------------------------------
@@ -874,6 +969,7 @@ def _score_support_resistance(
     # --------------------------------------------------------
 
     if distance_score is not None:
+
         score += (
             _numeric_score(
                 distance_score
@@ -881,7 +977,9 @@ def _score_support_resistance(
             * 0.10
         )
 
-    return _clamp(score)
+    return _clamp(
+        score
+    )
 
 
 # ============================================================
@@ -898,13 +996,16 @@ def _score_volatility(
     """Score de volatilité."""
 
     if volatility_score is not None:
+
         return _numeric_score(
             volatility_score
         )
 
     if volatility_valid is not None:
 
-        if bool(volatility_valid):
+        if bool(
+            volatility_valid
+        ):
             return 100.0
 
         return 20.0
@@ -912,6 +1013,7 @@ def _score_volatility(
     if atr_ratio is not None:
 
         try:
+
             ratio = float(
                 atr_ratio
             )
@@ -925,16 +1027,23 @@ def _score_volatility(
             if ratio > 0.0:
                 return 40.0
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             pass
 
     if atr is not None:
 
         try:
+
             if float(atr) > 0:
                 return 70.0
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             pass
 
     return 50.0
@@ -962,15 +1071,19 @@ def _score_m5_confirmation(
     M5 reste strictement secondaire.
 
     Il peut améliorer le score mais ne peut pas
-    annuler une validation principale H4/H1/M15.
+    annuler une validation principale.
     """
 
     if m5_score is not None:
-        return _numeric_score(m5_score)
+
+        return _numeric_score(
+            m5_score
+        )
 
     if confirmation is not None:
 
         if m5_retest is None:
+
             m5_retest = getattr(
                 confirmation,
                 "retest",
@@ -978,6 +1091,7 @@ def _score_m5_confirmation(
             )
 
         if m5_rejection is None:
+
             m5_rejection = getattr(
                 confirmation,
                 "rejection",
@@ -985,6 +1099,7 @@ def _score_m5_confirmation(
             )
 
         if m5_liquidity_sweep is None:
+
             m5_liquidity_sweep = getattr(
                 confirmation,
                 "liquidity_sweep",
@@ -992,6 +1107,7 @@ def _score_m5_confirmation(
             )
 
         if m5_micro_bos is None:
+
             m5_micro_bos = getattr(
                 confirmation,
                 "micro_bos",
@@ -999,6 +1115,7 @@ def _score_m5_confirmation(
             )
 
         if m5_candle is None:
+
             m5_candle = getattr(
                 confirmation,
                 "candle_confirmation",
@@ -1014,6 +1131,7 @@ def _score_m5_confirmation(
             direction,
         )
     ):
+
         score += 15.0
 
     if m5_retest:
@@ -1034,7 +1152,9 @@ def _score_m5_confirmation(
     if m5_displacement:
         score += 15.0
 
-    return _clamp(score)
+    return _clamp(
+        score
+    )
 
 
 # ============================================================
@@ -1049,19 +1169,11 @@ def calculate_score(
     spread_ok: bool = True,
     session_ok: bool = True,
 
-    # --------------------------------------------------------
-    # Directions
-    # --------------------------------------------------------
-
     direction: Any = None,
     h4_direction: Any = None,
     h1_direction: Any = None,
     m15_direction: Any = None,
     m5_direction: Any = None,
-
-    # --------------------------------------------------------
-    # Scores directs
-    # --------------------------------------------------------
 
     structure_score: Any = None,
     liquidity_score: Any = None,
@@ -1073,10 +1185,6 @@ def calculate_score(
     volatility_score: Any = None,
     m5_score: Any = None,
 
-    # --------------------------------------------------------
-    # Liquidité
-    # --------------------------------------------------------
-
     liquidity_sweep: Any = None,
     sweep_quality: Any = None,
     equal_levels: Any = None,
@@ -1084,17 +1192,9 @@ def calculate_score(
     previous_week_level: Any = None,
     old_high_low: Any = None,
 
-    # --------------------------------------------------------
-    # Displacement
-    # --------------------------------------------------------
-
     displacement_valid: Any = None,
     displacement_direction: Any = None,
     displacement_atr_ratio: Any = None,
-
-    # --------------------------------------------------------
-    # Order Block
-    # --------------------------------------------------------
 
     order_block: Any = None,
     ob_fresh: Any = None,
@@ -1102,26 +1202,14 @@ def calculate_score(
     ob_displacement_origin: Any = None,
     ob_direction: Any = None,
 
-    # --------------------------------------------------------
-    # FVG
-    # --------------------------------------------------------
-
     fvg: Any = None,
     fvg_fresh: Any = None,
     fvg_filled: Any = None,
     fvg_atr_ratio: Any = None,
 
-    # --------------------------------------------------------
-    # Premium / Discount
-    # --------------------------------------------------------
-
     in_discount: Any = None,
     in_premium: Any = None,
     equilibrium: Any = None,
-
-    # --------------------------------------------------------
-    # Support / Résistance
-    # --------------------------------------------------------
 
     level_type: Any = None,
     sr_strength: Any = None,
@@ -1131,17 +1219,9 @@ def calculate_score(
     rejection_confirmed: Any = None,
     sr_distance_score: Any = None,
 
-    # --------------------------------------------------------
-    # Volatilité
-    # --------------------------------------------------------
-
     atr: Any = None,
     atr_ratio: Any = None,
     volatility_valid: Any = None,
-
-    # --------------------------------------------------------
-    # M5
-    # --------------------------------------------------------
 
     m5_retest: Any = None,
     m5_rejection: Any = None,
@@ -1150,10 +1230,6 @@ def calculate_score(
     m5_candle: Any = None,
     m5_displacement: Any = None,
 
-    # --------------------------------------------------------
-    # Paramètres supplémentaires
-    # --------------------------------------------------------
-
     minimum_atr_factor: float = 0.5,
 
     **kwargs: Any,
@@ -1161,23 +1237,23 @@ def calculate_score(
     """
     Calcule le score final sur 100.
 
-    Les paramètres provenant du pipeline peuvent utiliser
-    plusieurs conventions de nommage. Ils sont normalisés
-    avant calcul.
+    IMPORTANT :
 
-    RR, spread et session ne sont PAS ajoutés au score.
-    Ils restent des validations séparées.
+    Cette fonction ne valide ni ne rejette un signal.
+
+    Elle mesure uniquement la qualité du setup.
+
+    RR, spread et session sont des informations de contexte
+    et les validations critiques restent dans le pipeline
+    de signal.
     """
 
     # ========================================================
-    # NORMALISATION DES PARAMÈTRES DU PIPELINE
+    # NORMALISATION DES PARAMÈTRES
     # ========================================================
 
-    # --------------------------------------------------------
-    # Directions
-    # --------------------------------------------------------
-
     if h4_direction is None:
+
         h4_direction = _first(
             kwargs,
             (
@@ -1188,6 +1264,7 @@ def calculate_score(
         )
 
     if h1_direction is None:
+
         h1_direction = _first(
             kwargs,
             (
@@ -1198,6 +1275,7 @@ def calculate_score(
         )
 
     if m15_direction is None:
+
         m15_direction = _first(
             kwargs,
             (
@@ -1208,6 +1286,7 @@ def calculate_score(
         )
 
     if m5_direction is None:
+
         m5_direction = _first(
             kwargs,
             (
@@ -1217,9 +1296,9 @@ def calculate_score(
             ),
         )
 
-    # --------------------------------------------------------
-    # Direction finale
-    # --------------------------------------------------------
+    # ========================================================
+    # DIRECTION FINALE
+    # ========================================================
 
     final_direction = _direction(
         direction
@@ -1241,6 +1320,7 @@ def calculate_score(
     if final_direction == Direction.NEUTRAL:
 
         if zone is not None:
+
             final_direction = _direction(
                 getattr(
                     zone,
@@ -1249,9 +1329,9 @@ def calculate_score(
                 )
             )
 
-    # --------------------------------------------------------
-    # H4 strength
-    # --------------------------------------------------------
+    # ========================================================
+    # H4 STRENGTH
+    # ========================================================
 
     h4_strength = kwargs.get(
         "h4_strength",
@@ -1259,6 +1339,7 @@ def calculate_score(
     )
 
     if h4_strength is None:
+
         h4_strength = _first(
             kwargs,
             (
@@ -1268,9 +1349,9 @@ def calculate_score(
             0.0,
         )
 
-    # --------------------------------------------------------
-    # H1 strength
-    # --------------------------------------------------------
+    # ========================================================
+    # H1 STRENGTH
+    # ========================================================
 
     h1_strength = kwargs.get(
         "h1_strength",
@@ -1278,6 +1359,7 @@ def calculate_score(
     )
 
     if h1_strength is None:
+
         h1_strength = _first(
             kwargs,
             (
@@ -1293,11 +1375,12 @@ def calculate_score(
             else 0.0,
         )
 
-    # --------------------------------------------------------
-    # LIQUIDITY
-    # --------------------------------------------------------
+    # ========================================================
+    # LIQUIDITÉ
+    # ========================================================
 
     if liquidity_sweep is None:
+
         liquidity_sweep = _first(
             kwargs,
             (
@@ -1308,6 +1391,7 @@ def calculate_score(
         )
 
     if sweep_quality is None:
+
         sweep_quality = _first(
             kwargs,
             (
@@ -1317,6 +1401,7 @@ def calculate_score(
         )
 
     if equal_levels is None:
+
         equal_levels = _first(
             kwargs,
             (
@@ -1328,6 +1413,7 @@ def calculate_score(
         )
 
     if previous_day_level is None:
+
         previous_day_level = _first(
             kwargs,
             (
@@ -1339,6 +1425,7 @@ def calculate_score(
         )
 
     if previous_week_level is None:
+
         previous_week_level = _first(
             kwargs,
             (
@@ -1350,6 +1437,7 @@ def calculate_score(
         )
 
     if old_high_low is None:
+
         old_high_low = _first(
             kwargs,
             (
@@ -1359,11 +1447,12 @@ def calculate_score(
             ),
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DISPLACEMENT
-    # --------------------------------------------------------
+    # ========================================================
 
     if displacement_valid is None:
+
         displacement_valid = _first(
             kwargs,
             (
@@ -1373,6 +1462,7 @@ def calculate_score(
         )
 
     if displacement_direction is None:
+
         displacement_direction = _first(
             kwargs,
             (
@@ -1382,6 +1472,7 @@ def calculate_score(
         )
 
     if displacement_atr_ratio is None:
+
         displacement_atr_ratio = _first(
             kwargs,
             (
@@ -1390,11 +1481,12 @@ def calculate_score(
             ),
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ORDER BLOCK
-    # --------------------------------------------------------
+    # ========================================================
 
     if order_block is None:
+
         order_block = _first(
             kwargs,
             (
@@ -1405,6 +1497,7 @@ def calculate_score(
         )
 
     if ob_fresh is None:
+
         ob_fresh = _first(
             kwargs,
             (
@@ -1414,6 +1507,7 @@ def calculate_score(
         )
 
     if ob_mitigated is None:
+
         ob_mitigated = _first(
             kwargs,
             (
@@ -1423,6 +1517,7 @@ def calculate_score(
         )
 
     if ob_displacement_origin is None:
+
         ob_displacement_origin = _first(
             kwargs,
             (
@@ -1432,6 +1527,7 @@ def calculate_score(
         )
 
     if ob_direction is None:
+
         ob_direction = _first(
             kwargs,
             (
@@ -1440,11 +1536,12 @@ def calculate_score(
             ),
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # FVG
-    # --------------------------------------------------------
+    # ========================================================
 
     if fvg is None:
+
         fvg = _first(
             kwargs,
             (
@@ -1454,6 +1551,7 @@ def calculate_score(
         )
 
     if fvg_fresh is None:
+
         fvg_fresh = _first(
             kwargs,
             (
@@ -1463,6 +1561,7 @@ def calculate_score(
         )
 
     if fvg_filled is None:
+
         fvg_filled = _first(
             kwargs,
             (
@@ -1472,6 +1571,7 @@ def calculate_score(
         )
 
     if fvg_atr_ratio is None:
+
         fvg_atr_ratio = _first(
             kwargs,
             (
@@ -1480,11 +1580,12 @@ def calculate_score(
             ),
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # PREMIUM / DISCOUNT
-    # --------------------------------------------------------
+    # ========================================================
 
     if in_discount is None:
+
         in_discount = _first(
             kwargs,
             (
@@ -1495,6 +1596,7 @@ def calculate_score(
         )
 
     if in_premium is None:
+
         in_premium = _first(
             kwargs,
             (
@@ -1505,6 +1607,7 @@ def calculate_score(
         )
 
     if equilibrium is None:
+
         equilibrium = _first(
             kwargs,
             (
@@ -1514,9 +1617,9 @@ def calculate_score(
             ),
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SUPPORT / RÉSISTANCE
-    # --------------------------------------------------------
+    # ========================================================
 
     sr_context = _first(
         kwargs,
@@ -1527,9 +1630,13 @@ def calculate_score(
         ),
     )
 
-    if isinstance(sr_context, Mapping):
+    if isinstance(
+        sr_context,
+        Mapping,
+    ):
 
         if level_type is None:
+
             level_type = _first(
                 sr_context,
                 (
@@ -1539,6 +1646,7 @@ def calculate_score(
             )
 
         if sr_strength is None:
+
             sr_strength = _first(
                 sr_context,
                 (
@@ -1548,6 +1656,7 @@ def calculate_score(
             )
 
         if sr_reactions is None:
+
             sr_reactions = _first(
                 sr_context,
                 (
@@ -1557,6 +1666,7 @@ def calculate_score(
             )
 
         if breakout_confirmed is None:
+
             breakout_confirmed = _first(
                 sr_context,
                 (
@@ -1566,6 +1676,7 @@ def calculate_score(
             )
 
         if retest_confirmed is None:
+
             retest_confirmed = _first(
                 sr_context,
                 (
@@ -1575,6 +1686,7 @@ def calculate_score(
             )
 
         if rejection_confirmed is None:
+
             rejection_confirmed = _first(
                 sr_context,
                 (
@@ -1584,6 +1696,7 @@ def calculate_score(
             )
 
         if sr_distance_score is None:
+
             sr_distance_score = _first(
                 sr_context,
                 (
@@ -1593,6 +1706,7 @@ def calculate_score(
             )
 
     if level_type is None:
+
         level_type = _first(
             kwargs,
             (
@@ -1602,6 +1716,7 @@ def calculate_score(
         )
 
     if sr_strength is None:
+
         sr_strength = _first(
             kwargs,
             (
@@ -1611,6 +1726,7 @@ def calculate_score(
         )
 
     if sr_reactions is None:
+
         sr_reactions = _first(
             kwargs,
             (
@@ -1620,6 +1736,7 @@ def calculate_score(
         )
 
     if breakout_confirmed is None:
+
         breakout_confirmed = _first(
             kwargs,
             (
@@ -1629,6 +1746,7 @@ def calculate_score(
         )
 
     if retest_confirmed is None:
+
         retest_confirmed = _first(
             kwargs,
             (
@@ -1638,6 +1756,7 @@ def calculate_score(
         )
 
     if rejection_confirmed is None:
+
         rejection_confirmed = _first(
             kwargs,
             (
@@ -1647,6 +1766,7 @@ def calculate_score(
         )
 
     if sr_distance_score is None:
+
         sr_distance_score = _first(
             kwargs,
             (
@@ -1655,11 +1775,12 @@ def calculate_score(
             ),
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # VOLATILITÉ
-    # --------------------------------------------------------
+    # ========================================================
 
     if atr is None:
+
         atr = _first(
             kwargs,
             (
@@ -1669,6 +1790,7 @@ def calculate_score(
         )
 
     if atr_ratio is None:
+
         atr_ratio = _first(
             kwargs,
             (
@@ -1678,6 +1800,7 @@ def calculate_score(
         )
 
     if volatility_valid is None:
+
         volatility_valid = _first(
             kwargs,
             (
@@ -1687,11 +1810,12 @@ def calculate_score(
             ),
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # M5
-    # --------------------------------------------------------
+    # ========================================================
 
     if m5_score is None:
+
         m5_score = _first(
             kwargs,
             (
@@ -1701,6 +1825,7 @@ def calculate_score(
         )
 
     if m5_retest is None:
+
         m5_retest = _first(
             kwargs,
             (
@@ -1710,6 +1835,7 @@ def calculate_score(
         )
 
     if m5_rejection is None:
+
         m5_rejection = _first(
             kwargs,
             (
@@ -1719,6 +1845,7 @@ def calculate_score(
         )
 
     if m5_liquidity_sweep is None:
+
         m5_liquidity_sweep = _first(
             kwargs,
             (
@@ -1728,6 +1855,7 @@ def calculate_score(
         )
 
     if m5_micro_bos is None:
+
         m5_micro_bos = _first(
             kwargs,
             (
@@ -1738,6 +1866,7 @@ def calculate_score(
         )
 
     if m5_candle is None:
+
         m5_candle = _first(
             kwargs,
             (
@@ -1747,6 +1876,7 @@ def calculate_score(
         )
 
     if m5_displacement is None:
+
         m5_displacement = _first(
             kwargs,
             (
@@ -1768,6 +1898,7 @@ def calculate_score(
         if h4 != Direction.NEUTRAL:
 
             try:
+
                 trend = TrendContext(
                     h4=h4,
                     h4_strength=_numeric_score(
@@ -1995,11 +2126,16 @@ class ScoreEngine:
     ) -> None:
 
         try:
+
             self.threshold = float(
                 threshold
             )
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
+
             self.threshold = DEFAULT_THRESHOLD
 
     # ========================================================
@@ -2053,7 +2189,7 @@ class ScoreEngine:
         )
 
     # ========================================================
-    # SEUIL
+    # SEUIL — COMPATIBILITÉ
     # ========================================================
 
     def should_send_signal(
@@ -2061,9 +2197,6 @@ class ScoreEngine:
         score: float,
         threshold: float | None = None,
     ) -> bool:
-
-        if threshold is None:
-            threshold = self.threshold
 
         return should_send_signal(
             score,
@@ -2079,11 +2212,13 @@ class ScoreEngine:
         score: float,
     ) -> str:
 
-        return score_label(score)
+        return score_label(
+            score
+        )
 
 
 # ============================================================
-# VALIDATION DU SEUIL
+# VALIDATION DU SEUIL — NON BLOQUANTE
 # ============================================================
 
 def should_send_signal(
@@ -2091,21 +2226,50 @@ def should_send_signal(
     threshold: float = DEFAULT_THRESHOLD,
 ) -> bool:
     """
-    Retourne True si le score atteint le seuil.
+    COMPATIBILITÉ UNIQUEMENT.
 
-    Par défaut :
+    IMPORTANT :
 
-        score >= 60
+    Le score ne constitue PLUS une condition
+    de validation d'un signal.
+
+    Cette fonction est conservée afin de ne pas
+    casser les anciens appels du projet.
+
+    Un score faible ne doit plus empêcher
+    la création d'un signal.
+
+    La validation réelle repose sur :
+
+        - conditions du setup
+        - direction
+        - Entry
+        - Stop Loss
+        - Take Profit
+        - RR minimum
+
+    Le paramètre threshold est conservé uniquement
+    pour compatibilité avec l'ancienne API.
     """
 
     try:
-        score = float(score)
-        threshold = float(threshold)
 
-    except (TypeError, ValueError):
+        float(score)
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
         return False
 
-    return score >= threshold
+    # ========================================================
+    # IMPORTANT :
+    #
+    # Aucun seuil de score ne bloque le signal.
+    # ========================================================
+
+    return True
 
 
 # ============================================================
@@ -2116,20 +2280,36 @@ def score_label(
     score: float,
 ) -> str:
     """
-    Convertit le score en qualité.
+    Convertit le score en niveau de qualité.
 
         90-100 → A+
         80-89  → A
         70-79  → B
         60-69  → C
-        <60    → NO_SIGNAL
+        <60    → D
+
+    IMPORTANT :
+
+    Aucun niveau ne signifie "NO_SIGNAL".
+
+    Même un score faible correspond à un niveau
+    de qualité et de confiance.
+
+    Le score ne décide pas si le signal existe.
     """
 
     try:
-        score = float(score)
 
-    except (TypeError, ValueError):
-        return "NO_SIGNAL"
+        score = float(
+            score
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return "D"
 
     if score >= 90:
         return "A+"
@@ -2143,4 +2323,4 @@ def score_label(
     if score >= 60:
         return "C"
 
-    return "NO_SIGNAL"
+    return "D"
