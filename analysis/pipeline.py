@@ -177,8 +177,8 @@ def _calculate_atr(
     period: int = 14,
 ) -> float:
     """
-    Calcule l'ATR simple nécessaire au moteur
-    de displacement.
+    Calcule l'ATR simple nécessaire aux moteurs
+    de displacement et d'Order Blocks.
 
     Aucun appel API.
     Aucun appel IA.
@@ -1129,9 +1129,12 @@ def analyze_market(
     # ATR
     # ========================================================
     #
-    # analyze_displacement() exige obligatoirement un ATR.
-    # Chaque timeframe utilise son propre ATR afin de mesurer
-    # correctement la force relative de ses bougies.
+    # Les moteurs displacement et Order Blocks
+    # exigent obligatoirement un ATR.
+    #
+    # Chaque timeframe utilise son propre ATR afin
+    # de mesurer correctement la force relative
+    # de ses bougies.
     #
 
     m15_atr = _calculate_atr(
@@ -1206,8 +1209,17 @@ def analyze_market(
         m15_atr,
     )
 
+    # ========================================================
+    # ORDER BLOCKS
+    # ========================================================
+    #
+    # analyze_order_blocks() exige également un ATR.
+    # On utilise l'ATR M15 correspondant aux bougies analysées.
+    #
+
     order_blocks = analyze_order_blocks(
-        m15_candles
+        m15_candles,
+        m15_atr,
     )
 
     fvg = analyze_fvg(
