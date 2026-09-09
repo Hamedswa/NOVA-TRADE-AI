@@ -39,6 +39,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from config import CONFIG
+
 from core.models import (
     Candle,
     Direction,
@@ -99,13 +100,16 @@ from signals.signal_engine import (
 )
 
 
+# ============================================================
+# TIMEFRAMES
+# ============================================================
+
 TIMEFRAMES = (
     "H4",
     "H1",
     "M15",
     "M5",
 )
-
 
 TIMEFRAME_TO_API = {
     "H4": "4h",
@@ -115,70 +119,129 @@ TIMEFRAME_TO_API = {
 }
 
 
-def _normalize_candle(candle: Any) -> Candle:
+# ============================================================
+# NORMALISATION DES BOUGIES
+# ============================================================
+
+def _normalize_candle(
+    candle: Any,
+) -> Optional[Candle]:
     """
-    Convertit une donnée brute en Candle.
+    Convertit une bougie provenant du market_data
+    vers le modèle Candle du projet.
     """
+
+    if candle is None:
+        return None
 
     if isinstance(candle, Candle):
         return candle
 
-    if isinstance(candle, dict):
+    try:
+        if isinstance(candle, dict):
+            return Candle(
+                timestamp=candle.get(
+                    "timestamp",
+                    candle.get("datetime"),
+                ),
+                open=float(candle["open"]),
+                high=float(candle["high"]),
+                low=float(candle["low"]),
+                close=float(candle["close"]),
+                volume=float(
+                    candle.get(
+                        "volume",
+                        0.0,
+                    )
+                ),
+            )
+
         return Candle(
-            timestamp=candle.get(
+            timestamp=getattr(
+                candle,
                 "timestamp",
-                candle.get("datetime"),
+                getattr(
+                    candle,
+                    "datetime",
+                    None,
+                ),
             ),
-            open=float(candle["open"]),
-            high=float(candle["high"]),
-            low=float(candle["low"]),
-            close=float(candle["close"]),
+            open=float(
+                getattr(
+                    candle,
+                    "open",
+                )
+            ),
+            high=float(
+                getattr(
+                    candle,
+                    "high",
+                )
+            ),
+            low=float(
+                getattr(
+                    candle,
+                    "low",
+                )
+            ),
+            close=float(
+                getattr(
+                    candle,
+                    "close",
+                )
+            ),
             volume=float(
-                candle.get("volume", 0.0)
-                or 0.0
+                getattr(
+                    candle,
+                    "volume",
+                    0.0,
+                )
             ),
         )
 
-    return Candle(
-        timestamp=getattr(
-            candle,
-            "timestamp",
-            getattr(candle, "datetime", None),
-        ),
-        open=float(candle.open),
-        high=float(candle.high),
-        low=float(candle.low),
-        close=float(candle.close),
-        volume=float(
-            getattr(candle, "volume", 0.0)
-            or 0.0
-        ),
-    )
+    except (
+        TypeError,
+        ValueError,
+        KeyError,
+        AttributeError,
+    ):
+        return None
 
 
 def _normalize_candles(
     candles: Any,
 ) -> list[Candle]:
     """
-    Normalise une série complète de bougies.
+    Normalise une liste de bougies.
     """
 
-    if candles is None:
+    if not candles:
         return []
 
-    return [
-        _normalize_candle(candle)
-        for candle in candles
-    ]
+    normalized: list[Candle] = []
 
+    for candle in candles:
+        result = _normalize_candle(
+            candle
+        )
+
+        if result is not None:
+            normalized.append(result)
+
+    return normalized
+
+
+# ============================================================
+# ATR
+# ============================================================
 
 def _calculate_atr(
     candles: list[Candle],
     period: int = 14,
 ) -> float:
     """
-    Calcule l'ATR simple nécessaire aux moteurs
-    de displacement et d'Order Blocks.
+    Calcule l'ATR simple nécessaire au moteur
+    de displacement.
 
     Aucun appel API.
     Aucun appel IA.
@@ -222,29 +285,39 @@ def _calculate_atr(
     return sum(selected) / len(selected)
 
 
+# ============================================================
+# NORMALISATION DIRECTION
+# ============================================================
+
 def _normalize_direction(
-    value: Any,
+    direction: Any,
 ) -> Direction:
     """
-    Convertit proprement une valeur en Direction.
+    Normalise une direction vers Direction.
     """
 
-    if isinstance(value, Direction):
-        return value
+    if isinstance(direction, Direction):
+        return direction
 
-    if value is None:
+    if direction is None:
         return Direction.NEUTRAL
 
-    text = str(value).upper().strip()
+    value = str(
+        getattr(
+            direction,
+            "value",
+            direction,
+        )
+    ).upper().strip()
 
-    if text in {
+    if value in {
         "BUY",
         "LONG",
         "BULLISH",
     }:
         return Direction.BUY
 
-    if text in {
+    if value in {
         "SELL",
         "SHORT",
         "BEARISH",
@@ -253,6 +326,10 @@ def _normalize_direction(
 
     return Direction.NEUTRAL
 
+
+# ============================================================
+# RESOLUTION DIRECTION
+# ============================================================
 
 def resolve_direction(
     h4: Direction,
@@ -321,6 +398,10 @@ def resolve_direction(
     return Direction.NEUTRAL
 
 
+# ============================================================
+# VALIDATION PRINCIPALE
+# ============================================================
+
 def _primary_alignment_valid(
     h4: Direction,
     h1: Direction,
@@ -347,6 +428,10 @@ def _primary_alignment_valid(
         for direction in directions
     )
 
+
+# ============================================================
+# SCÉNARIO
+# ============================================================
 
 def _determine_scenario(
     h4: Direction,
@@ -424,12 +509,15 @@ def _determine_scenario(
     return "RANGE"
 
 
+# ============================================================
+# EXTRACTION GÉNÉRIQUE
+# ============================================================
+
 def _extract_direction(
     result: Any,
 ) -> Direction:
     """
-    Extrait la direction d'un résultat
-    d'analyse.
+    Extrait une direction depuis un résultat.
     """
 
     if result is None:
@@ -443,6 +531,7 @@ def _extract_direction(
             "direction",
             "bias",
             "trend",
+            "signal",
         ):
             if key in result:
                 return _normalize_direction(
@@ -453,10 +542,17 @@ def _extract_direction(
         "direction",
         "bias",
         "trend",
+        "signal",
     ):
-        if hasattr(result, key):
+        value = getattr(
+            result,
+            key,
+            None,
+        )
+
+        if value is not None:
             return _normalize_direction(
-                getattr(result, key)
+                value
             )
 
     return Direction.NEUTRAL
@@ -466,7 +562,7 @@ def _extract_strength(
     result: Any,
 ) -> float:
     """
-    Extrait une force normalisée.
+    Extrait une force numérique.
     """
 
     if result is None:
@@ -476,18 +572,13 @@ def _extract_strength(
         for key in (
             "strength",
             "score",
+            "quality",
             "confidence",
         ):
             if key in result:
                 try:
-                    return max(
-                        0.0,
-                        min(
-                            100.0,
-                            float(
-                                result[key]
-                            ),
-                        ),
+                    return float(
+                        result[key]
                     )
                 except (
                     TypeError,
@@ -498,22 +589,18 @@ def _extract_strength(
     for key in (
         "strength",
         "score",
+        "quality",
         "confidence",
     ):
-        if hasattr(result, key):
+        value = getattr(
+            result,
+            key,
+            None,
+        )
+
+        if value is not None:
             try:
-                return max(
-                    0.0,
-                    min(
-                        100.0,
-                        float(
-                            getattr(
-                                result,
-                                key,
-                            )
-                        ),
-                    ),
-                )
+                return float(value)
             except (
                 TypeError,
                 ValueError,
@@ -535,44 +622,58 @@ def _extract_bool(
         return False
 
     if isinstance(result, dict):
-        return any(
-            bool(result.get(key, False))
-            for key in keys
+        for key in keys:
+            if key in result:
+                return bool(
+                    result[key]
+                )
+
+    for key in keys:
+        value = getattr(
+            result,
+            key,
+            None,
         )
 
-    return any(
-        bool(
-            getattr(
-                result,
-                key,
-                False,
-            )
-        )
-        for key in keys
-    )
+        if value is not None:
+            return bool(value)
+
+    return False
 
 
 def _extract_bos(
     result: Any,
 ) -> bool:
+    """
+    Extrait la présence d'un BOS.
+    """
+
     return _extract_bool(
         result,
         "bos",
-        "break_of_structure",
         "has_bos",
+        "break_of_structure",
     )
 
 
 def _extract_choch(
     result: Any,
 ) -> bool:
+    """
+    Extrait la présence d'un CHoCH.
+    """
+
     return _extract_bool(
         result,
         "choch",
-        "change_of_character",
         "has_choch",
+        "change_of_character",
     )
 
+
+# ============================================================
+# CONSTRUCTION ZONE
+# ============================================================
 
 def _build_zone(
     direction: Direction,
@@ -581,10 +682,9 @@ def _build_zone(
     fvg_result: Any,
 ) -> Optional[Zone]:
     """
-    Construit la zone de trading.
+    Construit la zone principale du trade.
 
     Priorité :
-
     1. Support / Résistance
     2. Order Block
     3. FVG
@@ -594,13 +694,14 @@ def _build_zone(
         direction
     )
 
+    # --------------------------------------------------------
+    # SUPPORT / RESISTANCE
+    # --------------------------------------------------------
+
     if sr_result is not None:
         sr = (
             sr_result
-            if isinstance(
-                sr_result,
-                dict,
-            )
+            if isinstance(sr_result, dict)
             else getattr(
                 sr_result,
                 "best",
@@ -609,60 +710,40 @@ def _build_zone(
         )
 
         if isinstance(sr, dict):
-            low = float(
-                sr.get("low", 0.0)
-                or 0.0
+            low = sr.get(
+                "low",
+                sr.get("price_low"),
             )
-            high = float(
-                sr.get("high", 0.0)
-                or 0.0
-            )
-            key_level = float(
-                sr.get("key_level", 0.0)
-                or sr.get("level", 0.0)
-                or 0.0
+            high = sr.get(
+                "high",
+                sr.get("price_high"),
             )
 
-            if low > 0 and high > 0:
-                return Zone(
-                    direction=direction,
-                    timeframe="M15",
-                    low=low,
-                    high=high,
-                    h1_strength=0.0,
-                    m15_strength=_extract_strength(
-                        sr_result
-                    ),
-                    kind="SUPPORT_RESISTANCE",
-                    structure_confirmed=True,
-                    liquidity_nearby=False,
-                    order_block=False,
-                    fvg=False,
-                    level_type=(
-                        "SUPPORT"
-                        if direction
-                        == Direction.BUY
-                        else "RESISTANCE"
-                    ),
-                    key_level=(
-                        key_level
-                        if key_level > 0
-                        else (
-                            low
-                            if direction
-                            == Direction.BUY
-                            else high
-                        )
-                    ),
-                )
+            if (
+                low is not None
+                and high is not None
+            ):
+                try:
+                    return Zone(
+                        low=float(low),
+                        high=float(high),
+                        direction=direction,
+                        source="SUPPORT_RESISTANCE",
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+
+    # --------------------------------------------------------
+    # ORDER BLOCK
+    # --------------------------------------------------------
 
     if ob_result is not None:
         ob = (
             ob_result
-            if isinstance(
-                ob_result,
-                dict,
-            )
+            if isinstance(ob_result, dict)
             else getattr(
                 ob_result,
                 "best",
@@ -671,39 +752,40 @@ def _build_zone(
         )
 
         if isinstance(ob, dict):
-            low = float(
-                ob.get("low", 0.0)
-                or 0.0
+            low = ob.get(
+                "low",
+                ob.get("price_low"),
             )
-            high = float(
-                ob.get("high", 0.0)
-                or 0.0
+            high = ob.get(
+                "high",
+                ob.get("price_high"),
             )
 
-            if low > 0 and high > 0:
-                return Zone(
-                    direction=direction,
-                    timeframe="M15",
-                    low=low,
-                    high=high,
-                    h1_strength=0.0,
-                    m15_strength=_extract_strength(
-                        ob_result
-                    ),
-                    kind="ORDER_BLOCK",
-                    structure_confirmed=True,
-                    liquidity_nearby=False,
-                    order_block=True,
-                    fvg=False,
-                )
+            if (
+                low is not None
+                and high is not None
+            ):
+                try:
+                    return Zone(
+                        low=float(low),
+                        high=float(high),
+                        direction=direction,
+                        source="ORDER_BLOCK",
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+
+    # --------------------------------------------------------
+    # FVG
+    # --------------------------------------------------------
 
     if fvg_result is not None:
         fvg = (
             fvg_result
-            if isinstance(
-                fvg_result,
-                dict,
-            )
+            if isinstance(fvg_result, dict)
             else getattr(
                 fvg_result,
                 "best",
@@ -712,34 +794,38 @@ def _build_zone(
         )
 
         if isinstance(fvg, dict):
-            low = float(
-                fvg.get("low", 0.0)
-                or 0.0
+            low = fvg.get(
+                "low",
+                fvg.get("price_low"),
             )
-            high = float(
-                fvg.get("high", 0.0)
-                or 0.0
+            high = fvg.get(
+                "high",
+                fvg.get("price_high"),
             )
 
-            if low > 0 and high > 0:
-                return Zone(
-                    direction=direction,
-                    timeframe="M15",
-                    low=low,
-                    high=high,
-                    h1_strength=0.0,
-                    m15_strength=_extract_strength(
-                        fvg_result
-                    ),
-                    kind="FVG",
-                    structure_confirmed=True,
-                    liquidity_nearby=False,
-                    order_block=False,
-                    fvg=True,
-                )
+            if (
+                low is not None
+                and high is not None
+            ):
+                try:
+                    return Zone(
+                        low=float(low),
+                        high=float(high),
+                        direction=direction,
+                        source="FVG",
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
 
     return None
 
+
+# ============================================================
+# GÉOMÉTRIE TRADE
+# ============================================================
 
 def _build_trade_geometry(
     direction: Direction,
@@ -816,6 +902,10 @@ def _build_trade_geometry(
     )
 
 
+# ============================================================
+# SCORE FINAL
+# ============================================================
+
 def _calculate_final_score(
     h4: Any,
     h1: Any,
@@ -832,50 +922,27 @@ def _calculate_final_score(
     volatility_valid: bool = True,
 ) -> float:
     """
-    Calcule le score final du setup.
+    Calcule le score final.
 
-    IMPORTANT :
-    M5 est une confirmation secondaire
+    M5 reste une confirmation secondaire
     et non bloquante.
-
-    M5 ne reçoit des points que si une
-    véritable confirmation est détectée.
     """
 
-    h4_direction = _extract_direction(
-        h4
+    direction = _normalize_direction(
+        direction
     )
 
-    h1_direction = _extract_direction(
-        h1
+    liquidity_quality = _extract_strength(
+        liquidity
     )
 
-    m15_direction = _extract_direction(
-        m15
-    )
-
-    m5_direction = _extract_direction(
-        m5
-    )
-
-    liquidity_sweep = _extract_bool(
-        liquidity,
-        "sweep",
-        "liquidity_sweep",
-        "has_sweep",
-    )
-
-    liquidity_quality = (
-        _extract_strength(liquidity)
-        if liquidity_sweep
-        else 0.0
-    )
-
-    displacement_detected = _extract_bool(
-        displacement,
-        "displacement",
-        "has_displacement",
-        "strong_displacement",
+    displacement_detected = (
+        _extract_bool(
+            displacement,
+            "valid",
+            "confirmed",
+            "displacement",
+        )
     )
 
     ob_fresh = _extract_bool(
@@ -900,10 +967,8 @@ def _calculate_final_score(
         order_blocks
     )
 
-    support_resistance_score = (
-        _extract_strength(
-            support_resistance
-        )
+    m5_direction = _extract_direction(
+        m5
     )
 
     m5_confirmation = (
@@ -959,112 +1024,64 @@ def _calculate_final_score(
         or m5_liquidity_sweep
     )
 
+    support_resistance_score = (
+        _extract_strength(
+            support_resistance
+        )
+    )
+
     try:
         score = calculate_score(
             h4=h4,
             h1=h1,
             m15=m15,
             direction=direction,
-
-            structure_htf=(
-                _extract_strength(h1)
+            structure_htf=_extract_strength(
+                h1
             ),
-
-            liquidity=(
-                liquidity_quality
-            ),
-
+            liquidity=liquidity_quality,
             displacement=(
                 100.0
                 if displacement_detected
                 else 0.0
             ),
-
-            order_block=(
-                _extract_strength(
-                    order_blocks
-                )
+            order_block=_extract_strength(
+                order_blocks
             ),
-
-            fvg=(
-                _extract_strength(fvg)
+            fvg=_extract_strength(
+                fvg
             ),
-
-            premium_discount=(
-                _extract_strength(
-                    premium_discount
-                )
+            premium_discount=_extract_strength(
+                premium_discount
             ),
-
             support_resistance=(
                 support_resistance_score
             ),
-
-            volatility_valid=(
-                volatility_valid
-            ),
-
+            volatility_valid=volatility_valid,
             rr=rr,
-
             liquidity_sweep_quality=(
                 liquidity_quality
             ),
-
-            order_block_fresh=(
-                ob_fresh
-            ),
-
-            order_block_mitigated=(
-                ob_mitigated
-            ),
-
+            order_block_fresh=ob_fresh,
+            order_block_mitigated=ob_mitigated,
             order_block_displacement_origin=(
                 ob_displacement_origin
             ),
-
             order_block_direction=(
                 ob_direction
             ),
-
-            m5_confirmation=(
-                m5_confirmation
-            ),
-
-            m5_direction=(
-                m5_direction
-            ),
-
-            m5_retest=(
-                m5_retest
-            ),
-
-            m5_rejection=(
-                m5_rejection
-            ),
-
+            m5_confirmation=m5_confirmation,
+            m5_direction=m5_direction,
+            m5_retest=m5_retest,
+            m5_rejection=m5_rejection,
             m5_liquidity_sweep=(
                 m5_liquidity_sweep
             ),
-
-            m5_micro_bos=(
-                m5_micro_bos
-            ),
-
+            m5_micro_bos=m5_micro_bos,
             m5_candle_confirmation=(
                 m5_candle_confirmation
             ),
-
-            m5_displacement=(
-                m5_displacement
-            ),
-        )
-
-        return max(
-            0.0,
-            min(
-                100.0,
-                float(score),
-            ),
+            m5_displacement=m5_displacement,
         )
 
     except TypeError:
@@ -1076,24 +1093,32 @@ def _calculate_final_score(
             rr=rr,
         )
 
-        return max(
-            0.0,
-            min(
-                100.0,
-                float(score),
-            ),
-        )
+    try:
+        return float(score)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return 0.0
 
+
+# ============================================================
+# ANALYSE PRINCIPALE
+# ============================================================
 
 def analyze_market(
-    symbol: str,
+    symbol: str = "XAU/USD",
     requested_direction: Optional[
         Direction
     ] = None,
 ) -> Dict[str, Any]:
     """
-    Pipeline complet d'analyse.
+    Analyse complète multi-timeframe.
     """
+
+    # --------------------------------------------------------
+    # RÉCUPÉRATION DES DONNÉES
+    # --------------------------------------------------------
 
     market_data = {}
 
@@ -1107,35 +1132,46 @@ def analyze_market(
             interval,
         )
 
-        market_data[timeframe] = (
-            _normalize_candles(candles)
+        market_data[
+            timeframe
+        ] = _normalize_candles(
+            candles
         )
 
-    h4_candles = market_data["H4"]
-    h1_candles = market_data["H1"]
-    m15_candles = market_data["M15"]
-    m5_candles = market_data["M5"]
+    # --------------------------------------------------------
+    # CANDLES
+    # --------------------------------------------------------
+
+    h4_candles = market_data[
+        "H4"
+    ]
+
+    h1_candles = market_data[
+        "H1"
+    ]
+
+    m15_candles = market_data[
+        "M15"
+    ]
+
+    m5_candles = market_data[
+        "M5"
+    ]
 
     if not h4_candles:
         return {
             "status": "NO_DATA",
             "symbol": symbol,
-            "direction": Direction.NEUTRAL.value,
+            "direction": (
+                Direction.NEUTRAL.value
+            ),
             "score": 0.0,
             "rr": 0.0,
         }
 
-    # ========================================================
+    # --------------------------------------------------------
     # ATR
-    # ========================================================
-    #
-    # Les moteurs displacement et Order Blocks
-    # exigent obligatoirement un ATR.
-    #
-    # Chaque timeframe utilise son propre ATR afin
-    # de mesurer correctement la force relative
-    # de ses bougies.
-    #
+    # --------------------------------------------------------
 
     m15_atr = _calculate_atr(
         m15_candles,
@@ -1146,6 +1182,10 @@ def analyze_market(
         m5_candles,
         period=14,
     )
+
+    # --------------------------------------------------------
+    # STRUCTURES
+    # --------------------------------------------------------
 
     h4_structure = analyze_structure(
         h4_candles
@@ -1163,6 +1203,10 @@ def analyze_market(
         m5_candles
     )
 
+    # --------------------------------------------------------
+    # DIRECTIONS
+    # --------------------------------------------------------
+
     h4_direction = _extract_direction(
         h4_structure
     )
@@ -1178,6 +1222,10 @@ def analyze_market(
     m5_direction = _extract_direction(
         m5_structure
     )
+
+    # --------------------------------------------------------
+    # STRENGTHS
+    # --------------------------------------------------------
 
     h4_strength = _extract_strength(
         h4_structure
@@ -1195,36 +1243,54 @@ def analyze_market(
         m5_structure
     )
 
+    # --------------------------------------------------------
+    # TREND CONTEXT
+    # --------------------------------------------------------
+
     trend_context = build_trend_context(
         h4=h4_direction,
         h4_strength=h4_strength,
     )
 
+    # --------------------------------------------------------
+    # LIQUIDITY M15
+    # --------------------------------------------------------
+
     liquidity = analyze_liquidity(
         m15_candles
     )
+
+    # --------------------------------------------------------
+    # DISPLACEMENT M15
+    # ATR M15 est transmis explicitement.
+    # --------------------------------------------------------
 
     displacement = analyze_displacement(
         m15_candles,
         m15_atr,
     )
 
-    # ========================================================
-    # ORDER BLOCKS
-    # ========================================================
-    #
-    # analyze_order_blocks() exige également un ATR.
-    # On utilise l'ATR M15 correspondant aux bougies analysées.
-    #
+    # --------------------------------------------------------
+    # ORDER BLOCK M15
+    # ATR M15 est transmis explicitement.
+    # --------------------------------------------------------
 
     order_blocks = analyze_order_blocks(
         m15_candles,
         m15_atr,
     )
 
+    # --------------------------------------------------------
+    # FVG
+    # --------------------------------------------------------
+
     fvg = analyze_fvg(
         m15_candles
     )
+
+    # --------------------------------------------------------
+    # PREMIUM / DISCOUNT
+    # --------------------------------------------------------
 
     premium_discount = (
         analyze_premium_discount(
@@ -1232,15 +1298,28 @@ def analyze_market(
         )
     )
 
+    # --------------------------------------------------------
+    # SUPPORT / RESISTANCE
+    # --------------------------------------------------------
+
     support_resistance = (
         analyze_support_resistance(
             m15_candles
         )
     )
 
+    # --------------------------------------------------------
+    # LIQUIDITY M5
+    # --------------------------------------------------------
+
     m5_liquidity = analyze_liquidity(
         m5_candles
     )
+
+    # --------------------------------------------------------
+    # DISPLACEMENT M5
+    # ATR M5 est transmis explicitement.
+    # --------------------------------------------------------
 
     m5_displacement = (
         analyze_displacement(
@@ -1249,35 +1328,31 @@ def analyze_market(
         )
     )
 
-    m5_liquidity_sweep = (
-        _extract_bool(
-            m5_liquidity,
-            "sweep",
-            "liquidity_sweep",
-            "has_sweep",
-        )
+    # --------------------------------------------------------
+    # M5 CONFIRMATION
+    # --------------------------------------------------------
+
+    m5_liquidity_sweep = _extract_bool(
+        m5_liquidity,
+        "sweep",
+        "liquidity_sweep",
+        "has_sweep",
     )
 
-    m5_micro_bos = (
-        _extract_bos(
-            m5_structure
-        )
+    m5_micro_bos = _extract_bos(
+        m5_structure
     )
 
-    m5_retest = (
-        _extract_bool(
-            m5_structure,
-            "retest",
-            "retest_confirmed",
-        )
+    m5_retest = _extract_bool(
+        m5_structure,
+        "retest",
+        "retest_confirmed",
     )
 
-    m5_rejection = (
-        _extract_bool(
-            m5_structure,
-            "rejection",
-            "rejection_confirmed",
-        )
+    m5_rejection = _extract_bool(
+        m5_structure,
+        "rejection",
+        "rejection_confirmed",
     )
 
     m5_candle_confirmation = False
@@ -1305,6 +1380,10 @@ def analyze_market(
         )
     )
 
+    # --------------------------------------------------------
+    # DIRECTION FINALE
+    # --------------------------------------------------------
+
     direction = resolve_direction(
         h4=h4_direction,
         h1=h1_direction,
@@ -1314,6 +1393,10 @@ def analyze_market(
         ),
     )
 
+    # --------------------------------------------------------
+    # VALIDATION PRINCIPALE
+    # --------------------------------------------------------
+
     primary_alignment = (
         _primary_alignment_valid(
             h4=h4_direction,
@@ -1322,26 +1405,26 @@ def analyze_market(
         )
     )
 
+    # --------------------------------------------------------
+    # SCÉNARIO
+    # --------------------------------------------------------
+
     scenario = _determine_scenario(
         h4=h4_direction,
         h1=h1_direction,
         m15=m15_direction,
         direction=direction,
-        liquidity_sweep=(
-            _extract_bool(
-                liquidity,
-                "sweep",
-                "liquidity_sweep",
-                "has_sweep",
-            )
+        liquidity_sweep=_extract_bool(
+            liquidity,
+            "sweep",
+            "liquidity_sweep",
+            "has_sweep",
         ),
-        displacement=(
-            _extract_bool(
-                displacement,
-                "displacement",
-                "has_displacement",
-                "strong_displacement",
-            )
+        displacement=_extract_bool(
+            displacement,
+            "valid",
+            "confirmed",
+            "displacement",
         ),
         bos=_extract_bos(
             m15_structure
@@ -1350,6 +1433,10 @@ def analyze_market(
             m15_structure
         ),
     )
+
+    # --------------------------------------------------------
+    # PRIX ACTUEL
+    # --------------------------------------------------------
 
     latest_price = float(
         m5_candles[-1].close
@@ -1361,9 +1448,18 @@ def analyze_market(
         )
     )
 
+    # --------------------------------------------------------
+    # ATR DE RÉFÉRENCE
+    # --------------------------------------------------------
+
     # L'ATR M15 sert de référence pour la
     # géométrie principale du trade.
+
     atr = m15_atr
+
+    # --------------------------------------------------------
+    # ZONE
+    # --------------------------------------------------------
 
     zone = _build_zone(
         direction=direction,
@@ -1372,23 +1468,32 @@ def analyze_market(
         fvg_result=fvg,
     )
 
-    (
-        entry,
-        stop_loss,
-        take_profit,
-    ) = _build_trade_geometry(
-        direction=direction,
-        entry=latest_price,
-        zone=zone,
-        atr=atr,
+    # --------------------------------------------------------
+    # GÉOMÉTRIE TRADE
+    # --------------------------------------------------------
+
+    entry, stop_loss, take_profit = (
+        _build_trade_geometry(
+            direction=direction,
+            entry=latest_price,
+            zone=zone,
+            atr=atr,
+        )
     )
+
+    # --------------------------------------------------------
+    # RR
+    # --------------------------------------------------------
 
     rr = calculate_rr(
         entry=entry,
         stop_loss=stop_loss,
         take_profit=take_profit,
-        direction=direction,
     )
+
+    # --------------------------------------------------------
+    # SCORE FINAL
+    # --------------------------------------------------------
 
     score = _calculate_final_score(
         h4=h4_direction,
@@ -1399,9 +1504,7 @@ def analyze_market(
         displacement=displacement,
         order_blocks=order_blocks,
         fvg=fvg,
-        premium_discount=(
-            premium_discount
-        ),
+        premium_discount=premium_discount,
         support_resistance=(
             support_resistance
         ),
@@ -1409,6 +1512,10 @@ def analyze_market(
         rr=rr,
         volatility_valid=True,
     )
+
+    # --------------------------------------------------------
+    # STATUT
+    # --------------------------------------------------------
 
     status = "ACTIVE"
 
@@ -1423,6 +1530,10 @@ def analyze_market(
 
     elif rr < CONFIG.MINIMUM_RR:
         status = "REJECT"
+
+    # --------------------------------------------------------
+    # RÉSULTAT
+    # --------------------------------------------------------
 
     return {
         "status": status,
@@ -1467,6 +1578,7 @@ def analyze_market(
         ),
 
         "zone": zone,
+
         "entry": entry,
         "stop_loss": stop_loss,
         "take_profit": take_profit,
@@ -1489,9 +1601,15 @@ def analyze_market(
             support_resistance
         ),
 
-        "confirmation": m5_confirmation,
+        "confirmation": (
+            m5_confirmation
+        ),
     }
 
+
+# ============================================================
+# ALIAS
+# ============================================================
 
 def analyser_marche(
     symbol: str = "XAU/USD",
@@ -1499,10 +1617,6 @@ def analyser_marche(
         Direction
     ] = None,
 ) -> Dict[str, Any]:
-    """
-    Alias français compatible.
-    """
-
     return analyze_market(
         symbol=symbol,
         requested_direction=(
@@ -1517,10 +1631,6 @@ def analyser_market(
         Direction
     ] = None,
 ) -> Dict[str, Any]:
-    """
-    Alias anglais.
-    """
-
     return analyze_market(
         symbol=symbol,
         requested_direction=(
