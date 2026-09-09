@@ -69,9 +69,9 @@ TELEGRAM :
 - Les sessions sont envoyées au canal.
 - Les annonces économiques sont envoyées au canal.
 - La destination automatique est définie par :
-    TELEGRAM CHAT ID
+    TELEGRAM_CHAT_ID
 
-La valeur de TELEGRAM CHAT ID doit correspondre à l'identifiant
+La valeur de TELEGRAM_CHAT_ID doit correspondre à l'identifiant
 du canal Telegram et le bot doit être administrateur du canal.
 """
 
@@ -157,9 +157,9 @@ if not TELEGRAM_BOT_TOKEN:
 """
 IMPORTANT :
 
-Le nom de la variable Railway est exactement :
+Le nom principal de la variable Railway est exactement :
 
-TELEGRAM CHAT ID
+TELEGRAM_CHAT_ID
 
 Exemple de valeur :
 
@@ -167,21 +167,48 @@ Exemple de valeur :
 
 Cette valeur doit être l'identifiant du CANAL Telegram.
 
-Elle n'est pas automatiquement remplacée par le chat privé
-de l'utilisateur.
+Le bot doit être présent et administrateur du canal avec
+la permission de publier.
+
+Compatibilité temporaire :
+
+Si TELEGRAM_CHAT_ID n'est pas trouvé, le code vérifie également
+l'ancien nom "TELEGRAM CHAT ID".
+
+Le nom recommandé et officiel reste :
+
+TELEGRAM_CHAT_ID
 """
 
 TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM CHAT ID",
+    "TELEGRAM_CHAT_ID",
     ""
 ).strip()
+
+# ------------------------------------------------------------
+# COMPATIBILITÉ AVEC L'ANCIEN NOM
+# ------------------------------------------------------------
+
+if not TELEGRAM_CHAT_ID:
+
+    TELEGRAM_CHAT_ID = os.getenv(
+        "TELEGRAM CHAT ID",
+        ""
+    ).strip()
+
 
 if not TELEGRAM_CHAT_ID:
 
     logger.warning(
-        "⚠️ TELEGRAM CHAT ID est absent. "
+        "⚠️ TELEGRAM_CHAT_ID est absent. "
         "Les messages automatiques ne pourront pas être "
         "envoyés au canal."
+    )
+
+else:
+
+    logger.info(
+        "📢 TELEGRAM_CHAT_ID configuré."
     )
 
 
@@ -307,8 +334,12 @@ def get_channel_chat_id():
     """
     Retourne l'identifiant du canal configuré.
 
-    On conserve la valeur sous forme de chaîne afin de supporter
-    correctement les identifiants Telegram négatifs.
+    L'identifiant est conservé sous forme de chaîne afin de
+    supporter correctement les identifiants Telegram négatifs.
+
+    Exemple :
+
+    -1001234567890
     """
 
     if not TELEGRAM_CHAT_ID:
@@ -347,7 +378,7 @@ async def send_to_channel(
 
         logger.error(
             "❌ Impossible d'envoyer au canal : "
-            "TELEGRAM CHAT ID est vide."
+            "TELEGRAM_CHAT_ID est vide."
         )
 
         return False
@@ -405,7 +436,7 @@ async def verify_channel(
     if not channel_id:
 
         logger.warning(
-            "⚠️ Aucun TELEGRAM CHAT ID configuré."
+            "⚠️ Aucun TELEGRAM_CHAT_ID configuré."
         )
 
         return
@@ -416,13 +447,19 @@ async def verify_channel(
             chat_id=channel_id
         )
 
-        logger.info(
-            "✅ Canal Telegram connecté : %s",
-            chat.title or channel_id,
+        chat_title = getattr(
+            chat,
+            "title",
+            None
         )
 
         logger.info(
-            "🆔 TELEGRAM CHAT ID : %s",
+            "✅ Canal Telegram connecté : %s",
+            chat_title or channel_id,
+        )
+
+        logger.info(
+            "🆔 TELEGRAM_CHAT_ID : %s",
             channel_id,
         )
 
@@ -440,7 +477,7 @@ async def verify_channel(
         )
 
         logger.error(
-            "1. TELEGRAM CHAT ID correspond bien au canal."
+            "1. TELEGRAM_CHAT_ID correspond bien au canal."
         )
 
         logger.error(
@@ -1382,8 +1419,8 @@ async def _send_information_to_users(
     """
     IMPORTANT :
 
-    Les informations automatiques sont maintenant envoyées
-    DIRECTEMENT au canal via TELEGRAM CHAT ID.
+    Les informations automatiques sont envoyées
+    DIRECTEMENT au canal via TELEGRAM_CHAT_ID.
 
     Elles ne dépendent plus du fait qu'un utilisateur ait
     utilisé /start.
@@ -1727,14 +1764,13 @@ async def automatic_scanner(
                         )
 
                         # ================================================
-                        # CORRECTION PRINCIPALE
+                        # ENVOI DIRECT AU CANAL
                         #
-                        # AVANT :
-                        #     envoi aux chat_ids enregistrés
+                        # Le signal automatique ne dépend PAS des
+                        # utilisateurs ayant utilisé /start.
                         #
-                        # MAINTENANT :
-                        #     envoi direct au canal configuré
-                        #     par TELEGRAM CHAT ID
+                        # Destination :
+                        # TELEGRAM_CHAT_ID
                         # ================================================
 
                         sent = await send_to_channel(
