@@ -61,6 +61,18 @@ Ils ne peuvent jamais :
 - modifier le RR ;
 - définir Entry / SL / TP ;
 - bloquer une entrée.
+
+TELEGRAM :
+
+- Les commandes utilisateur restent dans le chat privé.
+- Les signaux automatiques sont envoyés au canal.
+- Les sessions sont envoyées au canal.
+- Les annonces économiques sont envoyées au canal.
+- La destination automatique est définie par :
+    TELEGRAM CHAT ID
+
+La valeur de TELEGRAM CHAT ID doit correspondre à l'identifiant
+du canal Telegram et le bot doit être administrateur du canal.
 """
 
 from __future__ import annotations
@@ -121,7 +133,7 @@ logger = logging.getLogger(
 
 
 # ============================================================
-# TOKEN
+# TOKEN TELEGRAM
 # ============================================================
 
 TELEGRAM_BOT_TOKEN = "".join(
@@ -135,6 +147,41 @@ if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
         "TELEGRAM_BOT_TOKEN est absent "
         "des variables d'environnement."
+    )
+
+
+# ============================================================
+# CHAT ID DU CANAL
+# ============================================================
+
+"""
+IMPORTANT :
+
+Le nom de la variable Railway est exactement :
+
+TELEGRAM CHAT ID
+
+Exemple de valeur :
+
+-1001234567890
+
+Cette valeur doit être l'identifiant du CANAL Telegram.
+
+Elle n'est pas automatiquement remplacée par le chat privé
+de l'utilisateur.
+"""
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM CHAT ID",
+    ""
+).strip()
+
+if not TELEGRAM_CHAT_ID:
+
+    logger.warning(
+        "⚠️ TELEGRAM CHAT ID est absent. "
+        "Les messages automatiques ne pourront pas être "
+        "envoyés au canal."
     )
 
 
@@ -207,8 +254,10 @@ def safe_float(
     value: Any,
     default: float = 0.0
 ) -> float:
+
     try:
         return float(value)
+
     except (
         TypeError,
         ValueError,
@@ -217,6 +266,7 @@ def safe_float(
 
 
 def utc_now():
+
     return datetime.now(
         timezone.utc
     )
@@ -243,9 +293,167 @@ def set_selected_symbol(
 ) -> None:
 
     if symbol in ALL_SYMBOLS:
+
         context.user_data[
             "selected_symbol"
         ] = symbol
+
+
+# ============================================================
+# DESTINATION TELEGRAM
+# ============================================================
+
+def get_channel_chat_id():
+    """
+    Retourne l'identifiant du canal configuré.
+
+    On conserve la valeur sous forme de chaîne afin de supporter
+    correctement les identifiants Telegram négatifs.
+    """
+
+    if not TELEGRAM_CHAT_ID:
+
+        return None
+
+    return TELEGRAM_CHAT_ID
+
+
+# ============================================================
+# ENVOI VERS LE CANAL
+# ============================================================
+
+async def send_to_channel(
+    application: Application,
+    text: str,
+    parse_mode: str | None = None,
+) -> bool:
+
+    """
+    Envoie un message directement dans le canal Telegram.
+
+    Cette fonction est utilisée pour :
+
+    - signaux automatiques ;
+    - sessions ;
+    - annonces économiques ;
+    - informations automatiques.
+
+    Elle ne dépend PAS des utilisateurs ayant utilisé /start.
+    """
+
+    channel_id = get_channel_chat_id()
+
+    if not channel_id:
+
+        logger.error(
+            "❌ Impossible d'envoyer au canal : "
+            "TELEGRAM CHAT ID est vide."
+        )
+
+        return False
+
+    try:
+
+        kwargs = {
+            "chat_id": channel_id,
+            "text": text,
+        }
+
+        if parse_mode:
+
+            kwargs["parse_mode"] = parse_mode
+
+        await application.bot.send_message(
+            **kwargs
+        )
+
+        logger.info(
+            "📢 Message envoyé dans le canal Telegram : %s",
+            channel_id,
+        )
+
+        return True
+
+    except Exception as exc:
+
+        logger.exception(
+            "❌ Erreur envoi vers le canal Telegram "
+            "%s : %s",
+            channel_id,
+            exc,
+        )
+
+        return False
+
+
+# ============================================================
+# VERIFICATION DU CANAL
+# ============================================================
+
+async def verify_channel(
+    application: Application
+) -> None:
+
+    """
+    Vérifie que le bot peut accéder au canal configuré.
+
+    Cette vérification ne publie aucun message.
+    """
+
+    channel_id = get_channel_chat_id()
+
+    if not channel_id:
+
+        logger.warning(
+            "⚠️ Aucun TELEGRAM CHAT ID configuré."
+        )
+
+        return
+
+    try:
+
+        chat = await application.bot.get_chat(
+            chat_id=channel_id
+        )
+
+        logger.info(
+            "✅ Canal Telegram connecté : %s",
+            chat.title or channel_id,
+        )
+
+        logger.info(
+            "🆔 TELEGRAM CHAT ID : %s",
+            channel_id,
+        )
+
+    except Exception as exc:
+
+        logger.error(
+            "❌ Impossible d'accéder au canal Telegram "
+            "%s : %s",
+            channel_id,
+            exc,
+        )
+
+        logger.error(
+            "Vérifie que :"
+        )
+
+        logger.error(
+            "1. TELEGRAM CHAT ID correspond bien au canal."
+        )
+
+        logger.error(
+            "2. Le bot est présent dans le canal."
+        )
+
+        logger.error(
+            "3. Le bot est administrateur du canal."
+        )
+
+        logger.error(
+            "4. Le bot possède la permission de publier."
+        )
 
 
 # ============================================================
@@ -331,6 +539,7 @@ def symbol_selection_menu():
         )
 
         if len(row) == 2:
+
             keyboard.append(row)
             row = []
 
@@ -376,6 +585,7 @@ def symbol_selection_menu():
         )
 
         if len(row) == 2:
+
             keyboard.append(row)
             row = []
 
@@ -479,28 +689,6 @@ def is_valid_automatic_signal(
     Détermine si le résultat FINAL du moteur
     doit être envoyé automatiquement.
 
-    IMPORTANT :
-
-    Cette fonction NE reconstruit PAS la logique
-    H4/H1/M15.
-
-    Le pipeline a déjà effectué :
-
-    - analyse multi-timeframe ;
-    - structure ;
-    - liquidité ;
-    - displacement ;
-    - OB ;
-    - FVG ;
-    - premium/discount ;
-    - support/résistance ;
-    - volatilité ;
-    - confirmation M5 ;
-    - scénario ;
-    - score ;
-    - RR ;
-    - validation finale.
-
     Telegram vérifie uniquement les conditions
     finales de publication.
     """
@@ -569,34 +757,6 @@ def is_valid_automatic_signal(
 
     if rr < CONFIG.MINIMUM_RR:
         return False
-
-    # --------------------------------------------------------
-    # AUCUNE VALIDATION D'ALIGNEMENT STRICTE ICI
-    # --------------------------------------------------------
-
-    #
-    # H4 peut être différent de H1/M15.
-    #
-    # Exemple valide :
-    #
-    # H4  = SELL
-    # H1  = SELL
-    # M15 = BUY
-    # M5  = BUY
-    #
-    # Le pipeline peut identifier :
-    #
-    # CORRECTION
-    # ou
-    # COUNTER_TREND
-    # ou
-    # POTENTIAL_REVERSAL
-    #
-    # et décider lui-même si le setup mérite
-    # le statut ACTIVE.
-    #
-    # Telegram ne doit pas casser cette décision.
-    #
 
     return True
 
@@ -688,13 +848,7 @@ def format_analysis(
     )
 
     # ========================================================
-    # CORRECTION H4 / H1 / M15 / M5
-    #
-    # Le pipeline renvoie désormais directement :
-    # h4, h1, m15, m5
-    #
-    # Les anciennes clés *_direction restent acceptées
-    # comme fallback pour éviter toute régression.
+    # H4 / H1 / M15 / M5
     # ========================================================
 
     h4 = result.get(
@@ -934,7 +1088,9 @@ async def status_command(
         "• M5 → confirmation secondaire\n\n"
         "Les timeframes n'ont pas besoin "
         "d'être strictement alignés.\n\n"
-        "Score et RR restent obligatoires."
+        "Score et RR restent obligatoires.\n\n"
+        "📢 Les alertes automatiques sont "
+        "publiées dans le canal configuré."
     )
 
     if update.message:
@@ -1155,7 +1311,9 @@ async def callback_handler(
             "H1 → structure\n"
             "M15 → contexte\n"
             "M5 → confirmation secondaire\n\n"
-            "Aucun alignement strict n'est imposé."
+            "Aucun alignement strict n'est imposé.\n\n"
+            "📢 Les alertes automatiques sont "
+            "envoyées vers le canal configuré."
         )
 
         await query.edit_message_text(
@@ -1211,6 +1369,10 @@ def _build_news_event_key(
     )
 
 
+# ============================================================
+# ENVOI INFORMATIONS
+# ============================================================
+
 async def _send_information_to_users(
     application: Application,
     text: str,
@@ -1218,45 +1380,25 @@ async def _send_information_to_users(
 ) -> None:
 
     """
-    Circuit strictement informationnel.
+    IMPORTANT :
 
-    Aucun lien avec la décision de trading.
+    Les informations automatiques sont maintenant envoyées
+    DIRECTEMENT au canal via TELEGRAM CHAT ID.
+
+    Elles ne dépendent plus du fait qu'un utilisateur ait
+    utilisé /start.
     """
 
-    chat_ids = (
-        application
-        .bot_data
-        .get(
-            "chat_ids",
-            set()
-        )
+    await send_to_channel(
+        application,
+        text,
+        parse_mode=parse_mode,
     )
 
-    for chat_id in list(chat_ids):
 
-        try:
-
-            kwargs = {
-                "chat_id": chat_id,
-                "text": text,
-            }
-
-            if parse_mode:
-                kwargs["parse_mode"] = parse_mode
-
-            await application.bot.send_message(
-                **kwargs
-            )
-
-        except Exception as exc:
-
-            logger.error(
-                "Erreur envoi information Telegram "
-                "%s : %s",
-                chat_id,
-                exc,
-            )
-
+# ============================================================
+# SESSION SUPERVISOR
+# ============================================================
 
 async def _check_session_supervisor(
     application: Application,
@@ -1277,13 +1419,14 @@ async def _check_session_supervisor(
 
             if message:
 
-                await _send_information_to_users(
+                await send_to_channel(
                     application,
                     message,
                 )
 
                 logger.info(
-                    "Session informationnelle : %s %s",
+                    "🌍 Session informationnelle publiée "
+                    "dans le canal : %s %s",
                     status.name,
                     status.action,
                 )
@@ -1295,6 +1438,10 @@ async def _check_session_supervisor(
             exc,
         )
 
+
+# ============================================================
+# ECONOMIC NEWS
+# ============================================================
 
 async def _check_economic_news(
     application: Application,
@@ -1326,14 +1473,15 @@ async def _check_economic_news(
                 include_ai_explanation=True,
             )
 
-            await _send_information_to_users(
+            await send_to_channel(
                 application,
                 message,
                 parse_mode="HTML",
             )
 
             logger.info(
-                "Annonce économique HIGH envoyée : %s | %s",
+                "📰 Annonce économique HIGH publiée "
+                "dans le canal : %s | %s",
                 event.get("currency"),
                 event.get("event"),
             )
@@ -1353,6 +1501,10 @@ async def _check_economic_news(
             exc,
         )
 
+
+# ============================================================
+# INFORMATION SUPERVISOR
+# ============================================================
 
 async def information_supervisor(
     application: Application,
@@ -1574,39 +1726,36 @@ async def automatic_scanner(
                             )
                         )
 
-                        chat_ids = (
-                            application
-                            .bot_data
-                            .get(
-                                "chat_ids",
-                                set()
-                            )
+                        # ================================================
+                        # CORRECTION PRINCIPALE
+                        #
+                        # AVANT :
+                        #     envoi aux chat_ids enregistrés
+                        #
+                        # MAINTENANT :
+                        #     envoi direct au canal configuré
+                        #     par TELEGRAM CHAT ID
+                        # ================================================
+
+                        sent = await send_to_channel(
+                            application,
+                            message,
+                            parse_mode="Markdown",
                         )
 
-                        for chat_id in list(
-                            chat_ids
-                        ):
+                        if sent:
 
-                            try:
+                            logger.info(
+                                "📢 SIGNAL %s publié dans le canal.",
+                                symbol,
+                            )
 
-                                await (
-                                    application
-                                    .bot
-                                    .send_message(
-                                        chat_id=chat_id,
-                                        text=message,
-                                        parse_mode="Markdown",
-                                    )
-                                )
+                        else:
 
-                            except Exception as exc:
-
-                                logger.error(
-                                    "Erreur envoi Telegram "
-                                    "%s : %s",
-                                    chat_id,
-                                    exc,
-                                )
+                            logger.error(
+                                "❌ SIGNAL %s non publié dans le canal.",
+                                symbol,
+                            )
 
                     else:
 
@@ -1750,6 +1899,18 @@ async def post_init(
         "chat_ids"
     ] = set()
 
+    # --------------------------------------------------------
+    # VERIFICATION DU CANAL
+    # --------------------------------------------------------
+
+    await verify_channel(
+        application
+    )
+
+    # --------------------------------------------------------
+    # DEMARRAGE TACHES
+    # --------------------------------------------------------
+
     loop = asyncio.get_running_loop()
 
     loop.call_later(
@@ -1872,9 +2033,7 @@ def run_bot():
     )
 
     # ========================================================
-    # CORRECTION :
-    # ZONE_TIMEFRAMES n'existe pas forcément dans config.py.
-    # H1 + M15 reste la configuration par défaut.
+    # ZONE_TIMEFRAMES
     # ========================================================
 
     zone_timeframes = getattr(
@@ -1897,6 +2056,23 @@ def run_bot():
         f"Auto execution : "
         f"{CONFIG.AUTO_EXECUTION_ENABLED}"
     )
+
+    # --------------------------------------------------------
+    # CANAL
+    # --------------------------------------------------------
+
+    if TELEGRAM_CHAT_ID:
+
+        print(
+            f"Canal Telegram : "
+            f"{TELEGRAM_CHAT_ID}"
+        )
+
+    else:
+
+        print(
+            "Canal Telegram : NON CONFIGURÉ"
+        )
 
     print("=" * 50)
 
