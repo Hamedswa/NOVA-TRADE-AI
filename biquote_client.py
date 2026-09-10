@@ -64,7 +64,7 @@ class BiQuoteDataError(BiQuoteError):
 
 
 # ============================================================
-# MODELES DE DONNÉES
+# MODÈLES DE DONNÉES
 # ============================================================
 
 @dataclass(frozen=True)
@@ -108,12 +108,11 @@ class Candle:
 
 class BiQuoteClient:
     """
-    Client REST minimal pour le moteur 2.
+    Client REST minimal pour le Moteur 2.
 
-    Important :
-    cette classe ne décide jamais BUY / SELL.
+    Cette classe fournit uniquement les données BiQuote.
 
-    Elle fournit uniquement les données.
+    Elle ne contient aucune logique de trading.
     """
 
     def __init__(
@@ -152,7 +151,10 @@ class BiQuoteClient:
 
         last_error: Optional[Exception] = None
 
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(
+            1,
+            self.max_retries + 1,
+        ):
 
             try:
 
@@ -177,7 +179,9 @@ class BiQuoteClient:
                         retry_after,
                     )
 
-                    time.sleep(retry_after)
+                    time.sleep(
+                        retry_after
+                    )
 
                     continue
 
@@ -185,11 +189,13 @@ class BiQuoteClient:
 
                     try:
                         payload = response.json()
+
                     except Exception:
                         payload = response.text
 
                     raise BiQuoteHTTPError(
-                        f"BiQuote HTTP {response.status_code}: "
+                        f"BiQuote HTTP "
+                        f"{response.status_code}: "
                         f"{payload}"
                     )
 
@@ -209,11 +215,13 @@ class BiQuoteClient:
 
                 if attempt < self.max_retries:
 
-                    time.sleep(attempt)
+                    time.sleep(
+                        attempt
+                    )
 
         raise BiQuoteError(
-            f"Impossible de contacter BiQuote après "
-            f"{self.max_retries} tentatives."
+            "Impossible de contacter BiQuote "
+            f"après {self.max_retries} tentatives."
         ) from last_error
 
     # ========================================================
@@ -228,14 +236,24 @@ class BiQuoteClient:
 
         symbol = symbol.upper()
 
+        if symbol != SYMBOL:
+            raise ValueError(
+                "Le Moteur 2 BiQuote est limité à XAUUSD."
+            )
+
         payload = self._get(
             f"/api/{symbol}",
             params={
-                "allowStale": str(allow_stale).lower(),
+                "allowStale": str(
+                    allow_stale
+                ).lower(),
             },
         )
 
-        if not isinstance(payload, dict):
+        if not isinstance(
+            payload,
+            dict,
+        ):
 
             raise BiQuoteDataError(
                 "Réponse tick BiQuote invalide."
@@ -243,15 +261,27 @@ class BiQuoteClient:
 
         try:
 
-            mid = float(payload["mid"])
+            mid = float(
+                payload["mid"]
+            )
 
-            bid = float(payload["bid"])
+            bid = float(
+                payload["bid"]
+            )
 
-            ask = float(payload["ask"])
+            ask = float(
+                payload["ask"]
+            )
 
-            spread = float(payload["spread"])
+            spread = float(
+                payload["spread"]
+            )
 
-        except (KeyError, TypeError, ValueError) as exc:
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
 
             raise BiQuoteDataError(
                 "Tick BiQuote incomplet ou invalide."
@@ -260,7 +290,8 @@ class BiQuoteClient:
         if mid <= 0:
 
             raise BiQuoteDataError(
-                f"Prix mid invalide pour {symbol}: {mid}"
+                f"Prix mid invalide pour "
+                f"{symbol}: {mid}"
             )
 
         return Tick(
@@ -321,6 +352,14 @@ class BiQuoteClient:
 
         timeframe = timeframe.upper()
 
+        symbol = symbol.upper()
+
+        if symbol != SYMBOL:
+
+            raise ValueError(
+                "Le Moteur 2 BiQuote est limité à XAUUSD."
+            )
+
         if timeframe not in SUPPORTED_TIMEFRAMES:
 
             raise ValueError(
@@ -332,28 +371,39 @@ class BiQuoteClient:
         if not 1 <= limit <= 1000:
 
             raise ValueError(
-                "limit doit être compris entre 1 et 1000."
+                "limit doit être compris "
+                "entre 1 et 1000."
             )
 
-        interval = SUPPORTED_TIMEFRAMES[timeframe]
+        interval = SUPPORTED_TIMEFRAMES[
+            timeframe
+        ]
 
         payload = self._get(
-            f"/api/{symbol.upper()}/ohlc",
+            f"/api/{symbol}/ohlc",
             params={
                 "interval": interval,
                 "limit": limit,
             },
         )
 
-        if not isinstance(payload, dict):
+        if not isinstance(
+            payload,
+            dict,
+        ):
 
             raise BiQuoteDataError(
                 "Réponse OHLC BiQuote invalide."
             )
 
-        bars = payload.get("bars")
+        bars = payload.get(
+            "bars"
+        )
 
-        if not isinstance(bars, list):
+        if not isinstance(
+            bars,
+            list,
+        ):
 
             raise BiQuoteDataError(
                 "Champ 'bars' absent ou invalide."
@@ -363,7 +413,10 @@ class BiQuoteClient:
 
         for bar in bars:
 
-            if not isinstance(bar, dict):
+            if not isinstance(
+                bar,
+                dict,
+            ):
                 continue
 
             try:
@@ -412,8 +465,6 @@ class BiQuoteClient:
 
                 continue
 
-            # Validation basique de la bougie.
-
             if candle.high < candle.low:
 
                 logger.warning(
@@ -449,24 +500,23 @@ class BiQuoteClient:
 
                 continue
 
-            if closed_only and candle.is_open:
+            if (
+                closed_only
+                and candle.is_open
+            ):
 
                 continue
 
-            candles.append(candle)
+            candles.append(
+                candle
+            )
 
         if not candles:
 
             raise BiQuoteDataError(
-                f"Aucune bougie valide reçue pour "
-                f"{symbol} {timeframe}."
+                f"Aucune bougie valide reçue "
+                f"pour {symbol} {timeframe}."
             )
-
-        # BiQuote peut retourner les bougies
-        # de la plus récente à la plus ancienne.
-        #
-        # Le moteur 2 travaillera dans l'ordre
-        # chronologique : ancienne -> récente.
 
         candles.sort(
             key=lambda candle: candle.open_time
@@ -475,7 +525,36 @@ class BiQuoteClient:
         return candles
 
     # ========================================================
-    # MÉTHODE UTILITAIRE
+    # COMPATIBILITÉ MOTEUR 2
+    # ========================================================
+
+    def get_ohlc(
+        self,
+        timeframe: str,
+        symbol: str = SYMBOL,
+        limit: int = 500,
+        closed_only: bool = False,
+    ) -> list[Candle]:
+        """
+        Alias de compatibilité pour le Moteur 2.
+
+        Le client BiQuote officiel du projet utilise
+        get_candles(). Cette méthode permet aux anciennes
+        parties du Moteur 2 qui appellent encore get_ohlc()
+        de fonctionner sans dupliquer la logique OHLC.
+
+        Aucun calcul de trading n'est effectué ici.
+        """
+
+        return self.get_candles(
+            timeframe=timeframe,
+            symbol=symbol,
+            limit=limit,
+            closed_only=closed_only,
+        )
+
+    # ========================================================
+    # TOUS LES TIMEFRAMES
     # ========================================================
 
     def get_all_timeframes(
@@ -485,7 +564,18 @@ class BiQuoteClient:
         closed_only: bool = True,
     ) -> dict[str, list[Candle]]:
 
-        data: dict[str, list[Candle]] = {}
+        symbol = symbol.upper()
+
+        if symbol != SYMBOL:
+
+            raise ValueError(
+                "Le Moteur 2 BiQuote est limité à XAUUSD."
+            )
+
+        data: dict[
+            str,
+            list[Candle],
+        ] = {}
 
         for timeframe in (
             "H4",
