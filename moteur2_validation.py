@@ -1,9 +1,12 @@
-# moteur2_validation.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+
+# ============================================================
+# RESULTAT DE VALIDATION
+# ============================================================
 
 @dataclass
 class ValidationResult:
@@ -15,6 +18,10 @@ class ValidationResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+# ============================================================
+# MOTEUR DE VALIDATION
+# ============================================================
+
 class Moteur2Validation:
     """
     Validation déterministe finale du Moteur 2.
@@ -25,9 +32,28 @@ class Moteur2Validation:
         REJECTED
         VALIDATED_WAITING_CONFIRMATION
         READY_FOR_SIGNAL
+
+    Règle RR :
+        RR minimum obligatoire = 3.0
+        soit un ratio minimal de 1:3.
+
+    IMPORTANT :
+    - Aucun calcul de setup
+    - Aucun déplacement de Entry / SL / TP
+    - Aucun RR artificiel
+    - Aucun concept SMC obligatoire
+    - La validation ne modifie jamais le RiskPlan
     """
 
-    MIN_RR = 2.0
+    # ========================================================
+    # CONFIGURATION RR
+    # ========================================================
+
+    MIN_RR = 3.0
+
+    # ========================================================
+    # OUTILS
+    # ========================================================
 
     @staticmethod
     def _get(
@@ -35,6 +61,7 @@ class Moteur2Validation:
         key: str,
         default: Any = None,
     ) -> Any:
+
         if obj is None:
             return default
 
@@ -48,14 +75,27 @@ class Moteur2Validation:
         value: Any,
         default: Optional[float] = None,
     ) -> Optional[float]:
+
         try:
+
             if value is None:
                 return default
+
             return float(value)
+
         except (TypeError, ValueError):
+
             return default
 
-    def _direction(self, setup: Any) -> str:
+    # ========================================================
+    # DIRECTION
+    # ========================================================
+
+    def _direction(
+        self,
+        setup: Any,
+    ) -> str:
+
         raw = str(
             self._get(
                 setup,
@@ -72,25 +112,42 @@ class Moteur2Validation:
             "BUY": "BUY",
             "LONG": "BUY",
             "HAUSSIER": "BUY",
+            "HAUSSIERE": "BUY",
+            "HAUSSIÈRE": "BUY",
             "BULLISH": "BUY",
             "ACHAT": "BUY",
+
             "SELL": "SELL",
             "SHORT": "SELL",
             "BAISSIER": "SELL",
+            "BAISSIERE": "SELL",
+            "BAISSIÈRE": "SELL",
             "BEARISH": "SELL",
             "VENTE": "SELL",
         }
 
         return mapping.get(raw, raw)
 
-    def _extract_rr(self, risk_plan: Any) -> Optional[float]:
+    # ========================================================
+    # RR
+    # ========================================================
+
+    def _extract_rr(
+        self,
+        risk_plan: Any,
+    ) -> Optional[float]:
+
         for key in (
             "rr",
             "primary_rr",
             "rr_tp1",
         ):
+
             value = self._float(
-                self._get(risk_plan, key)
+                self._get(
+                    risk_plan,
+                    key,
+                )
             )
 
             if value is not None:
@@ -98,7 +155,15 @@ class Moteur2Validation:
 
         return None
 
-    def _risk_valid(self, risk_plan: Any) -> bool:
+    # ========================================================
+    # VALIDITE DU PLAN DE RISQUE
+    # ========================================================
+
+    def _risk_valid(
+        self,
+        risk_plan: Any,
+    ) -> bool:
+
         explicit_valid = self._get(
             risk_plan,
             "valid",
@@ -128,6 +193,10 @@ class Moteur2Validation:
 
         return True
 
+    # ========================================================
+    # GEOMETRIE
+    # ========================================================
+
     def _geometry_valid(
         self,
         direction: str,
@@ -135,23 +204,38 @@ class Moteur2Validation:
     ) -> bool:
 
         entry = self._float(
-            self._get(risk_plan, "entry")
+            self._get(
+                risk_plan,
+                "entry",
+            )
         )
 
         sl = self._float(
-            self._get(risk_plan, "sl")
+            self._get(
+                risk_plan,
+                "sl",
+            )
         )
 
         tp1 = self._float(
-            self._get(risk_plan, "tp1")
+            self._get(
+                risk_plan,
+                "tp1",
+            )
         )
 
         tp2 = self._float(
-            self._get(risk_plan, "tp2")
+            self._get(
+                risk_plan,
+                "tp2",
+            )
         )
 
         tp3 = self._float(
-            self._get(risk_plan, "tp3")
+            self._get(
+                risk_plan,
+                "tp3",
+            )
         )
 
         values = (
@@ -162,18 +246,32 @@ class Moteur2Validation:
             tp3,
         )
 
-        if any(value is None for value in values):
+        if any(
+            value is None
+            for value in values
+        ):
             return False
 
+        # ----------------------------------------------------
+        # BUY
+        # ----------------------------------------------------
+
         if direction == "BUY":
+
             return (
-                sl < entry
+                sl
+                < entry
                 < tp1
                 < tp2
                 < tp3
             )
 
+        # ----------------------------------------------------
+        # SELL
+        # ----------------------------------------------------
+
         if direction == "SELL":
+
             return (
                 tp3
                 < tp2
@@ -184,6 +282,10 @@ class Moteur2Validation:
 
         return False
 
+    # ========================================================
+    # CONTRADICTION MAJEURE
+    # ========================================================
+
     def _major_contradiction(
         self,
         setup: Any,
@@ -191,17 +293,25 @@ class Moteur2Validation:
         confluences: Any,
     ) -> bool:
 
-        setup_direction = self._direction(setup)
+        setup_direction = self._direction(
+            setup
+        )
 
-        if setup_direction not in ("BUY", "SELL"):
+        if setup_direction not in (
+            "BUY",
+            "SELL",
+        ):
             return True
 
-        # Une neutralité sur H1/M15 n'est pas une contradiction.
-        # Le moteur ne rejette que les contradictions explicites.
+        # Une neutralité n'est pas une contradiction.
+        # Seules les contradictions explicitement déclarées
+        # peuvent bloquer le setup.
+
         for source in (
             context,
             confluences,
         ):
+
             contradiction = self._get(
                 source,
                 "major_contradiction",
@@ -217,10 +327,20 @@ class Moteur2Validation:
                 None,
             )
 
-            if isinstance(contradiction, bool) and contradiction:
+            if (
+                isinstance(
+                    contradiction,
+                    bool,
+                )
+                and contradiction
+            ):
                 return True
 
         return False
+
+    # ========================================================
+    # CONFIRMATION M5 / M1
+    # ========================================================
 
     def _confirmation_triggered(
         self,
@@ -235,6 +355,10 @@ class Moteur2Validation:
             )
         )
 
+    # ========================================================
+    # ANALYSE
+    # ========================================================
+
     def analyser(
         self,
         setup: Any = None,
@@ -248,73 +372,110 @@ class Moteur2Validation:
         blockers: List[str] = []
         warnings: List[str] = []
 
-        # ========================================================
+        # ====================================================
         # 1. SETUP
-        # ========================================================
+        # ====================================================
 
         if setup is None:
-            blockers.append("NO_SETUP")
+            blockers.append(
+                "NO_SETUP"
+            )
 
-        direction = self._direction(setup)
+        direction = self._direction(
+            setup
+        )
 
-        # ========================================================
+        # ====================================================
         # 2. DIRECTION
-        # ========================================================
+        # ====================================================
 
-        if direction not in ("BUY", "SELL"):
-            blockers.append("INVALID_DIRECTION")
-
-        # ========================================================
-        # 3. RISK PLAN
-        # ========================================================
-
-        if risk_plan is None:
-            blockers.append("NO_RISK_PLAN")
-        else:
-            if not self._risk_valid(risk_plan):
-                blockers.append("INVALID_RISK_PLAN")
-
-        # ========================================================
-        # 4. GEOMETRIE
-        # ========================================================
-
-        if risk_plan is not None and direction in (
+        if direction not in (
             "BUY",
             "SELL",
         ):
+
+            blockers.append(
+                "INVALID_DIRECTION"
+            )
+
+        # ====================================================
+        # 3. RISK PLAN
+        # ====================================================
+
+        if risk_plan is None:
+
+            blockers.append(
+                "NO_RISK_PLAN"
+            )
+
+        else:
+
+            if not self._risk_valid(
+                risk_plan
+            ):
+
+                blockers.append(
+                    "INVALID_RISK_PLAN"
+                )
+
+        # ====================================================
+        # 4. GEOMETRIE
+        # ====================================================
+
+        if (
+            risk_plan is not None
+            and direction in (
+                "BUY",
+                "SELL",
+            )
+        ):
+
             if not self._geometry_valid(
                 direction,
                 risk_plan,
             ):
-                blockers.append("INVALID_GEOMETRY")
 
-        # ========================================================
-        # 5. RR
-        # ========================================================
+                blockers.append(
+                    "INVALID_GEOMETRY"
+                )
 
-        rr = self._extract_rr(risk_plan)
+        # ====================================================
+        # 5. RR MINIMUM 1:3
+        # ====================================================
+
+        rr = self._extract_rr(
+            risk_plan
+        )
 
         if rr is None:
-            blockers.append("RR_MISSING")
+
+            blockers.append(
+                "RR_MISSING"
+            )
+
         elif rr < self.MIN_RR:
+
             blockers.append(
                 f"RR_BELOW_MINIMUM_{self.MIN_RR:.1f}"
             )
 
-        # ========================================================
+        # ====================================================
         # 6. CONTRADICTION MAJEURE
-        # ========================================================
+        # ====================================================
 
         if self._major_contradiction(
             setup,
             context,
             confluences,
         ):
-            blockers.append("MAJOR_CONTRADICTION")
 
-        # ========================================================
-        # 7. M5/M1
-        # ========================================================
+            blockers.append(
+                "MAJOR_CONTRADICTION"
+            )
+
+        # ====================================================
+        # 7. CONFIRMATION M5 / M1
+        # ====================================================
 
         confirmation_triggered = (
             self._confirmation_triggered(
@@ -323,23 +484,32 @@ class Moteur2Validation:
         )
 
         if not confirmation_triggered:
+
             warnings.append(
                 "M5_M1_CONFIRMATION_WAITING"
             )
 
-        # ========================================================
-        # 8. DECISION
-        # ========================================================
+        # ====================================================
+        # 8. DECISION FINALE
+        # ====================================================
+
+        # ----------------------------------------------------
+        # REJECTED
+        # ----------------------------------------------------
 
         if blockers:
+
             return ValidationResult(
                 status="REJECTED",
                 valid=False,
-                reason="; ".join(blockers),
+                reason="; ".join(
+                    blockers
+                ),
                 blockers=blockers,
                 warnings=warnings,
                 metadata={
                     "rr": rr,
+                    "minimum_rr": self.MIN_RR,
                     "direction": direction,
                     "confirmation_triggered": (
                         confirmation_triggered
@@ -347,36 +517,56 @@ class Moteur2Validation:
                 },
             )
 
+        # ----------------------------------------------------
+        # WAITING CONFIRMATION
+        # ----------------------------------------------------
+
         if not confirmation_triggered:
+
             return ValidationResult(
-                status="VALIDATED_WAITING_CONFIRMATION",
+                status=(
+                    "VALIDATED_WAITING_CONFIRMATION"
+                ),
                 valid=True,
                 reason=(
-                    "Setup valide. "
+                    "Setup valide avec RR minimum 1:3. "
                     "Confirmation M5/M1 attendue."
                 ),
                 blockers=[],
                 warnings=warnings,
                 metadata={
                     "rr": rr,
+                    "minimum_rr": self.MIN_RR,
                     "direction": direction,
                     "confirmation_triggered": False,
                 },
             )
 
+        # ----------------------------------------------------
+        # READY FOR SIGNAL
+        # ----------------------------------------------------
+
         return ValidationResult(
             status="READY_FOR_SIGNAL",
             valid=True,
-            reason="Setup validé et confirmation déclenchée.",
+            reason=(
+                "Setup validé avec RR minimum 1:3 "
+                "et confirmation déclenchée."
+            ),
             blockers=[],
-            warnings=warnings,
+            warnings=[],
             metadata={
                 "rr": rr,
+                "minimum_rr": self.MIN_RR,
                 "direction": direction,
                 "confirmation_triggered": True,
             },
         )
 
+
+# ============================================================
+# FONCTION PUBLIQUE
+# ============================================================
 
 def valider(
     setup: Any = None,
