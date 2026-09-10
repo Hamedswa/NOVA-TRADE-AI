@@ -7,11 +7,11 @@ Gestion déterministe du risque pour le moteur 2.
 Responsabilités :
 - Recevoir les setups détectés
 - Déterminer une Entry naturelle
-- Déterminer un SL cohérent avec la structure réelle du marché
+- Déterminer un SL cohérent avec le marché
 - Déterminer TP1 / TP2 / TP3
 - Calculer les RR
 - Vérifier la cohérence géométrique
-- Refuser les setups dont le RR primaire est insuffisant
+- Refuser les setups dont le RR primaire est inférieur à 1:3
 
 IMPORTANT :
 - Aucun BOS
@@ -41,24 +41,14 @@ import math
 # RR minimum obligatoire : 1:3
 MIN_RR = 3.0
 
-# Objectifs minimums
-# TP1 doit obligatoirement permettre au moins 3R.
+# TP1 est l'objectif primaire.
 TP1_RR_TARGET = 3.0
 
-# Objectifs secondaires
+# Objectifs secondaires.
 TP2_RR_TARGET = 4.0
 TP3_RR_TARGET = 5.0
 
 DEFAULT_SWING_LOOKBACK = 30
-MIN_DISTANCE_RATIO = 0.00005
-
-TIMEFRAME_PRIORITY = {
-    "H4": 5,
-    "H1": 4,
-    "M15": 3,
-    "M5": 2,
-    "M1": 1,
-}
 
 
 # ============================================================
@@ -104,20 +94,14 @@ class Moteur2Risk:
     """
     Détermine les niveaux de risque d'un setup.
 
-    Entrées principales :
-        setups
-        zones
-        candles
-        current_price
-
     Le moteur cherche les niveaux naturels à partir :
         - du prix actuel
         - des limites des zones
-        - des supports/résistances
-        - des swings récents
+        - des supports/résistances fournis
+        - des extrêmes récents
         - de l'amplitude récente
 
-    Il ne force jamais un RR artificiellement.
+    Le moteur ne fabrique jamais artificiellement un RR.
     """
 
     def __init__(
@@ -125,8 +109,8 @@ class Moteur2Risk:
         min_rr: float = MIN_RR,
         swing_lookback: int = DEFAULT_SWING_LOOKBACK,
     ):
-        self.min_rr = float(min_rr)
-        self.swing_lookback = int(swing_lookback)
+        self.min_rr = max(float(min_rr), MIN_RR)
+        self.swing_lookback = max(int(swing_lookback), 5)
 
     # ========================================================
     # OUTILS GENERIQUES
@@ -134,9 +118,6 @@ class Moteur2Risk:
 
     @staticmethod
     def _number(value: Any) -> Optional[float]:
-        """
-        Convertit proprement une valeur en float.
-        """
         if value is None:
             return None
 
@@ -152,13 +133,12 @@ class Moteur2Risk:
             return None
 
     @staticmethod
-    def _get(obj: Any, key: str, default: Any = None) -> Any:
-        """
-        Fonction permettant de lire indifféremment :
-        - dictionnaire
-        - dataclass
-        - objet classique
-        """
+    def _get(
+        obj: Any,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+
         if obj is None:
             return default
 
@@ -168,7 +148,10 @@ class Moteur2Risk:
         return getattr(obj, key, default)
 
     @staticmethod
-    def _normalize_direction(direction: Any) -> Optional[str]:
+    def _normalize_direction(
+        direction: Any,
+    ) -> Optional[str]:
+
         if direction is None:
             return None
 
@@ -193,7 +176,11 @@ class Moteur2Risk:
         return aliases.get(value)
 
     @staticmethod
-    def _extract_symbol(data: Any, default: str = "XAUUSD") -> str:
+    def _extract_symbol(
+        data: Any,
+        default: str = "XAUUSD",
+    ) -> str:
+
         symbol = (
             Moteur2Risk._get(data, "symbol")
             or Moteur2Risk._get(data, "ticker")
@@ -206,55 +193,42 @@ class Moteur2Risk:
     # CANDLES
     # ========================================================
 
-    def _extract_candles(self, candles: Any) -> List[Any]:
-        """
-        Accepte plusieurs formats :
-
-        {
-            "H4": [...],
-            "H1": [...],
-            ...
-        }
-
-        ou directement :
-            [...]
-
-        ou objet contenant les timeframes.
-        """
+    def _extract_candles(
+        self,
+        candles: Any,
+    ) -> List[Any]:
 
         if candles is None:
             return []
 
         if isinstance(candles, dict):
+
             result = []
 
-            for timeframe in (
+            timeframes = (
                 "H4",
                 "H1",
                 "M15",
                 "M5",
                 "M1",
-            ):
+                "4h",
+                "1h",
+                "15m",
+                "5m",
+                "1m",
+            )
+
+            for timeframe in timeframes:
+
                 values = candles.get(timeframe)
 
-                if values:
+                if isinstance(values, (list, tuple)):
                     result.extend(values)
 
             if result:
                 return result
 
-            # Cas où les clés sont en minuscules
-            for key, values in candles.items():
-                if str(key).upper() in {
-                    "H4",
-                    "H1",
-                    "M15",
-                    "M5",
-                    "M1",
-                } and values:
-                    result.extend(values)
-
-            return result
+            return []
 
         if isinstance(candles, (list, tuple)):
             return list(candles)
@@ -275,6 +249,7 @@ class Moteur2Risk:
         }
 
         for name in aliases.get(field, (field,)):
+
             value = self._get(candle, name)
 
             number = self._number(value)
@@ -284,7 +259,11 @@ class Moteur2Risk:
 
         return None
 
-    def _valid_ohlc(self, candle: Any) -> bool:
+    def _valid_ohlc(
+        self,
+        candle: Any,
+    ) -> bool:
+
         high = self._candle_value(candle, "high")
         low = self._candle_value(candle, "low")
         close = self._candle_value(candle, "close")
@@ -309,9 +288,12 @@ class Moteur2Risk:
         if price is not None and price > 0:
             return price
 
-        # Dernier close disponible
         for candle in reversed(candles):
-            close = self._candle_value(candle, "close")
+
+            close = self._candle_value(
+                candle,
+                "close",
+            )
 
             if close is not None and close > 0:
                 return close
@@ -335,6 +317,7 @@ class Moteur2Risk:
             "lower_bound",
             "min_price",
             "price_low",
+            "price_min",
         )
 
         upper_keys = (
@@ -345,28 +328,29 @@ class Moteur2Risk:
             "upper_bound",
             "max_price",
             "price_high",
+            "price_max",
         )
 
         low = None
         high = None
 
         for key in lower_keys:
-            low = self._number(self._get(zone, key))
+
+            low = self._number(
+                self._get(zone, key)
+            )
 
             if low is not None:
                 break
 
         for key in upper_keys:
-            high = self._number(self._get(zone, key))
+
+            high = self._number(
+                self._get(zone, key)
+            )
 
             if high is not None:
                 break
-
-        if low is None:
-            low = self._number(self._get(zone, "price_min"))
-
-        if high is None:
-            high = self._number(self._get(zone, "price_max"))
 
         if low is None or high is None:
             return None
@@ -396,6 +380,7 @@ class Moteur2Risk:
                 "nearby_zones",
                 "zones",
             ):
+
                 values = zones.get(key)
 
                 if isinstance(values, list):
@@ -418,6 +403,7 @@ class Moteur2Risk:
         candidates = []
 
         for zone in zones:
+
             bounds = self._extract_zone_bounds(zone)
 
             if bounds is None:
@@ -434,9 +420,13 @@ class Moteur2Risk:
                 )
 
             if direction == "BUY":
-                directional_bonus = 0 if low <= price else 1
+                directional_bonus = (
+                    0 if low <= price else 1
+                )
             else:
-                directional_bonus = 0 if high >= price else 1
+                directional_bonus = (
+                    0 if high >= price else 1
+                )
 
             candidates.append(
                 (
@@ -449,7 +439,12 @@ class Moteur2Risk:
         if not candidates:
             return None
 
-        candidates.sort(key=lambda x: (x[0], x[1]))
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+            )
+        )
 
         return candidates[0][2]
 
@@ -465,7 +460,11 @@ class Moteur2Risk:
         values = []
 
         for candle in candles[-self.swing_lookback:]:
-            high = self._candle_value(candle, "high")
+
+            high = self._candle_value(
+                candle,
+                "high",
+            )
 
             if high is not None:
                 values.append(high)
@@ -480,47 +479,34 @@ class Moteur2Risk:
         values = []
 
         for candle in candles[-self.swing_lookback:]:
-            low = self._candle_value(candle, "low")
+
+            low = self._candle_value(
+                candle,
+                "low",
+            )
 
             if low is not None:
                 values.append(low)
 
         return values
 
-    def _recent_high(self, candles: Sequence[Any]) -> Optional[float]:
-        values = self._recent_highs(candles)
-
-        if not values:
-            return None
-
-        return max(values)
-
-    def _recent_low(self, candles: Sequence[Any]) -> Optional[float]:
-        values = self._recent_lows(candles)
-
-        if not values:
-            return None
-
-        return min(values)
-
-    def _recent_range(
+    def _recent_high(
         self,
         candles: Sequence[Any],
     ) -> Optional[float]:
 
-        highs = self._recent_highs(candles)
-        lows = self._recent_lows(candles)
+        values = self._recent_highs(candles)
 
-        if not highs or not lows:
-            return None
+        return max(values) if values else None
 
-        high = max(highs)
-        low = min(lows)
+    def _recent_low(
+        self,
+        candles: Sequence[Any],
+    ) -> Optional[float]:
 
-        if high <= low:
-            return None
+        values = self._recent_lows(candles)
 
-        return high - low
+        return min(values) if values else None
 
     # ========================================================
     # ENTRY
@@ -533,18 +519,23 @@ class Moteur2Risk:
         zone: Any,
     ) -> Optional[float]:
 
-        explicit_entry = (
-            self._number(self._get(setup, "entry"))
-            or self._number(self._get(setup, "entry_price"))
-            or self._number(self._get(setup, "trigger_price"))
+        explicit_values = (
+            self._get(setup, "entry"),
+            self._get(setup, "entry_price"),
+            self._get(setup, "trigger_price"),
         )
 
-        if explicit_entry is not None and explicit_entry > 0:
-            return explicit_entry
+        for value in explicit_values:
+
+            entry = self._number(value)
+
+            if entry is not None and entry > 0:
+                return entry
 
         zone_bounds = self._extract_zone_bounds(zone)
 
         if zone_bounds is not None:
+
             low, high = zone_bounds
 
             if low <= current_price <= high:
@@ -571,14 +562,18 @@ class Moteur2Risk:
         candles: Sequence[Any],
     ) -> Optional[float]:
 
-        explicit_sl = (
-            self._number(self._get(setup, "sl"))
-            or self._number(self._get(setup, "stop_loss"))
-            or self._number(self._get(setup, "stop"))
+        explicit_values = (
+            self._get(setup, "sl"),
+            self._get(setup, "stop_loss"),
+            self._get(setup, "stop"),
         )
 
-        if explicit_sl is not None:
-            return explicit_sl
+        for value in explicit_values:
+
+            sl = self._number(value)
+
+            if sl is not None and sl > 0:
+                return sl
 
         zone_bounds = self._extract_zone_bounds(zone)
 
@@ -590,6 +585,7 @@ class Moteur2Risk:
             candidates = []
 
             if zone_bounds is not None:
+
                 zone_low, _ = zone_bounds
 
                 if zone_low < entry:
@@ -601,13 +597,13 @@ class Moteur2Risk:
             if not candidates:
                 return None
 
+            # SL placé sous le niveau naturel le plus proche.
             return max(candidates)
-
-        # SELL
 
         candidates = []
 
         if zone_bounds is not None:
+
             _, zone_high = zone_bounds
 
             if zone_high > entry:
@@ -619,6 +615,7 @@ class Moteur2Risk:
         if not candidates:
             return None
 
+        # SL placé au-dessus du niveau naturel le plus proche.
         return min(candidates)
 
     # ========================================================
@@ -632,7 +629,11 @@ class Moteur2Risk:
         sl: float,
         candles: Sequence[Any],
         zones: List[Any],
-    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    ) -> Tuple[
+        Optional[float],
+        Optional[float],
+        Optional[float],
+    ]:
 
         risk = abs(entry - sl)
 
@@ -642,18 +643,22 @@ class Moteur2Risk:
         recent_high = self._recent_high(candles)
         recent_low = self._recent_low(candles)
 
+        natural_targets = []
+
         # ----------------------------------------------------
         # BUY
         # ----------------------------------------------------
 
         if direction == "BUY":
 
-            natural_targets = []
-
-            if recent_high is not None and recent_high > entry:
+            if (
+                recent_high is not None
+                and recent_high > entry
+            ):
                 natural_targets.append(recent_high)
 
             for zone in zones:
+
                 bounds = self._extract_zone_bounds(zone)
 
                 if bounds is None:
@@ -663,6 +668,7 @@ class Moteur2Risk:
 
                 if zone_low > entry:
                     natural_targets.append(zone_low)
+
                 elif zone_high > entry:
                     natural_targets.append(zone_high)
 
@@ -678,64 +684,41 @@ class Moteur2Risk:
             tp2 = None
             tp3 = None
 
-            # ------------------------------------------------
-            # TP1 : minimum 3R
-            # ------------------------------------------------
-
+            # TP1 doit obligatoirement être >= 3R.
             for target in natural_targets:
-                if (target - entry) / risk >= TP1_RR_TARGET:
+
+                rr = (target - entry) / risk
+
+                if rr >= TP1_RR_TARGET:
                     tp1 = target
                     break
 
-            # Aucun objectif naturel à 3R = rejet.
             if tp1 is None:
                 return None, None, None
 
-            # ------------------------------------------------
-            # TP2 : objectif naturel à 4R
-            # ------------------------------------------------
-
+            # TP2 naturel >= 4R.
             for target in natural_targets:
-                if (
-                    target > tp1
-                    and (target - entry) / risk >= TP2_RR_TARGET
-                ):
+
+                if target <= tp1:
+                    continue
+
+                rr = (target - entry) / risk
+
+                if rr >= TP2_RR_TARGET:
                     tp2 = target
                     break
 
-            # ------------------------------------------------
-            # TP3 : objectif naturel à 5R
-            # ------------------------------------------------
-
+            # TP3 naturel >= 5R.
             for target in natural_targets:
-                if (
-                    target > (tp2 if tp2 else tp1)
-                    and (target - entry) / risk >= TP3_RR_TARGET
-                ):
+
+                if target <= (tp2 if tp2 else tp1):
+                    continue
+
+                rr = (target - entry) / risk
+
+                if rr >= TP3_RR_TARGET:
                     tp3 = target
                     break
-
-            # ------------------------------------------------
-            # TP2 de secours à 4R
-            # ------------------------------------------------
-
-            if tp2 is None:
-
-                candidate = entry + risk * TP2_RR_TARGET
-
-                if recent_high is None or candidate <= recent_high:
-                    tp2 = candidate
-
-            # ------------------------------------------------
-            # TP3 de secours à 5R
-            # ------------------------------------------------
-
-            if tp3 is None:
-
-                candidate = entry + risk * TP3_RR_TARGET
-
-                if recent_high is None or candidate <= recent_high:
-                    tp3 = candidate
 
             return tp1, tp2, tp3
 
@@ -743,101 +726,81 @@ class Moteur2Risk:
         # SELL
         # ----------------------------------------------------
 
-        natural_targets = []
-
-        if recent_low is not None and recent_low < entry:
-            natural_targets.append(recent_low)
-
-        for zone in zones:
-
-            bounds = self._extract_zone_bounds(zone)
-
-            if bounds is None:
-                continue
-
-            zone_low, zone_high = bounds
-
-            if zone_high < entry:
-                natural_targets.append(zone_high)
-            elif zone_low < entry:
-                natural_targets.append(zone_low)
-
-        natural_targets = sorted(
-            set(
-                round(value, 8)
-                for value in natural_targets
-                if value < entry
-            ),
-            reverse=True,
-        )
-
-        tp1 = None
-        tp2 = None
-        tp3 = None
-
-        # ----------------------------------------------------
-        # TP1 : minimum 3R
-        # ----------------------------------------------------
-
-        for target in natural_targets:
-
-            if (entry - target) / risk >= TP1_RR_TARGET:
-                tp1 = target
-                break
-
-        # Aucun objectif naturel à 3R = rejet.
-        if tp1 is None:
-            return None, None, None
-
-        # ----------------------------------------------------
-        # TP2 : objectif naturel à 4R
-        # ----------------------------------------------------
-
-        for target in natural_targets:
+        if direction == "SELL":
 
             if (
-                target < tp1
-                and (entry - target) / risk >= TP2_RR_TARGET
+                recent_low is not None
+                and recent_low < entry
             ):
-                tp2 = target
-                break
+                natural_targets.append(recent_low)
 
-        # ----------------------------------------------------
-        # TP3 : objectif naturel à 5R
-        # ----------------------------------------------------
+            for zone in zones:
 
-        for target in natural_targets:
+                bounds = self._extract_zone_bounds(zone)
 
-            if (
-                target < (tp2 if tp2 else tp1)
-                and (entry - target) / risk >= TP3_RR_TARGET
-            ):
-                tp3 = target
-                break
+                if bounds is None:
+                    continue
 
-        # ----------------------------------------------------
-        # TP2 de secours à 4R
-        # ----------------------------------------------------
+                zone_low, zone_high = bounds
 
-        if tp2 is None:
+                if zone_high < entry:
+                    natural_targets.append(zone_high)
 
-            candidate = entry - risk * TP2_RR_TARGET
+                elif zone_low < entry:
+                    natural_targets.append(zone_low)
 
-            if recent_low is None or candidate >= recent_low:
-                tp2 = candidate
+            natural_targets = sorted(
+                set(
+                    round(value, 8)
+                    for value in natural_targets
+                    if value < entry
+                ),
+                reverse=True,
+            )
 
-        # ----------------------------------------------------
-        # TP3 de secours à 5R
-        # ----------------------------------------------------
+            tp1 = None
+            tp2 = None
+            tp3 = None
 
-        if tp3 is None:
+            # TP1 doit obligatoirement être >= 3R.
+            for target in natural_targets:
 
-            candidate = entry - risk * TP3_RR_TARGET
+                rr = (entry - target) / risk
 
-            if recent_low is None or candidate >= recent_low:
-                tp3 = candidate
+                if rr >= TP1_RR_TARGET:
+                    tp1 = target
+                    break
 
-        return tp1, tp2, tp3
+            if tp1 is None:
+                return None, None, None
+
+            # TP2 naturel >= 4R.
+            for target in natural_targets:
+
+                if target >= tp1:
+                    continue
+
+                rr = (entry - target) / risk
+
+                if rr >= TP2_RR_TARGET:
+                    tp2 = target
+                    break
+
+            # TP3 naturel >= 5R.
+            for target in natural_targets:
+
+                if target >= (tp2 if tp2 else tp1):
+                    continue
+
+                rr = (entry - target) / risk
+
+                if rr >= TP3_RR_TARGET:
+                    tp3 = target
+                    break
+
+            return tp1, tp2, tp3
+
+        return None, None, None
 
     # ========================================================
     # GEOMETRIE
@@ -853,28 +816,52 @@ class Moteur2Risk:
         tp3: Optional[float],
     ) -> bool:
 
-        values = [entry, sl, tp1, tp2, tp3]
-
-        if any(value is None for value in values):
+        if entry is None or sl is None or tp1 is None:
             return False
 
         if direction == "BUY":
 
-            return (
+            # TP1 est obligatoire.
+            if not (
                 sl < entry
                 and entry < tp1
-                and tp1 < tp2
-                and tp2 < tp3
-            )
+            ):
+                return False
+
+            # TP2/TP3 sont optionnels.
+            if tp2 is not None and tp2 <= tp1:
+                return False
+
+            if tp3 is not None:
+
+                reference = tp2 if tp2 is not None else tp1
+
+                if tp3 <= reference:
+                    return False
+
+            return True
 
         if direction == "SELL":
 
-            return (
-                tp3 < tp2
-                and tp2 < tp1
-                and tp1 < entry
+            # TP1 est obligatoire.
+            if not (
+                tp1 < entry
                 and entry < sl
-            )
+            ):
+                return False
+
+            # TP2/TP3 sont optionnels.
+            if tp2 is not None and tp2 >= tp1:
+                return False
+
+            if tp3 is not None:
+
+                reference = tp2 if tp2 is not None else tp1
+
+                if tp3 >= reference:
+                    return False
+
+            return True
 
         return False
 
@@ -899,15 +886,12 @@ class Moteur2Risk:
             return None
 
         if direction == "BUY":
-
             reward = tp - entry
 
         elif direction == "SELL":
-
             reward = entry - tp
 
         else:
-
             return None
 
         if reward <= 0:
@@ -957,7 +941,7 @@ class Moteur2Risk:
         candidate_zones = self._extract_candidate_zones(zones)
 
         # ----------------------------------------------------
-        # Vérifications initiales
+        # Direction
         # ----------------------------------------------------
 
         if direction is None:
@@ -981,8 +965,14 @@ class Moteur2Risk:
                 rr_valid=False,
                 valid=False,
                 reason="Direction du setup invalide ou absente.",
-                metadata={},
+                metadata={
+                    "minimum_rr": self.min_rr,
+                },
             )
+
+        # ----------------------------------------------------
+        # Prix
+        # ----------------------------------------------------
 
         if price is None:
 
@@ -1005,8 +995,14 @@ class Moteur2Risk:
                 rr_valid=False,
                 valid=False,
                 reason="Prix actuel indisponible.",
-                metadata={},
+                metadata={
+                    "minimum_rr": self.min_rr,
+                },
             )
+
+        # ----------------------------------------------------
+        # Zone la plus pertinente
+        # ----------------------------------------------------
 
         zone = self._nearest_zone(
             candidate_zones,
@@ -1045,11 +1041,13 @@ class Moteur2Risk:
                 rr_valid=False,
                 valid=False,
                 reason="Entry impossible à déterminer.",
-                metadata={},
+                metadata={
+                    "minimum_rr": self.min_rr,
+                },
             )
 
         # ----------------------------------------------------
-        # STOP
+        # STOP LOSS
         # ----------------------------------------------------
 
         sl = self._calculate_sl(
@@ -1081,7 +1079,9 @@ class Moteur2Risk:
                 rr_valid=False,
                 valid=False,
                 reason="Stop Loss naturel impossible à déterminer.",
-                metadata={},
+                metadata={
+                    "minimum_rr": self.min_rr,
+                },
             )
 
         risk_distance = abs(entry - sl)
@@ -1107,7 +1107,9 @@ class Moteur2Risk:
                 rr_valid=False,
                 valid=False,
                 reason="Distance Entry/SL nulle.",
-                metadata={},
+                metadata={
+                    "minimum_rr": self.min_rr,
+                },
             )
 
         # ----------------------------------------------------
@@ -1147,6 +1149,7 @@ class Moteur2Risk:
             tp3,
         )
 
+        # TP1 = objectif primaire.
         primary_rr = rr_tp1
 
         # ----------------------------------------------------
@@ -1184,11 +1187,7 @@ class Moteur2Risk:
                 valid=False,
                 reason="Géométrie Entry/SL/TP incohérente.",
                 metadata={
-                    "zone_used": (
-                        asdict(zone)
-                        if hasattr(zone, "__dataclass_fields__")
-                        else zone
-                    ),
+                    "minimum_rr": self.min_rr,
                 },
             )
 
@@ -1223,9 +1222,12 @@ class Moteur2Risk:
                 rr_valid=False,
                 valid=False,
                 reason=(
-                    f"RR insuffisant : minimum requis 1:{MIN_RR:.0f}."
+                    f"RR insuffisant : minimum requis "
+                    f"1:{self.min_rr:.0f}."
                 ),
-                metadata={},
+                metadata={
+                    "minimum_rr": self.min_rr,
+                },
             )
 
         # ----------------------------------------------------
@@ -1250,12 +1252,15 @@ class Moteur2Risk:
             geometry_valid=True,
             rr_valid=True,
             valid=True,
-            reason="Plan de risque cohérent avec RR minimum 1:3 respecté.",
+            reason=(
+                "Plan de risque cohérent avec "
+                "RR minimum 1:3 respecté."
+            ),
             metadata={
                 "zone_used": zone,
                 "current_price": price,
                 "candles_count": len(all_candles),
-                "minimum_rr": MIN_RR,
+                "minimum_rr": self.min_rr,
                 "tp1_rr_target": TP1_RR_TARGET,
                 "tp2_rr_target": TP2_RR_TARGET,
                 "tp3_rr_target": TP3_RR_TARGET,
@@ -1314,7 +1319,10 @@ class Moteur2Risk:
     # ========================================================
 
     @staticmethod
-    def to_dict(plan: RiskPlan) -> Dict[str, Any]:
+    def to_dict(
+        plan: RiskPlan,
+    ) -> Dict[str, Any]:
+
         return asdict(plan)
 
     def analyser(
@@ -1334,8 +1342,7 @@ class Moteur2Risk:
 
         return {
             "symbol": "XAUUSD",
-
-            "minimum_rr": MIN_RR,
+            "minimum_rr": self.min_rr,
 
             "plans": [
                 self.to_dict(plan)
