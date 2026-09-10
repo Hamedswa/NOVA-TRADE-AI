@@ -38,11 +38,16 @@ import math
 # CONFIGURATION
 # ============================================================
 
-MIN_RR = 2.0
+# RR minimum obligatoire : 1:3
+MIN_RR = 3.0
 
-TP1_RR_TARGET = 2.0
-TP2_RR_TARGET = 3.0
-TP3_RR_TARGET = 4.0
+# Objectifs minimums
+# TP1 doit obligatoirement permettre au moins 3R.
+TP1_RR_TARGET = 3.0
+
+# Objectifs secondaires
+TP2_RR_TARGET = 4.0
+TP3_RR_TARGET = 5.0
 
 DEFAULT_SWING_LOOKBACK = 30
 MIN_DISTANCE_RATIO = 0.00005
@@ -357,7 +362,6 @@ class Moteur2Risk:
             if high is not None:
                 break
 
-        # Cas zone avec "price_min" / "price_max"
         if low is None:
             low = self._number(self._get(zone, "price_min"))
 
@@ -429,7 +433,6 @@ class Moteur2Risk:
                     abs(price - high),
                 )
 
-            # Pour BUY, priorité aux zones sous le prix.
             if direction == "BUY":
                 directional_bonus = 0 if low <= price else 1
             else:
@@ -530,8 +533,6 @@ class Moteur2Risk:
         zone: Any,
     ) -> Optional[float]:
 
-        # Si le setup fournit déjà une entrée naturelle,
-        # elle est prioritaire.
         explicit_entry = (
             self._number(self._get(setup, "entry"))
             or self._number(self._get(setup, "entry_price"))
@@ -546,13 +547,9 @@ class Moteur2Risk:
         if zone_bounds is not None:
             low, high = zone_bounds
 
-            # Si le prix est dans la zone :
-            # utiliser le prix actuel comme point d'entrée.
             if low <= current_price <= high:
                 return current_price
 
-            # Si le prix est proche de la zone,
-            # utiliser la frontière pertinente.
             if current_price < low:
                 return low
 
@@ -604,7 +601,6 @@ class Moteur2Risk:
             if not candidates:
                 return None
 
-            # SL sous le niveau structurel le plus proche.
             return max(candidates)
 
         # SELL
@@ -623,7 +619,6 @@ class Moteur2Risk:
         if not candidates:
             return None
 
-        # SL au-dessus du niveau structurel le plus proche.
         return min(candidates)
 
     # ========================================================
@@ -683,21 +678,34 @@ class Moteur2Risk:
             tp2 = None
             tp3 = None
 
-            # Premier objectif naturel >= RR 2
+            # ------------------------------------------------
+            # TP1 : minimum 3R
+            # ------------------------------------------------
+
             for target in natural_targets:
                 if (target - entry) / risk >= TP1_RR_TARGET:
                     tp1 = target
                     break
 
-            # Si aucun niveau naturel ne permet RR 2,
-            # on NE FABRIQUE PAS un TP.
+            # Aucun objectif naturel à 3R = rejet.
             if tp1 is None:
                 return None, None, None
 
+            # ------------------------------------------------
+            # TP2 : objectif naturel à 4R
+            # ------------------------------------------------
+
             for target in natural_targets:
-                if target > tp1 and (target - entry) / risk >= TP2_RR_TARGET:
+                if (
+                    target > tp1
+                    and (target - entry) / risk >= TP2_RR_TARGET
+                ):
                     tp2 = target
                     break
+
+            # ------------------------------------------------
+            # TP3 : objectif naturel à 5R
+            # ------------------------------------------------
 
             for target in natural_targets:
                 if (
@@ -707,16 +715,23 @@ class Moteur2Risk:
                     tp3 = target
                     break
 
-            # Si les niveaux naturels supplémentaires n'existent pas,
-            # les objectifs RR peuvent être utilisés seulement si aucune
-            # résistance naturelle ne les contredit.
+            # ------------------------------------------------
+            # TP2 de secours à 4R
+            # ------------------------------------------------
+
             if tp2 is None:
+
                 candidate = entry + risk * TP2_RR_TARGET
 
                 if recent_high is None or candidate <= recent_high:
                     tp2 = candidate
 
+            # ------------------------------------------------
+            # TP3 de secours à 5R
+            # ------------------------------------------------
+
             if tp3 is None:
+
                 candidate = entry + risk * TP3_RR_TARGET
 
                 if recent_high is None or candidate <= recent_high:
@@ -734,6 +749,7 @@ class Moteur2Risk:
             natural_targets.append(recent_low)
 
         for zone in zones:
+
             bounds = self._extract_zone_bounds(zone)
 
             if bounds is None:
@@ -759,20 +775,39 @@ class Moteur2Risk:
         tp2 = None
         tp3 = None
 
+        # ----------------------------------------------------
+        # TP1 : minimum 3R
+        # ----------------------------------------------------
+
         for target in natural_targets:
+
             if (entry - target) / risk >= TP1_RR_TARGET:
                 tp1 = target
                 break
 
+        # Aucun objectif naturel à 3R = rejet.
         if tp1 is None:
             return None, None, None
 
+        # ----------------------------------------------------
+        # TP2 : objectif naturel à 4R
+        # ----------------------------------------------------
+
         for target in natural_targets:
-            if target < tp1 and (entry - target) / risk >= TP2_RR_TARGET:
+
+            if (
+                target < tp1
+                and (entry - target) / risk >= TP2_RR_TARGET
+            ):
                 tp2 = target
                 break
 
+        # ----------------------------------------------------
+        # TP3 : objectif naturel à 5R
+        # ----------------------------------------------------
+
         for target in natural_targets:
+
             if (
                 target < (tp2 if tp2 else tp1)
                 and (entry - target) / risk >= TP3_RR_TARGET
@@ -780,13 +815,23 @@ class Moteur2Risk:
                 tp3 = target
                 break
 
+        # ----------------------------------------------------
+        # TP2 de secours à 4R
+        # ----------------------------------------------------
+
         if tp2 is None:
+
             candidate = entry - risk * TP2_RR_TARGET
 
             if recent_low is None or candidate >= recent_low:
                 tp2 = candidate
 
+        # ----------------------------------------------------
+        # TP3 de secours à 5R
+        # ----------------------------------------------------
+
         if tp3 is None:
+
             candidate = entry - risk * TP3_RR_TARGET
 
             if recent_low is None or candidate >= recent_low:
@@ -814,6 +859,7 @@ class Moteur2Risk:
             return False
 
         if direction == "BUY":
+
             return (
                 sl < entry
                 and entry < tp1
@@ -822,6 +868,7 @@ class Moteur2Risk:
             )
 
         if direction == "SELL":
+
             return (
                 tp3 < tp2
                 and tp2 < tp1
@@ -852,12 +899,15 @@ class Moteur2Risk:
             return None
 
         if direction == "BUY":
+
             reward = tp - entry
 
         elif direction == "SELL":
+
             reward = entry - tp
 
         else:
+
             return None
 
         if reward <= 0:
@@ -911,6 +961,7 @@ class Moteur2Risk:
         # ----------------------------------------------------
 
         if direction is None:
+
             return RiskPlan(
                 symbol=symbol,
                 setup_id=setup_id,
@@ -934,6 +985,7 @@ class Moteur2Risk:
             )
 
         if price is None:
+
             return RiskPlan(
                 symbol=symbol,
                 setup_id=setup_id,
@@ -973,6 +1025,7 @@ class Moteur2Risk:
         )
 
         if entry is None or entry <= 0:
+
             return RiskPlan(
                 symbol=symbol,
                 setup_id=setup_id,
@@ -1008,6 +1061,7 @@ class Moteur2Risk:
         )
 
         if sl is None:
+
             return RiskPlan(
                 symbol=symbol,
                 setup_id=setup_id,
@@ -1033,6 +1087,7 @@ class Moteur2Risk:
         risk_distance = abs(entry - sl)
 
         if risk_distance <= 0:
+
             return RiskPlan(
                 symbol=symbol,
                 setup_id=setup_id,
@@ -1108,6 +1163,7 @@ class Moteur2Risk:
         )
 
         if not geometry_valid:
+
             return RiskPlan(
                 symbol=symbol,
                 setup_id=setup_id,
@@ -1128,9 +1184,11 @@ class Moteur2Risk:
                 valid=False,
                 reason="Géométrie Entry/SL/TP incohérente.",
                 metadata={
-                    "zone_used": asdict(zone)
-                    if hasattr(zone, "__dataclass_fields__")
-                    else zone,
+                    "zone_used": (
+                        asdict(zone)
+                        if hasattr(zone, "__dataclass_fields__")
+                        else zone
+                    ),
                 },
             )
 
@@ -1141,9 +1199,11 @@ class Moteur2Risk:
         rr_valid = (
             primary_rr is not None
             and primary_rr >= self.min_rr
+            and primary_rr >= MIN_RR
         )
 
         if not rr_valid:
+
             return RiskPlan(
                 symbol=symbol,
                 setup_id=setup_id,
@@ -1162,7 +1222,9 @@ class Moteur2Risk:
                 geometry_valid=True,
                 rr_valid=False,
                 valid=False,
-                reason=f"RR insuffisant : minimum requis {self.min_rr:.2f}.",
+                reason=(
+                    f"RR insuffisant : minimum requis 1:{MIN_RR:.0f}."
+                ),
                 metadata={},
             )
 
@@ -1188,11 +1250,15 @@ class Moteur2Risk:
             geometry_valid=True,
             rr_valid=True,
             valid=True,
-            reason="Plan de risque cohérent avec RR minimum respecté.",
+            reason="Plan de risque cohérent avec RR minimum 1:3 respecté.",
             metadata={
                 "zone_used": zone,
                 "current_price": price,
                 "candles_count": len(all_candles),
+                "minimum_rr": MIN_RR,
+                "tp1_rr_target": TP1_RR_TARGET,
+                "tp2_rr_target": TP2_RR_TARGET,
+                "tp3_rr_target": TP3_RR_TARGET,
             },
         )
 
@@ -1221,9 +1287,11 @@ class Moteur2Risk:
             )
 
         elif isinstance(setups, (list, tuple)):
+
             setup_list = list(setups)
 
         else:
+
             setup_list = [setups]
 
         results = []
@@ -1266,15 +1334,20 @@ class Moteur2Risk:
 
         return {
             "symbol": "XAUUSD",
+
+            "minimum_rr": MIN_RR,
+
             "plans": [
                 self.to_dict(plan)
                 for plan in plans
             ],
+
             "valid_plans": [
                 self.to_dict(plan)
                 for plan in plans
                 if plan.valid
             ],
+
             "rejected_plans": [
                 self.to_dict(plan)
                 for plan in plans
