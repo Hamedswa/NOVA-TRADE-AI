@@ -22,7 +22,7 @@ La détection des setups sera faite plus tard par moteur2_setups.py.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from biquote_client import Candle
 
@@ -302,37 +302,48 @@ class Moteur2Marche:
             timeframe,
         )
 
+        # IMPORTANT :
+        # Les fonctions internes retournent des dataclasses.
+        # La conversion avec asdict() est effectuée UNE SEULE FOIS ici.
         return {
             "timeframe": timeframe,
             "current_price": current_price,
+
             "important_highs": [
                 asdict(x)
                 for x in highs
             ],
+
             "important_lows": [
                 asdict(x)
                 for x in lows
             ],
+
             "supports": [
                 asdict(x)
                 for x in supports
             ],
+
             "resistances": [
                 asdict(x)
                 for x in resistances
             ],
+
             "zones": [
                 asdict(x)
                 for x in zones
             ],
+
             "impulses": [
                 asdict(x)
                 for x in impulses
             ],
+
             "corrections": [
                 asdict(x)
                 for x in corrections
             ],
+
             "ranges": ranges,
         }
 
@@ -525,6 +536,15 @@ class Moteur2Marche:
         resistances: List[PriceLevel],
         timeframe: str,
     ) -> List[MarketZone]:
+        """
+        Construit les zones de réaction.
+
+        IMPORTANT :
+        Cette fonction retourne des objets MarketZone.
+        Elle ne fait PAS de asdict().
+        La conversion est effectuée uniquement dans
+        _analyser_timeframe().
+        """
 
         zones: List[MarketZone] = []
 
@@ -570,10 +590,7 @@ class Moteur2Marche:
                 )
             )
 
-        return [
-            asdict(zone)
-            for zone in zones
-        ]
+        return zones
 
     # -----------------------------------------------------------------------
     # IMPULSIONS
@@ -647,6 +664,12 @@ class Moteur2Marche:
         candles: List[Candle],
         timeframe: str,
     ) -> List[MarketCorrection]:
+        """
+        Détecte un mouvement de correction descriptif.
+
+        Cette fonction retourne directement des
+        MarketCorrection, et non des dictionnaires.
+        """
 
         if len(candles) < 15:
             return []
@@ -682,15 +705,13 @@ class Moteur2Marche:
         )
 
         return [
-            asdict(
-                MarketCorrection(
-                    direction=direction,
-                    start_price=start,
-                    end_price=end,
-                    amplitude=abs(amplitude),
-                    percentage=percentage,
-                    timeframe=timeframe,
-                )
+            MarketCorrection(
+                direction=direction,
+                start_price=start,
+                end_price=end,
+                amplitude=abs(amplitude),
+                percentage=percentage,
+                timeframe=timeframe,
             )
         ]
 
@@ -827,7 +848,7 @@ class Moteur2Marche:
         candles: List[Candle],
     ) -> List[Candle]:
 
-        valid = []
+        valid: List[Candle] = []
 
         for candle in candles:
 
