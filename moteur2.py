@@ -49,6 +49,10 @@ class Moteur2:
         -> validation
         -> anti-spam
         -> signal
+
+    IMPORTANT :
+        Le Moteur 2 reste totalement indépendant
+        du Moteur 1.
     """
 
     SYMBOL = "XAUUSD"
@@ -56,8 +60,21 @@ class Moteur2:
     def __init__(self) -> None:
         self.logger = logger
 
+        # --------------------------------------------------------
+        # CLIENT BIQUOTE
+        # --------------------------------------------------------
+
         self.biquote = BiQuoteClient()
-        self.stream = BiQuoteStream()
+
+        # Le callback est donné au constructeur du stream.
+        self.stream = BiQuoteStream(
+            symbol=self.SYMBOL,
+            on_tick=self._handle_tick,
+        )
+
+        # --------------------------------------------------------
+        # MODULES MOTEUR 2
+        # --------------------------------------------------------
 
         self.cache = Moteur2Cache()
         self.marche = Moteur2Marche()
@@ -72,9 +89,20 @@ class Moteur2:
         self.antispam = Moteur2AntiSpam()
         self.signal = Moteur2Signal()
 
+        # --------------------------------------------------------
+        # ÉTAT
+        # --------------------------------------------------------
+
         self.running = False
-        self.last_analysis: Optional[Dict[str, Any]] = None
-        self.last_signal: Optional[Dict[str, Any]] = None
+
+        self.last_analysis: Optional[
+            Dict[str, Any]
+        ] = None
+
+        self.last_signal: Optional[
+            Dict[str, Any]
+        ] = None
+
         self.last_error: Optional[str] = None
 
         self.current_price: Optional[float] = None
@@ -85,39 +113,97 @@ class Moteur2:
 
     @staticmethod
     def _now() -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(
+            timezone.utc
+        ).isoformat()
 
     @staticmethod
-    def _safe_float(value: Any) -> Optional[float]:
+    def _safe_float(
+        value: Any,
+    ) -> Optional[float]:
+
         try:
+
             if value is None:
                 return None
+
             return float(value)
-        except (TypeError, ValueError):
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
             return None
 
     @staticmethod
-    def _get(obj: Any, key: str, default: Any = None) -> Any:
+    def _get(
+        obj: Any,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+
         if obj is None:
             return default
 
-        if isinstance(obj, dict):
-            return obj.get(key, default)
+        if isinstance(
+            obj,
+            dict,
+        ):
 
-        return getattr(obj, key, default)
+            return obj.get(
+                key,
+                default,
+            )
 
-    def _extract_price(self, tick: Any) -> Optional[float]:
+        return getattr(
+            obj,
+            key,
+            default,
+        )
+
+    def _extract_price(
+        self,
+        tick: Any,
+    ) -> Optional[float]:
+
         if tick is None:
             return None
 
-        if isinstance(tick, dict):
-            for key in ("mid", "price", "last", "close"):
-                value = self._safe_float(tick.get(key))
+        if isinstance(
+            tick,
+            dict,
+        ):
+
+            for key in (
+                "mid",
+                "price",
+                "last",
+                "close",
+            ):
+
+                value = self._safe_float(
+                    tick.get(key)
+                )
+
                 if value is not None:
                     return value
 
-        for key in ("mid", "price", "last", "close"):
-            value = self._safe_float(getattr(tick, key, None))
+        for key in (
+            "mid",
+            "price",
+            "last",
+            "close",
+        ):
+
+            value = self._safe_float(
+                getattr(
+                    tick,
+                    key,
+                    None,
+                )
+            )
+
             if value is not None:
                 return value
 
@@ -127,34 +213,113 @@ class Moteur2:
     # DONNÉES BIQUOTE
     # ============================================================
 
-    async def _get_candles(self) -> Dict[str, List[Any]]:
+    async def _get_candles(
+        self,
+    ) -> Dict[str, List[Any]]:
         """
-        Récupère les données nécessaires depuis BiQuote.
+        Récupère les chandeliers XAUUSD depuis BiQuote.
 
-        Le tick temps réel ne remplace jamais une bougie M1 clôturée.
+        Le client BiQuote utilise une API REST synchrone.
+        Les appels sont donc exécutés dans un thread afin
+        de ne pas bloquer la boucle asyncio.
+
+        Timeframes :
+            H4
+            H1
+            M15
+            M5
+            M1
         """
 
-        timeframes = {
-            "H4": "4h",
-            "H1": "1h",
-            "M15": "15m",
-            "M5": "5m",
-            "M1": "1m",
-        }
+        timeframes = (
+            ("H4", "H4"),
+            ("H1", "H1"),
+            ("M15", "M15"),
+            ("M5", "M5"),
+            ("M1", "M1"),
+        )
 
-        data: Dict[str, List[Any]] = {}
+        data: Dict[
+            str,
+            List[Any],
+        ] = {}
 
-        for name, timeframe in timeframes.items():
-            candles = await self.biquote.get_ohlc(
-                self.SYMBOL,
-                timeframe=timeframe,
-                limit=300,
-            )
+        for name, timeframe in timeframes:
 
-            if candles:
-                data[name] = candles
+            try:
+
+                candles = await asyncio.to_thread(
+                    self.biquote.get_candles,
+                    timeframe=timeframe,
+                    symbol=self.SYMBOL,
+                    limit=300,
+                    closed_only=True,
+                )
+
+                if candles:
+
+                    data[name] = candles
+
+                    self.logger.info(
+                        "BiQuote OHLC %s : %s bougies reçues.",
+                        name,
+                        len(candles),
+                    )
+
+            except Exception as exc:
+
+                self.logger.error(
+                    "Erreur récupération BiQuote %s : %s",
+                    name,
+                    exc,
+                )
+
+                raise
 
         return data
+
+    # ============================================================
+    # PRIX BIQUOTE
+    # ============================================================
+
+    async def _get_current_price(
+        self,
+    ) -> Optional[float]:
+        """
+        Récupère le dernier tick XAUUSD.
+
+        get_tick() est synchrone dans BiQuoteClient.
+        Il est donc exécuté avec asyncio.to_thread().
+        """
+
+        try:
+
+            tick = await asyncio.to_thread(
+                self.biquote.get_tick,
+                symbol=self.SYMBOL,
+                allow_stale=False,
+            )
+
+            price = self._extract_price(
+                tick
+            )
+
+            if price is not None:
+
+                self.current_price = price
+
+            return price
+
+        except Exception as exc:
+
+            self.logger.warning(
+                "Impossible de récupérer le tick "
+                "BiQuote %s : %s",
+                self.SYMBOL,
+                exc,
+            )
+
+            return self.current_price
 
     # ============================================================
     # CARTOGRAPHIE
@@ -167,19 +332,40 @@ class Moteur2:
         """
         Cartographie générale du marché.
 
-        La logique détaillée reste dans moteur2_marche.py.
+        La logique détaillée reste dans
+        moteur2_marche.py.
         """
 
         try:
-            return self.marche.analyser(donnees)
+
+            return self.marche.analyser(
+                donnees
+            )
+
         except TypeError:
+
             try:
+
                 return self.marche.analyser(
                     self.SYMBOL,
                     donnees,
                 )
+
             except Exception:
+
+                self.logger.exception(
+                    "Erreur cartographie Moteur 2"
+                )
+
                 return {}
+
+        except Exception:
+
+            self.logger.exception(
+                "Erreur cartographie Moteur 2"
+            )
+
+            return {}
 
     # ============================================================
     # TRAITEMENT D'UN SETUP
@@ -211,22 +397,36 @@ class Moteur2:
         # --------------------------------------------------------
 
         try:
+
             risk_plans = self.risk.analyser_setups(
                 setup,
                 zones_result,
                 donnees,
                 current_price,
             )
+
         except Exception as exc:
-            self.logger.exception("Erreur risk Engine 2")
-            result["reason"] = f"RISK_ERROR: {exc}"
+
+            self.logger.exception(
+                "Erreur risk Engine 2"
+            )
+
+            result["reason"] = (
+                f"RISK_ERROR: {exc}"
+            )
+
             return result
 
         if not risk_plans:
-            result["reason"] = "Aucun risk plan valide"
+
+            result["reason"] = (
+                "Aucun risk plan valide"
+            )
+
             return result
 
         risk_plan = risk_plans[0]
+
         result["risk"] = risk_plan
 
         # --------------------------------------------------------
@@ -234,23 +434,37 @@ class Moteur2:
         # --------------------------------------------------------
 
         try:
-            confirmation_result = self.confirmation.analyser(
-                setup,
-                donnees,
-                risk_plan,
+
+            confirmation_result = (
+                self.confirmation.analyser(
+                    setup,
+                    donnees,
+                    risk_plan,
+                )
             )
+
         except Exception as exc:
-            self.logger.exception("Erreur confirmation Engine 2")
-            result["reason"] = f"CONFIRMATION_ERROR: {exc}"
+
+            self.logger.exception(
+                "Erreur confirmation Engine 2"
+            )
+
+            result["reason"] = (
+                f"CONFIRMATION_ERROR: {exc}"
+            )
+
             return result
 
-        result["confirmation"] = confirmation_result
+        result["confirmation"] = (
+            confirmation_result
+        )
 
         # --------------------------------------------------------
         # SCORE
         # --------------------------------------------------------
 
         try:
+
             score_result = self.score.analyser(
                 setup,
                 zones=zones_result,
@@ -259,9 +473,17 @@ class Moteur2:
                 confirmation=confirmation_result,
                 risk_plan=risk_plan,
             )
+
         except Exception as exc:
-            self.logger.exception("Erreur score Engine 2")
-            result["reason"] = f"SCORE_ERROR: {exc}"
+
+            self.logger.exception(
+                "Erreur score Engine 2"
+            )
+
+            result["reason"] = (
+                f"SCORE_ERROR: {exc}"
+            )
+
             return result
 
         result["score"] = score_result
@@ -271,32 +493,58 @@ class Moteur2:
         # --------------------------------------------------------
 
         try:
-            validation_result = self.validation.analyser(
-                setup=setup,
-                risk_plan=risk_plan,
-                confirmation=confirmation_result,
-                score_result=score_result,
-                context=contexte_result,
-                confluences=confluences_result,
-            )
-        except TypeError:
-            try:
-                validation_result = self.validation.analyser(
-                    setup,
-                    risk_plan,
-                    confirmation_result,
-                    score_result,
+
+            validation_result = (
+                self.validation.analyser(
+                    setup=setup,
+                    risk_plan=risk_plan,
+                    confirmation=confirmation_result,
+                    score_result=score_result,
+                    context=contexte_result,
+                    confluences=confluences_result,
                 )
+            )
+
+        except TypeError:
+
+            try:
+
+                validation_result = (
+                    self.validation.analyser(
+                        setup,
+                        risk_plan,
+                        confirmation_result,
+                        score_result,
+                    )
+                )
+
             except Exception as exc:
-                self.logger.exception("Erreur validation Engine 2")
-                result["reason"] = f"VALIDATION_ERROR: {exc}"
+
+                self.logger.exception(
+                    "Erreur validation Engine 2"
+                )
+
+                result["reason"] = (
+                    f"VALIDATION_ERROR: {exc}"
+                )
+
                 return result
+
         except Exception as exc:
-            self.logger.exception("Erreur validation Engine 2")
-            result["reason"] = f"VALIDATION_ERROR: {exc}"
+
+            self.logger.exception(
+                "Erreur validation Engine 2"
+            )
+
+            result["reason"] = (
+                f"VALIDATION_ERROR: {exc}"
+            )
+
             return result
 
-        result["validation"] = validation_result
+        result["validation"] = (
+            validation_result
+        )
 
         validation_status = str(
             self._get(
@@ -313,88 +561,156 @@ class Moteur2:
         result["status"] = validation_status
 
         # --------------------------------------------------------
-        # SETUP VALIDE MAIS EN ATTENTE M5/M1
+        # SETUP VALIDE MAIS EN ATTENTE
         # --------------------------------------------------------
 
-        if validation_status == "VALIDATED_WAITING_CONFIRMATION":
-            result["waiting_confirmation"] = True
+        if (
+            validation_status
+            == "VALIDATED_WAITING_CONFIRMATION"
+        ):
+
+            result[
+                "waiting_confirmation"
+            ] = True
+
             result["reason"] = (
-                "Setup validé. Confirmation M5/M1 encore attendue."
+                "Setup validé. "
+                "Confirmation M5/M1 encore attendue."
             )
+
             return result
 
         # --------------------------------------------------------
-        # TOUT CE QUI N'EST PAS READY EST REFUSÉ
+        # PAS DE SIGNAL SI PAS READY
         # --------------------------------------------------------
 
-        if validation_status != "READY_FOR_SIGNAL":
+        if (
+            validation_status
+            != "READY_FOR_SIGNAL"
+        ):
+
             result["reason"] = self._get(
                 validation_result,
                 "reason",
                 "Validation refusée",
             )
+
             return result
 
         # --------------------------------------------------------
-        # ANTI-SPAM UNIQUEMENT POUR UN SIGNAL PRÊT
+        # ANTI-SPAM
         # --------------------------------------------------------
 
         try:
-            antispam_result = self.antispam.verifier(
-                setup,
-                risk_plan,
-                validation_result,
+
+            antispam_result = (
+                self.antispam.verifier(
+                    setup,
+                    risk_plan,
+                    validation_result,
+                )
             )
+
         except Exception as exc:
-            self.logger.exception("Erreur anti-spam Engine 2")
-            result["reason"] = f"ANTISPAM_ERROR: {exc}"
+
+            self.logger.exception(
+                "Erreur anti-spam Engine 2"
+            )
+
+            result["reason"] = (
+                f"ANTISPAM_ERROR: {exc}"
+            )
+
             return result
 
-        result["antispam"] = antispam_result
+        result["antispam"] = (
+            antispam_result
+        )
 
         spam_blocked = bool(
-            self._get(antispam_result, "blocked", False)
-            or self._get(antispam_result, "is_duplicate", False)
-            or self._get(antispam_result, "duplicate", False)
+            self._get(
+                antispam_result,
+                "blocked",
+                False,
+            )
+            or self._get(
+                antispam_result,
+                "is_duplicate",
+                False,
+            )
+            or self._get(
+                antispam_result,
+                "duplicate",
+                False,
+            )
         )
 
         if spam_blocked:
-            result["status"] = "REJECTED"
+
+            result["status"] = (
+                "REJECTED"
+            )
+
             result["reason"] = self._get(
                 antispam_result,
                 "reason",
                 "Signal bloqué par anti-spam",
             )
+
             return result
 
         # --------------------------------------------------------
-        # CONSTRUCTION SIGNAL
+        # CONSTRUCTION DU SIGNAL
         # --------------------------------------------------------
 
         try:
-            signal_result = self.signal.creer_signal(
-                setup=setup,
-                risk_plan=risk_plan,
-                score_result=score_result,
-                validation_result=validation_result,
-                confirmation_result=confirmation_result,
-            )
-        except TypeError:
-            try:
-                signal_result = self.signal.creer_signal(
-                    setup,
-                    risk_plan,
-                    score_result,
-                    validation_result,
-                    confirmation_result,
+
+            signal_result = (
+                self.signal.creer_signal(
+                    setup=setup,
+                    risk_plan=risk_plan,
+                    score_result=score_result,
+                    validation_result=validation_result,
+                    confirmation_result=confirmation_result,
                 )
+            )
+
+        except TypeError:
+
+            try:
+
+                signal_result = (
+                    self.signal.creer_signal(
+                        setup,
+                        risk_plan,
+                        score_result,
+                        validation_result,
+                        confirmation_result,
+                    )
+                )
+
             except Exception as exc:
-                self.logger.exception("Erreur création signal")
-                result["reason"] = f"SIGNAL_ERROR: {exc}"
+
+                self.logger.exception(
+                    "Erreur création signal"
+                )
+
+                result["reason"] = (
+                    f"SIGNAL_ERROR: {exc}"
+                )
+
                 return result
+
         except Exception as exc:
-            self.logger.exception("Erreur création signal")
-            result["reason"] = f"SIGNAL_ERROR: {exc}"
+
+            self.logger.exception(
+                "Erreur création signal"
+            )
+
+            result["reason"] = (
+                f"SIGNAL_ERROR: {exc}"
+            )
+
             return result
 
         result["signal"] = signal_result
@@ -404,17 +720,26 @@ class Moteur2:
         # --------------------------------------------------------
 
         try:
+
             self.antispam.enregistrer_signal(
                 setup,
                 risk_plan,
-                setup_id=self._get(setup, "setup_id"),
-            )
-        except Exception:
-            self.logger.exception(
-                "Impossible d'enregistrer le signal anti-spam"
+                setup_id=self._get(
+                    setup,
+                    "setup_id",
+                ),
             )
 
-        result["status"] = "READY_FOR_SIGNAL"
+        except Exception:
+
+            self.logger.exception(
+                "Impossible d'enregistrer "
+                "le signal anti-spam"
+            )
+
+        result["status"] = (
+            "READY_FOR_SIGNAL"
+        )
 
         return result
 
@@ -422,99 +747,157 @@ class Moteur2:
     # ANALYSE XAU/USD
     # ============================================================
 
-    async def analyser_xauusd(self) -> Dict[str, Any]:
+    async def analyser_xauusd(
+        self,
+    ) -> Dict[str, Any]:
+
         self.last_error = None
 
         try:
-            donnees = await self._get_candles()
+
+            # ----------------------------------------------------
+            # DONNÉES OHLC
+            # ----------------------------------------------------
+
+            donnees = (
+                await self._get_candles()
+            )
 
             if not donnees:
+
                 raise RuntimeError(
-                    "Aucune donnée OHLC reçue depuis BiQuote"
+                    "Aucune donnée OHLC reçue "
+                    "depuis BiQuote"
+                )
+
+            # Vérification minimale des timeframes
+            # indispensables au moteur 2.
+
+            required_timeframes = (
+                "H4",
+                "H1",
+                "M15",
+                "M5",
+                "M1",
+            )
+
+            missing = [
+                tf
+                for tf in required_timeframes
+                if tf not in donnees
+                or not donnees[tf]
+            ]
+
+            if missing:
+
+                raise RuntimeError(
+                    "Timeframes BiQuote manquants : "
+                    + ", ".join(missing)
                 )
 
             # ----------------------------------------------------
             # CARTOGRAPHIE
             # ----------------------------------------------------
 
-            cartographie = self._cartographier(donnees)
+            cartographie = (
+                self._cartographier(
+                    donnees
+                )
+            )
 
             # ----------------------------------------------------
             # PRIX COURANT
             # ----------------------------------------------------
 
-            current_price = self.current_price
-
-            if current_price is None:
-                try:
-                    tick = await self.biquote.get_latest_tick(
-                        self.SYMBOL
-                    )
-                    current_price = self._extract_price(tick)
-                except Exception:
-                    current_price = None
-
-            self.current_price = current_price
+            current_price = (
+                await self._get_current_price()
+            )
 
             # ----------------------------------------------------
             # ZONES
             # ----------------------------------------------------
 
-            zones_result = self.zones.analyser(
-                cartographie,
-                current_price=current_price,
+            zones_result = (
+                self.zones.analyser(
+                    cartographie,
+                    current_price=current_price,
+                )
             )
 
             # ----------------------------------------------------
             # CONTEXTE
             # ----------------------------------------------------
 
-            contexte_result = self.contexte.analyser(
-                donnees,
-                zones_result,
+            contexte_result = (
+                self.contexte.analyser(
+                    donnees,
+                    zones_result,
+                )
             )
 
             # ----------------------------------------------------
             # CONFLUENCES
             # ----------------------------------------------------
 
-            confluences_result = self.confluences.analyser(
-                donnees,
-                zones_result,
-                contexte_result,
-                cartographie,
+            confluences_result = (
+                self.confluences.analyser(
+                    donnees,
+                    zones_result,
+                    contexte_result,
+                    cartographie,
+                )
             )
 
             # ----------------------------------------------------
             # SETUPS
             # ----------------------------------------------------
 
-            setups_result = self.setups.analyser(
-                zones_result,
-                confluences_result,
-                contexte_result,
-                donnees,
+            setups_result = (
+                self.setups.analyser(
+                    zones_result,
+                    confluences_result,
+                    contexte_result,
+                    donnees,
+                )
             )
 
-            setups = []
+            setups: List[Any] = []
 
-            if isinstance(setups_result, list):
+            if isinstance(
+                setups_result,
+                list,
+            ):
+
                 setups = setups_result
-            elif isinstance(setups_result, dict):
+
+            elif isinstance(
+                setups_result,
+                dict,
+            ):
+
                 setups = (
-                    setups_result.get("setups")
-                    or setups_result.get("candidates")
-                    or setups_result.get("results")
+                    setups_result.get(
+                        "setups"
+                    )
+                    or setups_result.get(
+                        "candidates"
+                    )
+                    or setups_result.get(
+                        "results"
+                    )
                     or []
                 )
 
             # ----------------------------------------------------
-            # TRAITEMENT
+            # TRAITEMENT DES SETUPS
             # ----------------------------------------------------
 
-            processed: List[Dict[str, Any]] = []
+            processed: List[
+                Dict[str, Any]
+            ] = []
 
             for setup in setups:
+
                 item = await self.traiter_setup(
                     setup,
                     zones_result,
@@ -524,12 +907,21 @@ class Moteur2:
                     current_price,
                 )
 
-                processed.append(item)
+                processed.append(
+                    item
+                )
 
-                if item.get("status") == "READY_FOR_SIGNAL":
-                    self.last_signal = item
+                if (
+                    item.get("status")
+                    == "READY_FOR_SIGNAL"
+                ):
 
-                    # Un seul signal final par cycle d'analyse.
+                    self.last_signal = (
+                        item
+                    )
+
+                    # Un seul signal final
+                    # par cycle d'analyse.
                     break
 
             result = {
@@ -550,7 +942,10 @@ class Moteur2:
             return result
 
         except Exception as exc:
-            self.last_error = str(exc)
+
+            self.last_error = str(
+                exc
+            )
 
             self.logger.exception(
                 "Erreur analyse XAU/USD Engine 2"
@@ -571,57 +966,79 @@ class Moteur2:
     # STREAM BIQUOTE
     # ============================================================
 
-    async def _handle_tick(self, tick: Any) -> None:
-        price = self._extract_price(tick)
+    async def _handle_tick(
+        self,
+        tick: Any,
+    ) -> None:
+        """
+        Callback appelé directement par BiQuoteStream.
 
-        if price is not None:
-            self.current_price = price
+        Le stream fournit déjà les ticks normalisés.
+        Le Moteur 2 met simplement à jour son prix courant.
+
+        Aucun calcul de trading n'est effectué ici.
+        """
 
         try:
-            await self.stream.handle_tick(tick)
-        except AttributeError:
-            pass
 
-    async def start_stream(self) -> None:
+            price = self._extract_price(
+                tick
+            )
+
+            if price is not None:
+
+                self.current_price = price
+
+        except Exception:
+
+            self.logger.exception(
+                "Erreur traitement tick Moteur 2"
+            )
+
+    async def start_stream(
+        self,
+    ) -> None:
         """
         Démarre le flux temps réel BiQuote.
 
-        Le stream est continu.
-        Aucun polling du tick n'est nécessaire.
+        BiQuoteStream est déjà configuré avec :
+            symbol = XAUUSD
+            callback = _handle_tick
+
+        Il ne faut donc transmettre aucun argument
+        symbols/callback à run().
         """
 
         try:
-            if hasattr(self.stream, "start"):
-                await self.stream.start(
-                    symbols=[self.SYMBOL],
-                    callback=self._handle_tick,
-                )
-                return
 
-            if hasattr(self.stream, "run"):
-                await self.stream.run(
-                    symbols=[self.SYMBOL],
-                    callback=self._handle_tick,
-                )
-                return
+            self.logger.info(
+                "Démarrage flux temps réel BiQuote : %s",
+                self.SYMBOL,
+            )
 
-            if hasattr(self.stream, "connect"):
-                await self.stream.connect()
+            await self.stream.run()
 
-                if hasattr(self.stream, "subscribe"):
-                    await self.stream.subscribe([self.SYMBOL])
+        except asyncio.CancelledError:
+
+            self.logger.info(
+                "Flux BiQuote Moteur 2 arrêté."
+            )
+
+            raise
 
         except Exception as exc:
+
             self.logger.exception(
                 "Erreur stream BiQuote: %s",
                 exc,
             )
 
     # ============================================================
-    # BOUCLE
+    # BOUCLE PRINCIPALE
     # ============================================================
 
     async def run(self) -> None:
+
         self.running = True
 
         self.logger.info(
@@ -629,94 +1046,209 @@ class Moteur2:
             self.SYMBOL,
         )
 
+        # --------------------------------------------------------
+        # STREAM TEMPS RÉEL
+        # --------------------------------------------------------
+
         stream_task = asyncio.create_task(
             self.start_stream()
         )
 
         try:
-            # Première analyse immédiate.
+
+            # ----------------------------------------------------
+            # PREMIÈRE ANALYSE
+            # ----------------------------------------------------
+
             await self.analyser_xauusd()
 
-            # Les fréquences ci-dessous sont celles du cache.
-            # Le stream BiQuote reste continu indépendamment.
-            last_h4 = 0.0
-            last_h1 = 0.0
-            last_m15 = 0.0
-            last_m5 = 0.0
-            last_m1 = 0.0
+            # ----------------------------------------------------
+            # HORLOGES D'ANALYSE
+            # ----------------------------------------------------
 
-            loop = asyncio.get_running_loop()
+            loop = (
+                asyncio.get_running_loop()
+            )
+
+            now = loop.time()
+
+            # On initialise à now afin d'éviter
+            # plusieurs analyses immédiates.
+            last_h4 = now
+            last_h1 = now
+            last_m15 = now
+            last_m5 = now
+            last_m1 = now
+
+            # ----------------------------------------------------
+            # BOUCLE
+            # ----------------------------------------------------
 
             while self.running:
+
                 now = loop.time()
 
                 # M1
-                if now - last_m1 >= 60:
+                if (
+                    now - last_m1
+                    >= 60
+                ):
+
                     await self.analyser_xauusd()
+
                     last_m1 = now
 
                 # M5
-                if now - last_m5 >= 600:
+                if (
+                    now - last_m5
+                    >= 600
+                ):
+
                     await self.analyser_xauusd()
+
                     last_m5 = now
 
                 # M15
-                if now - last_m15 >= 1800:
+                if (
+                    now - last_m15
+                    >= 1800
+                ):
+
                     await self.analyser_xauusd()
+
                     last_m15 = now
 
                 # H1
-                if now - last_h1 >= 7200:
+                if (
+                    now - last_h1
+                    >= 7200
+                ):
+
                     await self.analyser_xauusd()
+
                     last_h1 = now
 
                 # H4
-                if now - last_h4 >= 28800:
+                if (
+                    now - last_h4
+                    >= 28800
+                ):
+
                     await self.analyser_xauusd()
+
                     last_h4 = now
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(
+                    1
+                )
+
+        except asyncio.CancelledError:
+
+            self.logger.info(
+                "Moteur 2 annulé."
+            )
+
+            raise
+
+        except Exception as exc:
+
+            self.last_error = str(
+                exc
+            )
+
+            self.logger.exception(
+                "Erreur boucle Moteur 2"
+            )
 
         finally:
+
             self.running = False
 
-            if not stream_task.done():
+            # ----------------------------------------------------
+            # ARRÊT DU STREAM
+            # ----------------------------------------------------
+
+            if (
+                not stream_task.done()
+            ):
+
                 stream_task.cancel()
 
             try:
+
                 await stream_task
+
             except asyncio.CancelledError:
+
                 pass
+
+            except Exception:
+
+                self.logger.exception(
+                    "Erreur fermeture tâche stream"
+                )
+
+            # ----------------------------------------------------
+            # FERMETURE CLIENT BIQUOTE
+            # ----------------------------------------------------
 
             try:
-                await self.biquote.close()
+
+                self.biquote.close()
+
             except Exception:
-                pass
+
+                self.logger.exception(
+                    "Erreur fermeture client BiQuote"
+                )
+
+    # ============================================================
+    # ARRÊT
+    # ============================================================
 
     async def stop(self) -> None:
+
         self.running = False
 
         try:
-            if hasattr(self.stream, "stop"):
+
+            if hasattr(
+                self.stream,
+                "stop",
+            ):
+
                 result = self.stream.stop()
 
-                if asyncio.iscoroutine(result):
+                if asyncio.iscoroutine(
+                    result
+                ):
+
                     await result
+
         except Exception:
+
             self.logger.exception(
                 "Erreur arrêt stream BiQuote"
             )
 
         try:
-            await self.biquote.close()
+
+            self.biquote.close()
+
         except Exception:
-            pass
+
+            self.logger.exception(
+                "Erreur fermeture client BiQuote"
+            )
 
     # ============================================================
-    # STATUS
+    # STATUT
     # ============================================================
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(
+        self,
+    ) -> Dict[str, Any]:
+
         return {
             "engine": "MOTEUR_2",
             "symbol": self.SYMBOL,
@@ -729,19 +1261,34 @@ class Moteur2:
         }
 
 
+# ============================================================
+# TEST AUTONOME
+# ============================================================
+
 async def main() -> None:
+
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format=(
+            "%(asctime)s | "
+            "%(levelname)s | "
+            "%(name)s | "
+            "%(message)s"
+        ),
     )
 
     moteur = Moteur2()
 
     try:
+
         await moteur.run()
+
     except KeyboardInterrupt:
+
         pass
+
     finally:
+
         await moteur.stop()
 
 
