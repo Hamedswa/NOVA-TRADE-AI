@@ -1,248 +1,180 @@
-"""
-NOVA TRADE AI - ENGINE 2
-moteur2_validation.py
-
-Validation finale déterministe du moteur 2.
-
-Règles :
-- aucun setup réel -> rejet
-- direction invalide -> rejet
-- plan de risque invalide -> rejet
-- géométrie Entry/SL/TP invalide -> rejet
-- RR < 2 -> rejet
-- contradiction majeure -> rejet
-- M5/M1 non déclenchés ne rejettent PAS automatiquement un setup valide
-- le score mesure la qualité mais ne remplace pas les règles bloquantes
-"""
-
+# moteur2_validation.py
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-
-
-MIN_RR = 2.0
-
-VALID_DIRECTIONS = {
-    "BUY",
-    "SELL",
-}
 
 
 @dataclass
 class ValidationResult:
-    validated: bool
     status: str
-    reason: str
-    blockers: List[str]
-    warnings: List[str]
-
-    setup_id: str
-    direction: str
-    rr: Optional[float]
-
-    confirmation_status: str
-
-    metadata: Dict[str, Any]
+    valid: bool
+    reason: str = ""
+    blockers: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class Moteur2Validation:
+    """
+    Validation déterministe finale du Moteur 2.
 
-    def __init__(
-        self,
-        min_rr: float = MIN_RR,
-    ) -> None:
+    La confirmation M5/M1 n'est PAS un bloqueur absolu.
 
-        self.min_rr = float(min_rr)
+    États possibles :
+        REJECTED
+        VALIDATED_WAITING_CONFIRMATION
+        READY_FOR_SIGNAL
+    """
 
-    # ============================================================
-    # OUTILS
-    # ============================================================
+    MIN_RR = 2.0
 
     @staticmethod
     def _get(
-        data: Any,
+        obj: Any,
         key: str,
         default: Any = None,
     ) -> Any:
-
-        if data is None:
+        if obj is None:
             return default
 
-        if isinstance(data, dict):
-            return data.get(key, default)
+        if isinstance(obj, dict):
+            return obj.get(key, default)
 
-        return getattr(
-            data,
-            key,
-            default,
-        )
+        return getattr(obj, key, default)
 
     @staticmethod
     def _float(
         value: Any,
+        default: Optional[float] = None,
     ) -> Optional[float]:
-
         try:
-
             if value is None:
-                return None
-
+                return default
             return float(value)
+        except (TypeError, ValueError):
+            return default
 
-        except (
-            TypeError,
-            ValueError,
-        ):
+    def _direction(self, setup: Any) -> str:
+        raw = str(
+            self._get(
+                setup,
+                "direction",
+                self._get(
+                    setup,
+                    "bias",
+                    "",
+                ),
+            )
+        ).upper().strip()
 
-            return None
-
-    # ============================================================
-    # DIRECTION
-    # ============================================================
-
-    @classmethod
-    def _normalize_direction(
-        cls,
-        value: Any,
-    ) -> str:
-
-        value = str(
-            value or ""
-        ).strip().upper()
-
-        aliases = {
-
+        mapping = {
             "BUY": "BUY",
             "LONG": "BUY",
-
             "HAUSSIER": "BUY",
-            "HAUSSIERE": "BUY",
-            "HAUSSIÈRE": "BUY",
-
             "BULLISH": "BUY",
-
+            "ACHAT": "BUY",
             "SELL": "SELL",
             "SHORT": "SELL",
-
             "BAISSIER": "SELL",
-            "BAISSIERE": "SELL",
-            "BAISSIÈRE": "SELL",
-
             "BEARISH": "SELL",
+            "VENTE": "SELL",
         }
 
-        return aliases.get(
-            value,
-            value,
-        )
+        return mapping.get(raw, raw)
 
-    def _extract_direction(
-        self,
-        setup: Any,
-        risk_plan: Any,
-    ) -> str:
-
-        direction = self._get(
-            setup,
-            "direction",
-        )
-
-        if direction is None:
-
-            direction = self._get(
-                risk_plan,
-                "direction",
+    def _extract_rr(self, risk_plan: Any) -> Optional[float]:
+        for key in (
+            "rr",
+            "primary_rr",
+            "rr_tp1",
+        ):
+            value = self._float(
+                self._get(risk_plan, key)
             )
 
-        return self._normalize_direction(
-            direction
+            if value is not None:
+                return value
+
+        return None
+
+    def _risk_valid(self, risk_plan: Any) -> bool:
+        explicit_valid = self._get(
+            risk_plan,
+            "valid",
+            None,
         )
 
-    # ============================================================
-    # GÉOMÉTRIE
-    # ============================================================
+        if explicit_valid is False:
+            return False
 
-    def _validate_geometry(
+        geometry_valid = self._get(
+            risk_plan,
+            "geometry_valid",
+            None,
+        )
+
+        if geometry_valid is False:
+            return False
+
+        rr_valid = self._get(
+            risk_plan,
+            "rr_valid",
+            None,
+        )
+
+        if rr_valid is False:
+            return False
+
+        return True
+
+    def _geometry_valid(
         self,
         direction: str,
         risk_plan: Any,
-    ) -> tuple[bool, str]:
+    ) -> bool:
 
         entry = self._float(
-            self._get(
-                risk_plan,
-                "entry",
-            )
+            self._get(risk_plan, "entry")
         )
 
         sl = self._float(
-            self._get(
-                risk_plan,
-                "sl",
-            )
+            self._get(risk_plan, "sl")
         )
 
         tp1 = self._float(
-            self._get(
-                risk_plan,
-                "tp1",
-            )
+            self._get(risk_plan, "tp1")
         )
 
         tp2 = self._float(
-            self._get(
-                risk_plan,
-                "tp2",
-            )
+            self._get(risk_plan, "tp2")
         )
 
         tp3 = self._float(
-            self._get(
-                risk_plan,
-                "tp3",
-            )
+            self._get(risk_plan, "tp3")
         )
 
-        if None in (
+        values = (
             entry,
             sl,
             tp1,
             tp2,
             tp3,
-        ):
+        )
 
-            return (
-                False,
-                "Entry/SL/TP incomplets.",
-            )
-
-        if min(
-            entry,
-            sl,
-            tp1,
-            tp2,
-            tp3,
-        ) <= 0:
-
-            return (
-                False,
-                "Entry/SL/TP doivent être positifs.",
-            )
+        if any(value is None for value in values):
+            return False
 
         if direction == "BUY":
-
-            valid = (
-                sl
-                < entry
+            return (
+                sl < entry
                 < tp1
                 < tp2
                 < tp3
             )
 
-        elif direction == "SELL":
-
-            valid = (
+        if direction == "SELL":
+            return (
                 tp3
                 < tp2
                 < tp1
@@ -250,225 +182,52 @@ class Moteur2Validation:
                 < sl
             )
 
-        else:
+        return False
 
-            return (
-                False,
-                "Direction invalide.",
-            )
-
-        if not valid:
-
-            return (
-                False,
-                "Géométrie Entry/SL/TP invalide.",
-            )
-
-        return (
-            True,
-            "Géométrie valide.",
-        )
-
-    # ============================================================
-    # VALIDATION PRINCIPALE
-    # ============================================================
-
-    def valider(
+    def _major_contradiction(
         self,
         setup: Any,
-        risk_plan: Any,
-        confirmation: Any = None,
-        score_result: Any = None,
-        contexte: Any = None,
-        confluences: Any = None,
-    ) -> ValidationResult:
+        context: Any,
+        confluences: Any,
+    ) -> bool:
 
-        setup_id = str(
-            self._get(
-                setup,
-                "setup_id",
-            )
-            or self._get(
-                setup,
-                "id",
-            )
-            or "SETUP"
-        )
+        setup_direction = self._direction(setup)
 
-        direction = self._extract_direction(
-            setup,
-            risk_plan,
-        )
+        if setup_direction not in ("BUY", "SELL"):
+            return True
 
-        blockers: List[str] = []
-        warnings: List[str] = []
-
-        # --------------------------------------------------------
-        # SETUP
-        # --------------------------------------------------------
-
-        setup_type = str(
-            self._get(
-                setup,
-                "setup_type",
-                "",
-            )
-        ).strip().upper()
-
-        if (
-            not setup
-            or setup_type in {
-                "",
-                "NONE",
-                "NO_SETUP",
-            }
+        # Une neutralité sur H1/M15 n'est pas une contradiction.
+        # Le moteur ne rejette que les contradictions explicites.
+        for source in (
+            context,
+            confluences,
         ):
-
-            blockers.append(
-                "Aucun setup réel détecté."
+            contradiction = self._get(
+                source,
+                "major_contradiction",
+                None,
             )
 
-        # --------------------------------------------------------
-        # DIRECTION
-        # --------------------------------------------------------
+            if contradiction is True:
+                return True
 
-        if direction not in VALID_DIRECTIONS:
-
-            blockers.append(
-                "Direction absente ou invalide."
+            contradiction = self._get(
+                source,
+                "contradiction",
+                None,
             )
 
-        # --------------------------------------------------------
-        # RISK PLAN
-        # --------------------------------------------------------
+            if isinstance(contradiction, bool) and contradiction:
+                return True
 
-        risk_valid = bool(
-            self._get(
-                risk_plan,
-                "valid",
-                False,
-            )
-        )
+        return False
 
-        if not risk_valid:
+    def _confirmation_triggered(
+        self,
+        confirmation: Any,
+    ) -> bool:
 
-            blockers.append(
-                "Plan de risque invalide."
-            )
-
-        # --------------------------------------------------------
-        # GÉOMÉTRIE
-        # --------------------------------------------------------
-
-        geometry_ok, geometry_reason = (
-            self._validate_geometry(
-                direction,
-                risk_plan,
-            )
-        )
-
-        if not geometry_ok:
-
-            blockers.append(
-                geometry_reason
-            )
-
-        # --------------------------------------------------------
-        # RR
-        # --------------------------------------------------------
-
-        rr = self._float(
-            self._get(
-                risk_plan,
-                "rr",
-            )
-        )
-
-        if rr is None:
-
-            rr = self._float(
-                self._get(
-                    risk_plan,
-                    "primary_rr",
-                )
-            )
-
-        if rr is None:
-
-            rr = self._float(
-                self._get(
-                    risk_plan,
-                    "rr_tp1",
-                )
-            )
-
-        if rr is None:
-
-            blockers.append(
-                "RR primaire absent."
-            )
-
-        elif rr < self.min_rr:
-
-            blockers.append(
-                f"RR {rr:.2f} inférieur "
-                f"au minimum {self.min_rr:.2f}."
-            )
-
-        # --------------------------------------------------------
-        # CONTRADICTION MAJEURE
-        # --------------------------------------------------------
-
-        global_context = self._get(
-            contexte,
-            "global",
-            {},
-        )
-
-        global_direction = str(
-            self._get(
-                global_context,
-                "direction",
-                "",
-            )
-        ).strip().upper()
-
-        normalized_global = (
-            self._normalize_direction(
-                global_direction
-            )
-        )
-
-        if (
-            normalized_global
-            in VALID_DIRECTIONS
-            and direction
-            in VALID_DIRECTIONS
-            and normalized_global != direction
-        ):
-
-            blockers.append(
-                "Contradiction majeure entre "
-                "le contexte global et le setup."
-            )
-
-        # --------------------------------------------------------
-        # CONFIRMATION M5/M1
-        # --------------------------------------------------------
-
-        confirmation_status = str(
-            self._get(
-                confirmation,
-                "confirmation_status",
-                self._get(
-                    confirmation,
-                    "status",
-                    "UNKNOWN",
-                ),
-            )
-        ).upper()
-
-        entry_triggered = bool(
+        return bool(
             self._get(
                 confirmation,
                 "entry_triggered",
@@ -476,250 +235,163 @@ class Moteur2Validation:
             )
         )
 
-        if not entry_triggered:
+    def analyser(
+        self,
+        setup: Any = None,
+        risk_plan: Any = None,
+        confirmation: Any = None,
+        score_result: Any = None,
+        context: Any = None,
+        confluences: Any = None,
+    ) -> ValidationResult:
 
-            warnings.append(
-                "Setup valide mais déclenchement "
-                "M5/M1 non confirmé."
-            )
+        blockers: List[str] = []
+        warnings: List[str] = []
 
-        # --------------------------------------------------------
-        # SCORE
-        # --------------------------------------------------------
+        # ========================================================
+        # 1. SETUP
+        # ========================================================
 
-        score = self._float(
-            self._get(
-                score_result,
-                "score",
-            )
-        )
+        if setup is None:
+            blockers.append("NO_SETUP")
 
-        quality = str(
-            self._get(
-                score_result,
-                "quality",
-                "",
-            )
-        )
+        direction = self._direction(setup)
 
-        if (
-            score is not None
-            and score < 40
+        # ========================================================
+        # 2. DIRECTION
+        # ========================================================
+
+        if direction not in ("BUY", "SELL"):
+            blockers.append("INVALID_DIRECTION")
+
+        # ========================================================
+        # 3. RISK PLAN
+        # ========================================================
+
+        if risk_plan is None:
+            blockers.append("NO_RISK_PLAN")
+        else:
+            if not self._risk_valid(risk_plan):
+                blockers.append("INVALID_RISK_PLAN")
+
+        # ========================================================
+        # 4. GEOMETRIE
+        # ========================================================
+
+        if risk_plan is not None and direction in (
+            "BUY",
+            "SELL",
         ):
+            if not self._geometry_valid(
+                direction,
+                risk_plan,
+            ):
+                blockers.append("INVALID_GEOMETRY")
 
-            warnings.append(
-                f"Qualité faible : "
-                f"{score:.0f}/100 ({quality or 'E'})."
+        # ========================================================
+        # 5. RR
+        # ========================================================
+
+        rr = self._extract_rr(risk_plan)
+
+        if rr is None:
+            blockers.append("RR_MISSING")
+        elif rr < self.MIN_RR:
+            blockers.append(
+                f"RR_BELOW_MINIMUM_{self.MIN_RR:.1f}"
             )
 
-        # --------------------------------------------------------
-        # REJET
-        # --------------------------------------------------------
+        # ========================================================
+        # 6. CONTRADICTION MAJEURE
+        # ========================================================
+
+        if self._major_contradiction(
+            setup,
+            context,
+            confluences,
+        ):
+            blockers.append("MAJOR_CONTRADICTION")
+
+        # ========================================================
+        # 7. M5/M1
+        # ========================================================
+
+        confirmation_triggered = (
+            self._confirmation_triggered(
+                confirmation
+            )
+        )
+
+        if not confirmation_triggered:
+            warnings.append(
+                "M5_M1_CONFIRMATION_WAITING"
+            )
+
+        # ========================================================
+        # 8. DECISION
+        # ========================================================
 
         if blockers:
-
             return ValidationResult(
-
-                validated=False,
-
                 status="REJECTED",
-
-                reason=" | ".join(
-                    blockers
-                ),
-
+                valid=False,
+                reason="; ".join(blockers),
                 blockers=blockers,
-
                 warnings=warnings,
-
-                setup_id=setup_id,
-
-                direction=direction,
-
-                rr=rr,
-
-                confirmation_status=(
-                    confirmation_status
-                ),
-
                 metadata={
-
-                    "geometry": (
-                        geometry_reason
+                    "rr": rr,
+                    "direction": direction,
+                    "confirmation_triggered": (
+                        confirmation_triggered
                     ),
-
-                    "entry_triggered": (
-                        entry_triggered
-                    ),
-
-                    "score": score,
-
-                    "quality": quality,
                 },
             )
 
-        # --------------------------------------------------------
-        # VALIDÉ
-        # --------------------------------------------------------
-
-        if entry_triggered:
-
-            status = (
-                "READY_FOR_SIGNAL"
-            )
-
-            reason = (
-                "Setup validé et "
-                "déclenchement M5/M1 confirmé."
-            )
-
-        else:
-
-            status = (
-                "VALIDATED_WAITING_CONFIRMATION"
-            )
-
-            reason = (
-                "Setup validé ; attente "
-                "du déclenchement M5/M1."
+        if not confirmation_triggered:
+            return ValidationResult(
+                status="VALIDATED_WAITING_CONFIRMATION",
+                valid=True,
+                reason=(
+                    "Setup valide. "
+                    "Confirmation M5/M1 attendue."
+                ),
+                blockers=[],
+                warnings=warnings,
+                metadata={
+                    "rr": rr,
+                    "direction": direction,
+                    "confirmation_triggered": False,
+                },
             )
 
         return ValidationResult(
-
-            validated=True,
-
-            status=status,
-
-            reason=reason,
-
+            status="READY_FOR_SIGNAL",
+            valid=True,
+            reason="Setup validé et confirmation déclenchée.",
             blockers=[],
-
             warnings=warnings,
-
-            setup_id=setup_id,
-
-            direction=direction,
-
-            rr=rr,
-
-            confirmation_status=(
-                confirmation_status
-            ),
-
             metadata={
-
-                "geometry": (
-                    geometry_reason
-                ),
-
-                "entry_triggered": (
-                    entry_triggered
-                ),
-
-                "score": score,
-
-                "quality": quality,
+                "rr": rr,
+                "direction": direction,
+                "confirmation_triggered": True,
             },
         )
 
-    # ============================================================
-    # ALIAS
-    # ============================================================
-
-    def verifier(
-        self,
-        *args: Any,
-        **kwargs: Any,
-    ) -> ValidationResult:
-
-        return self.valider(
-            *args,
-            **kwargs,
-        )
-
-    # ============================================================
-    # DICTIONNAIRE
-    # ============================================================
-
-    @staticmethod
-    def to_dict(
-        result: ValidationResult,
-    ) -> Dict[str, Any]:
-
-        return asdict(
-            result
-        )
-
-
-# ================================================================
-# FONCTION PUBLIQUE
-# ================================================================
 
 def valider(
-    setup: Any,
-    risk_plan: Any,
+    setup: Any = None,
+    risk_plan: Any = None,
     confirmation: Any = None,
     score_result: Any = None,
-    contexte: Any = None,
+    context: Any = None,
     confluences: Any = None,
-    min_rr: float = MIN_RR,
-) -> Dict[str, Any]:
+) -> ValidationResult:
 
-    moteur = Moteur2Validation(
-        min_rr=min_rr
-    )
-
-    result = moteur.valider(
+    return Moteur2Validation().analyser(
         setup=setup,
         risk_plan=risk_plan,
         confirmation=confirmation,
         score_result=score_result,
-        contexte=contexte,
+        context=context,
         confluences=confluences,
     )
-
-    return moteur.to_dict(
-        result
-    )
-
-
-# ================================================================
-# TEST LOCAL
-# ================================================================
-
-if __name__ == "__main__":
-
-    result = valider(
-
-        setup={
-            "setup_id": "M2-TEST-001",
-            "symbol": "XAUUSD",
-            "direction": "BUY",
-            "setup_type": "CONTINUATION",
-        },
-
-        risk_plan={
-            "direction": "BUY",
-            "entry": 4600.0,
-            "sl": 4590.0,
-            "tp1": 4620.0,
-            "tp2": 4630.0,
-            "tp3": 4640.0,
-            "primary_rr": 2.0,
-            "valid": True,
-        },
-
-        confirmation={
-            "confirmation_status": (
-                "WAITING_CONFIRMATION"
-            ),
-            "entry_triggered": False,
-        },
-
-        score_result={
-            "score": 72,
-            "quality": "B",
-        },
-    )
-
-    print(result)
