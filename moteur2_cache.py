@@ -1,44 +1,72 @@
 """
 NOVA TRADE AI - Moteur 2
 moteur2_cache.py
-
-Gestion centralisée du cache de données BiQuote pour XAU/USD.
-
+Cache centralisé des données BiQuote pour le Moteur 2.
+Actifs :
+    XAUUSD
+    BTCUSD
+    EURUSD
+    GBPUSD
 Timeframes :
-    H4  -> rafraîchissement toutes les 8 heures
-    H1  -> rafraîchissement toutes les 2 heures
-    M15 -> rafraîchissement toutes les 30 minutes
-    M5  -> rafraîchissement toutes les 10 minutes
-    M1  -> rafraîchissement toutes les 1 minute
-
+    H4
+    H1
+    M15
+    M5
+    M1
+Architecture :
+    BiQuote REST
+         |
+         v
+    bougies clôturées
+         |
+         v
+    Moteur2Cache
+         ^
+         |
+    BiQuote SignalR
+         |
+         v
+    ticks temps réel
 Important :
     - BiQuote est la seule source du Moteur 2.
-    - Les ticks SignalR mettent à jour le prix temps réel.
-    - Un tick temps réel n'est PAS considéré comme une bougie M1 clôturée.
-    - Les bougies utilisées pour l'analyse peuvent être limitées
-      aux bougies clôturées.
+    - Les ticks SignalR servent au prix temps réel.
+    - Un tick temps réel n'est jamais transformé en bougie.
+    - Les bougies d'analyse sont récupérées séparément.
+    - Le cache est isolé par symbole.
+    - Ce module ne contient aucune logique de trading.
 """
-
 from __future__ import annotations
-
 import asyncio
 import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
-from biquote_client import BiQuoteClient, Candle, Tick
-
-
+from biquote_client import (
+    BiQuoteClient,
+    Candle,
+    Tick,
+)
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-SYMBOL = "XAUUSD"
-
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+SUPPORTED_SYMBOLS = (
+    "XAUUSD",
+    "BTCUSD",
+    "EURUSD",
+    "GBPUSD",
+)
+SUPPORTED_TIMEFRAMES = (
+    "H4",
+    "H1",
+    "M15",
+    "M5",
+    "M1",
+)
+# Rafraîchissement maximum autorisé.
+#
+# Ce sont des fenêtres de rafraîchissement du cache,
+# pas des règles de trading.
 TIMEFRAME_REFRESH_SECONDS = {
     "H4": 8 * 60 * 60,
     "H1": 2 * 60 * 60,
@@ -46,8 +74,7 @@ TIMEFRAME_REFRESH_SECONDS = {
     "M5": 10 * 60,
     "M1": 60,
 }
-
-# Nombre de bougies conservées par timeframe.
+# Nombre maximum de bougies conservées.
 DEFAULT_LIMIT = {
     "H4": 300,
     "H1": 500,
@@ -55,466 +82,868 @@ DEFAULT_LIMIT = {
     "M5": 500,
     "M1": 500,
 }
-
-
-# ---------------------------------------------------------------------------
-# Structures internes
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# STRUCTURES INTERNES
+# ============================================================================
 @dataclass
 class TimeframeCache:
     """
-    État du cache d'un timeframe.
+    État du cache d'un timeframe pour un symbole.
     """
-
     timeframe: str
     candles: List[Candle]
     last_refresh: float = 0.0
     refreshing: bool = False
     error: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Cache principal
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# CACHE PRINCIPAL
+# ============================================================================
 class Moteur2Cache:
     """
     Cache centralisé des données BiQuote du Moteur 2.
-
-    Il ne contient aucune logique de trading.
-
-    Son rôle est uniquement de fournir des données propres
-    et disponibles aux autres modules du Moteur 2.
+    Organisation interne :
+        symbol
+          |
+          +-- H4
+          +-- H1
+          +-- M15
+          +-- M5
+          +-- M1
+    Exemple :
+        XAUUSD -> H4/H1/M15/M5/M1
+        BTCUSD -> H4/H1/M15/M5/M1
+        EURUSD -> H4/H1/M15/M5/M1
+        GBPUSD -> H4/H1/M15/M5/M1
+    Ce module :
+        - stocke les bougies
+        - stocke les derniers ticks
+        - gère la fraîcheur
+        - gère les refresh
+        - fournit les données aux autres modules
+    Ce module ne :
+        - détecte pas de setup
+        - calcule pas d'Entry
+        - calcule pas de SL/TP
+        - calcule pas de RR
+        - ne valide aucun signal
+        - ne bloque aucun signal
     """
-
     def __init__(
         self,
         client: Optional[BiQuoteClient] = None,
-        symbol: str = SYMBOL,
+        symbols: Optional[
+            list[str] | tuple[str, ...]
+        ] = None,
     ):
         self.client = client or BiQuoteClient()
-
-        self.symbol = symbol.upper()
-
-        self._cache: Dict[str, TimeframeCache] = {
-            timeframe: TimeframeCache(
-                timeframe=timeframe,
-                candles=[],
+        # ------------------------------------------------------------------
+        # Symboles
+        # ------------------------------------------------------------------
+        if symbols is None:
+            symbols = SUPPORTED_SYMBOLS
+        normalized_symbols: List[str] = []
+        for symbol in symbols:
+            normalized = self._normalize_symbol(
+                symbol
             )
-            for timeframe in TIMEFRAME_REFRESH_SECONDS
+            if not normalized:
+                continue
+            if normalized not in SUPPORTED_SYMBOLS:
+                logger.warning(
+                    "Symbole ignoré dans le cache : %s",
+                    symbol,
+                )
+                continue
+            if normalized not in normalized_symbols:
+                normalized_symbols.append(
+                    normalized
+                )
+        if not normalized_symbols:
+            raise ValueError(
+                "Aucun symbole valide pour Moteur2Cache."
+            )
+        self.symbols = tuple(
+            normalized_symbols
+        )
+        # ------------------------------------------------------------------
+        # Cache des bougies
+        #
+        # _cache["XAUUSD"]["H4"]
+        # _cache["BTCUSD"]["M1"]
+        # etc.
+        # ------------------------------------------------------------------
+        self._cache: Dict[
+            str,
+            Dict[str, TimeframeCache],
+        ] = {
+            symbol: {
+                timeframe: TimeframeCache(
+                    timeframe=timeframe,
+                    candles=[],
+                )
+                for timeframe in SUPPORTED_TIMEFRAMES
+            }
+            for symbol in self.symbols
         }
-
-        # Dernier tick reçu par SignalR.
-        self._latest_tick: Optional[Tick] = None
-
-        # Verrou pour éviter deux refresh simultanés
-        # du même timeframe.
-        self._locks: Dict[str, asyncio.Lock] = {
-            timeframe: asyncio.Lock()
-            for timeframe in TIMEFRAME_REFRESH_SECONDS
+        # ------------------------------------------------------------------
+        # Dernier tick par symbole
+        # ------------------------------------------------------------------
+        self._latest_ticks: Dict[
+            str,
+            Tick,
+        ] = {}
+        # ------------------------------------------------------------------
+        # Lock indépendant pour chaque
+        # symbole + timeframe.
+        # ------------------------------------------------------------------
+        self._locks: Dict[
+            str,
+            Dict[str, asyncio.Lock],
+        ] = {
+            symbol: {
+                timeframe: asyncio.Lock()
+                for timeframe in SUPPORTED_TIMEFRAMES
+            }
+            for symbol in self.symbols
         }
-
-    # -----------------------------------------------------------------------
+    # =========================================================================
+    # SYMBOL HELPERS
+    # =========================================================================
+    @staticmethod
+    def _normalize_symbol(
+        symbol: Any,
+    ) -> str:
+        """
+        Normalise un symbole.
+        Exemples :
+            XAU/USD -> XAUUSD
+            BTC-USD -> BTCUSD
+            EUR USD -> EURUSD
+        """
+        if not isinstance(symbol, str):
+            return ""
+        return (
+            symbol.upper()
+            .replace("/", "")
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+            .strip()
+        )
+    def _validate_symbol(
+        self,
+        symbol: str,
+    ) -> str:
+        """
+        Valide et normalise un symbole.
+        """
+        normalized = self._normalize_symbol(
+            symbol
+        )
+        if normalized not in self.symbols:
+            raise ValueError(
+                f"Symbole non disponible dans le cache : "
+                f"{symbol}"
+            )
+        return normalized
+    @staticmethod
+    def _validate_timeframe(
+        timeframe: str,
+    ) -> str:
+        """
+        Valide et normalise un timeframe.
+        """
+        normalized = str(
+            timeframe
+        ).upper()
+        if normalized not in SUPPORTED_TIMEFRAMES:
+            raise ValueError(
+                f"Timeframe non supporté : "
+                f"{timeframe}"
+            )
+        return normalized
+    # =========================================================================
     # TICK TEMPS RÉEL
-    # -----------------------------------------------------------------------
-
-    def update_tick(self, tick: Any) -> None:
+    # =========================================================================
+    def update_tick(
+        self,
+        tick: Any,
+    ) -> None:
         """
-        Met à jour le dernier prix temps réel.
-
-        Cette méthode peut recevoir :
-            - un objet Tick provenant de biquote_client.py
-            - un dictionnaire provenant de biquote_stream.py
+        Met à jour le dernier tick d'un symbole.
+        Peut recevoir :
+            - Tick
+            - dict provenant de biquote_stream.py
+        Le tick est stocké uniquement pour son symbole.
         """
-
         try:
-            normalized = self._normalize_tick(tick)
-
+            normalized = self._normalize_tick(
+                tick
+            )
             if normalized is None:
                 return
-
-            if normalized.symbol.upper() != self.symbol:
+            symbol = self._normalize_symbol(
+                normalized.symbol
+            )
+            if symbol not in self.symbols:
+                logger.debug(
+                    "Tick ignoré : symbole non configuré %s",
+                    symbol,
+                )
                 return
-
-            self._latest_tick = normalized
-
+            self._latest_ticks[
+                symbol
+            ] = normalized
         except Exception:
             logger.exception(
-                "Erreur lors de la mise à jour du tick Moteur 2."
+                "Erreur mise à jour tick Moteur 2."
             )
-
-    def get_latest_tick(self) -> Optional[Tick]:
+    def get_latest_tick(
+        self,
+        symbol: str,
+    ) -> Optional[Tick]:
         """
-        Retourne le dernier tick connu.
+        Retourne le dernier tick connu d'un symbole.
         """
-        return self._latest_tick
-
-    def get_current_price(self) -> Optional[float]:
+        normalized = self._validate_symbol(
+            symbol
+        )
+        return self._latest_ticks.get(
+            normalized
+        )
+    def get_current_price(
+        self,
+        symbol: str,
+    ) -> Optional[float]:
         """
-        Retourne le prix actuel basé sur le mid BiQuote.
+        Retourne le dernier prix mid connu
+        pour le symbole demandé.
         """
-
-        if self._latest_tick is None:
+        tick = self.get_latest_tick(
+            symbol
+        )
+        if tick is None:
             return None
-
-        return self._latest_tick.mid
-
-    # -----------------------------------------------------------------------
+        return tick.mid
+    def get_latest_ticks(
+        self,
+    ) -> Dict[str, Tick]:
+        """
+        Retourne les derniers ticks connus.
+        Une copie du dictionnaire est retournée.
+        """
+        return dict(
+            self._latest_ticks
+        )
+    # =========================================================================
     # BOUGIES
-    # -----------------------------------------------------------------------
-
+    # =========================================================================
     async def refresh(
         self,
+        symbol: str,
         timeframe: str,
         force: bool = False,
     ) -> List[Candle]:
         """
-        Rafraîchit un timeframe si nécessaire.
-
-        force=True permet de forcer une nouvelle récupération.
-        """
-
-        timeframe = timeframe.upper()
-
-        if timeframe not in TIMEFRAME_REFRESH_SECONDS:
-            raise ValueError(
-                f"Timeframe non supporté : {timeframe}"
+        Rafraîchit un timeframe pour un symbole.
+        IMPORTANT :
+        Le nouveau biquote_client.py utilise :
+            get_candles(
+                timeframe,
+                symbol,
+                limit,
+                closed_only
             )
-
-        cache = self._cache[timeframe]
-
-        if not force and not self._needs_refresh(timeframe):
-            return cache.candles
-
-        lock = self._locks[timeframe]
-
+        Le cache respecte donc cet ordre.
+        """
+        symbol = self._validate_symbol(
+            symbol
+        )
+        timeframe = self._validate_timeframe(
+            timeframe
+        )
+        cache = self._cache[
+            symbol
+        ][
+            timeframe
+        ]
+        # ------------------------------------------------------------------
+        # Pas besoin de réseau si les données sont
+        # encore suffisamment fraîches.
+        # ------------------------------------------------------------------
+        if (
+            not force
+            and not self._needs_refresh(
+                symbol,
+                timeframe,
+            )
+        ):
+            return list(
+                cache.candles
+            )
+        lock = self._locks[
+            symbol
+        ][
+            timeframe
+        ]
         async with lock:
-
-            # Un autre appel a peut-être déjà rafraîchi
-            # les données pendant l'attente du verrou.
-            if not force and not self._needs_refresh(timeframe):
-                return cache.candles
-
+            # Un autre appel a peut-être terminé
+            # le refresh pendant l'attente.
+            if (
+                not force
+                and not self._needs_refresh(
+                    symbol,
+                    timeframe,
+                )
+            ):
+                return list(
+                    cache.candles
+                )
             cache.refreshing = True
             cache.error = None
-
             try:
                 logger.info(
                     "Moteur 2 | récupération %s %s",
-                    self.symbol,
+                    symbol,
                     timeframe,
                 )
-
+                # ------------------------------------------------------------------
+                # BiQuote REST
+                #
+                # closed_only=True
+                #
+                # Les bougies utilisées par le moteur
+                # sont donc explicitement demandées comme
+                # bougies clôturées.
+                # ------------------------------------------------------------------
                 candles = await asyncio.to_thread(
                     self.client.get_candles,
-                    self.symbol,
                     timeframe,
+                    symbol,
                     DEFAULT_LIMIT[timeframe],
                     True,
                 )
-
                 if not candles:
                     raise RuntimeError(
-                        f"Aucune bougie reçue pour {timeframe}"
+                        f"Aucune bougie reçue pour "
+                        f"{symbol} {timeframe}"
                     )
-
-                cache.candles = list(candles)
+                # ------------------------------------------------------------------
+                # Protection supplémentaire.
+                #
+                # On ne stocke que des objets Candle valides.
+                # ------------------------------------------------------------------
+                valid_candles = [
+                    candle
+                    for candle in candles
+                    if isinstance(
+                        candle,
+                        Candle,
+                    )
+                ]
+                if not valid_candles:
+                    raise RuntimeError(
+                        f"Aucune bougie Candle valide "
+                        f"pour {symbol} {timeframe}"
+                    )
+                cache.candles = list(
+                    valid_candles
+                )
                 cache.last_refresh = time.time()
                 cache.error = None
-
                 logger.info(
-                    "Moteur 2 | %s : %d bougies chargées",
+                    "Moteur 2 | %s %s : %d bougies chargées",
+                    symbol,
                     timeframe,
                     len(cache.candles),
                 )
-
-                return cache.candles
-
+                return list(
+                    cache.candles
+                )
             except Exception as exc:
-                cache.error = str(exc)
-
+                cache.error = str(
+                    exc
+                )
                 logger.exception(
                     "Erreur récupération %s %s",
-                    self.symbol,
+                    symbol,
                     timeframe,
                 )
-
-                # Si nous possédons déjà des données valides,
-                # on les conserve.
+                # ------------------------------------------------------------------
+                # IMPORTANT :
+                #
+                # En cas d'erreur réseau temporaire,
+                # les anciennes données restent disponibles.
+                #
+                # Mais leur état d'erreur est exposé dans
+                # get_status().
+                # ------------------------------------------------------------------
                 if cache.candles:
-                    return cache.candles
-
+                    return list(
+                        cache.candles
+                    )
                 raise
-
             finally:
                 cache.refreshing = False
-
-    async def refresh_all(
+    async def refresh_symbol(
         self,
+        symbol: str,
         force: bool = False,
     ) -> Dict[str, List[Candle]]:
         """
-        Rafraîchit tous les timeframes nécessaires.
+        Rafraîchit tous les timeframes d'un symbole.
         """
-
+        symbol = self._validate_symbol(
+            symbol
+        )
         results = await asyncio.gather(
             *[
                 self.refresh(
+                    symbol,
                     timeframe,
                     force=force,
                 )
-                for timeframe in TIMEFRAME_REFRESH_SECONDS
+                for timeframe in SUPPORTED_TIMEFRAMES
             ],
             return_exceptions=True,
         )
-
-        output: Dict[str, List[Candle]] = {}
-
+        output: Dict[
+            str,
+            List[Candle],
+        ] = {}
         for timeframe, result in zip(
-            TIMEFRAME_REFRESH_SECONDS,
+            SUPPORTED_TIMEFRAMES,
             results,
         ):
-            if isinstance(result, Exception):
+            if isinstance(
+                result,
+                Exception,
+            ):
                 logger.error(
-                    "Refresh %s échoué : %s",
+                    "Refresh %s %s échoué : %s",
+                    symbol,
                     timeframe,
                     result,
                 )
                 output[timeframe] = []
             else:
-                output[timeframe] = result
-
+                output[timeframe] = list(
+                    result
+                )
         return output
-
-    # -----------------------------------------------------------------------
-    # ACCÈS AUX DONNÉES
-    # -----------------------------------------------------------------------
-
+    async def refresh_all(
+        self,
+        force: bool = False,
+    ) -> Dict[
+        str,
+        Dict[str, List[Candle]],
+    ]:
+        """
+        Rafraîchit tous les timeframes de tous
+        les symboles configurés.
+        Structure retournée :
+            {
+                "XAUUSD": {
+                    "H4": [...],
+                    "H1": [...],
+                    ...
+                },
+                "BTCUSD": {
+                    ...
+                }
+            }
+        """
+        results = await asyncio.gather(
+            *[
+                self.refresh_symbol(
+                    symbol,
+                    force=force,
+                )
+                for symbol in self.symbols
+            ],
+            return_exceptions=True,
+        )
+        output: Dict[
+            str,
+            Dict[str, List[Candle]],
+        ] = {}
+        for symbol, result in zip(
+            self.symbols,
+            results,
+        ):
+            if isinstance(
+                result,
+                Exception,
+            ):
+                logger.error(
+                    "Refresh global %s échoué : %s",
+                    symbol,
+                    result,
+                )
+                output[symbol] = {
+                    timeframe: []
+                    for timeframe
+                    in SUPPORTED_TIMEFRAMES
+                }
+            else:
+                output[symbol] = result
+        return output
+    # =========================================================================
+    # ACCÈS AUX BOUGIES
+    # =========================================================================
     def get_candles(
         self,
+        symbol: str,
         timeframe: str,
     ) -> List[Candle]:
         """
         Retourne les bougies actuellement en cache.
-
-        Cette méthode ne déclenche PAS de requête réseau.
+        Aucune requête réseau n'est déclenchée.
         """
-
-        timeframe = timeframe.upper()
-
-        if timeframe not in self._cache:
-            raise ValueError(
-                f"Timeframe non supporté : {timeframe}"
-            )
-
-        return list(
-            self._cache[timeframe].candles
+        symbol = self._validate_symbol(
+            symbol
         )
-
+        timeframe = self._validate_timeframe(
+            timeframe
+        )
+        return list(
+            self._cache[
+                symbol
+            ][
+                timeframe
+            ].candles
+        )
     def get_closed_candles(
         self,
+        symbol: str,
         timeframe: str,
     ) -> List[Candle]:
         """
-        Retourne les bougies clôturées.
-
-        Le tick temps réel n'intervient jamais directement
+        Retourne uniquement les bougies clôturées.
+        Le tick temps réel n'intervient jamais
         dans cette liste.
         """
-
-        candles = self.get_candles(timeframe)
-
+        candles = self.get_candles(
+            symbol,
+            timeframe,
+        )
         return [
             candle
             for candle in candles
-            if self._is_closed_candle(candle)
+            if self._is_closed_candle(
+                candle
+            )
         ]
-
     def get_latest_closed_candle(
         self,
+        symbol: str,
         timeframe: str,
     ) -> Optional[Candle]:
         """
         Retourne la dernière bougie clôturée.
         """
-
-        candles = self.get_closed_candles(timeframe)
-
+        candles = self.get_closed_candles(
+            symbol,
+            timeframe,
+        )
         if not candles:
             return None
-
         return candles[-1]
-
-    # -----------------------------------------------------------------------
-    # ÉTAT DU CACHE
-    # -----------------------------------------------------------------------
-
+    def get_symbol_data(
+        self,
+        symbol: str,
+    ) -> Dict[
+        str,
+        List[Candle],
+    ]:
+        """
+        Retourne toutes les bougies en cache
+        pour un symbole.
+        """
+        symbol = self._validate_symbol(
+            symbol
+        )
+        return {
+            timeframe: list(
+                self._cache[
+                    symbol
+                ][
+                    timeframe
+                ].candles
+            )
+            for timeframe
+            in SUPPORTED_TIMEFRAMES
+        }
+    # =========================================================================
+    # REFRESH STATE
+    # =========================================================================
     def needs_refresh(
         self,
+        symbol: str,
         timeframe: str,
     ) -> bool:
         """
         Indique si un timeframe doit être rafraîchi.
         """
-        timeframe = timeframe.upper()
-
-        if timeframe not in self._cache:
-            raise ValueError(
-                f"Timeframe non supporté : {timeframe}"
-            )
-
-        return self._needs_refresh(timeframe)
-
+        symbol = self._validate_symbol(
+            symbol
+        )
+        timeframe = self._validate_timeframe(
+            timeframe
+        )
+        return self._needs_refresh(
+            symbol,
+            timeframe,
+        )
     def _needs_refresh(
         self,
+        symbol: str,
         timeframe: str,
     ) -> bool:
-        cache = self._cache[timeframe]
-
+        """
+        Vérification interne de fraîcheur.
+        """
+        cache = self._cache[
+            symbol
+        ][
+            timeframe
+        ]
         if not cache.candles:
             return True
-
-        elapsed = time.time() - cache.last_refresh
-
+        if cache.last_refresh <= 0:
+            return True
+        elapsed = (
+            time.time()
+            - cache.last_refresh
+        )
         return (
             elapsed
-            >= TIMEFRAME_REFRESH_SECONDS[timeframe]
+            >= TIMEFRAME_REFRESH_SECONDS[
+                timeframe
+            ]
         )
-
-    def get_status(self) -> Dict[str, Any]:
+    # =========================================================================
+    # STATUS
+    # =========================================================================
+    def get_status(
+        self,
+    ) -> Dict[str, Any]:
         """
-        Retourne un état lisible du cache.
+        Retourne l'état complet du cache.
+        Les informations sont organisées par symbole
+        puis par timeframe.
         """
-
         now = time.time()
-
-        status: Dict[str, Any] = {
-            "symbol": self.symbol,
-            "current_price": self.get_current_price(),
-            "tick_received": self._latest_tick is not None,
-            "timeframes": {},
+        status: Dict[
+            str,
+            Any,
+        ] = {
+            "provider": "BiQuote",
+            "symbols": list(
+                self.symbols
+            ),
+            "symbol_count": len(
+                self.symbols
+            ),
+            "timeframes": list(
+                SUPPORTED_TIMEFRAMES
+            ),
+            "latest_ticks": {},
+            "markets": {},
         }
-
-        for timeframe, cache in self._cache.items():
-
-            age = None
-
-            if cache.last_refresh > 0:
-                age = round(
-                    now - cache.last_refresh,
-                    2,
-                )
-
-            status["timeframes"][timeframe] = {
-                "candles": len(cache.candles),
-                "last_refresh_age": age,
-                "needs_refresh": self._needs_refresh(
-                    timeframe
+        # ------------------------------------------------------------------
+        # Ticks
+        # ------------------------------------------------------------------
+        for symbol in self.symbols:
+            tick = self._latest_ticks.get(
+                symbol
+            )
+            if tick is None:
+                status[
+                    "latest_ticks"
+                ][symbol] = {
+                    "received": False,
+                    "price": None,
+                }
+            else:
+                status[
+                    "latest_ticks"
+                ][symbol] = {
+                    "received": True,
+                    "price": tick.mid,
+                    "bid": tick.bid,
+                    "ask": tick.ask,
+                    "spread": tick.spread,
+                    "timestamp": tick.timestamp,
+                    "market_state": tick.market_state,
+                    "stale": tick.stale,
+                    "quote_age_seconds": (
+                        tick.quote_age_seconds
+                    ),
+                }
+        # ------------------------------------------------------------------
+        # Bougies
+        # ------------------------------------------------------------------
+        for symbol in self.symbols:
+            status[
+                "markets"
+            ][symbol] = {
+                "current_price": (
+                    self.get_current_price(
+                        symbol
+                    )
                 ),
-                "refreshing": cache.refreshing,
-                "error": cache.error,
+                "timeframes": {},
             }
-
+            for timeframe in SUPPORTED_TIMEFRAMES:
+                cache = self._cache[
+                    symbol
+                ][
+                    timeframe
+                ]
+                age = None
+                if cache.last_refresh > 0:
+                    age = round(
+                        now
+                        - cache.last_refresh,
+                        2,
+                    )
+                status[
+                    "markets"
+                ][symbol][
+                    "timeframes"
+                ][timeframe] = {
+                    "candles": len(
+                        cache.candles
+                    ),
+                    "last_refresh_age": age,
+                    "needs_refresh": (
+                        self._needs_refresh(
+                            symbol,
+                            timeframe,
+                        )
+                    ),
+                    "refreshing": (
+                        cache.refreshing
+                    ),
+                    "error": cache.error,
+                }
         return status
-
-    # -----------------------------------------------------------------------
-    # NORMALISATION TICK
-    # -----------------------------------------------------------------------
-
+    # =========================================================================
+    # TICK NORMALIZATION
+    # =========================================================================
     def _normalize_tick(
         self,
         tick: Any,
     ) -> Optional[Tick]:
         """
-        Transforme un tick dict ou Tick en objet Tick.
+        Transforme un dictionnaire tick en objet Tick.
+        Si l'objet est déjà un Tick, il est utilisé
+        directement.
         """
-
-        if isinstance(tick, Tick):
+        if isinstance(
+            tick,
+            Tick,
+        ):
             return tick
-
-        if not isinstance(tick, dict):
+        if not isinstance(
+            tick,
+            dict,
+        ):
             return None
-
-        symbol = str(
-            tick.get("symbol", self.symbol)
-        ).upper()
-
+        symbol = self._normalize_symbol(
+            tick.get(
+                "symbol",
+                "",
+            )
+        )
+        if not symbol:
+            return None
         mid = self._safe_float(
             tick.get("mid")
         )
-
-        if mid is None:
+        if mid is None or mid <= 0:
             return None
-
         bid = self._safe_float(
             tick.get("bid")
         )
-
         ask = self._safe_float(
             tick.get("ask")
         )
-
         spread = self._safe_float(
             tick.get("spread")
         )
-
         return Tick(
             symbol=symbol,
             bid=bid,
             ask=ask,
             mid=mid,
             spread=spread,
-            timestamp=tick.get("timestamp"),
+            timestamp=tick.get(
+                "timestamp"
+            ),
             market_state=tick.get(
                 "marketState"
             ),
-            stale=tick.get("stale"),
-            quote_age_seconds=self._safe_float(
-                tick.get("quoteAgeSeconds")
+            stale=tick.get(
+                "stale"
+            ),
+            quote_age_seconds=(
+                self._safe_float(
+                    tick.get(
+                        "quoteAgeSeconds"
+                    )
+                )
             ),
         )
-
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
     @staticmethod
     def _safe_float(
         value: Any,
     ) -> Optional[float]:
+        """
+        Conversion sécurisée en float.
+        """
         if value is None:
             return None
-
         try:
             return float(value)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return None
-
     @staticmethod
     def _is_closed_candle(
         candle: Candle,
     ) -> bool:
         """
-        Vérifie si une bougie est clôturée.
-
-        Selon le modèle Candle de biquote_client.py,
-        is_open=False signifie que la bougie est clôturée.
+        Détermine si une bougie est clôturée.
+        Selon le modèle Candle de biquote_client.py :
+            is_open=False -> bougie clôturée.
         """
-
         return not bool(
-            getattr(candle, "is_open", False)
+            getattr(
+                candle,
+                "is_open",
+                False,
+            )
         )
-
-
-# ---------------------------------------------------------------------------
-# Test local
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# TEST LOCAL
+# ============================================================================
 async def main() -> None:
     """
-    Test simple du cache.
-
-    Ce test ne lance pas SignalR.
-    Il vérifie seulement la récupération des bougies BiQuote.
+    Test local du cache.
+    Ce test :
+        - crée le cache multi-actifs
+        - récupère H1 pour les quatre actifs
+        - affiche les dernières bougies
+        - affiche l'état du cache
+    Il ne lance pas SignalR.
     """
-
     logging.basicConfig(
         level=logging.INFO,
         format=(
@@ -523,53 +952,65 @@ async def main() -> None:
             "%(message)s"
         ),
     )
-
     cache = Moteur2Cache()
-
     print()
-    print("=" * 60)
-    print("NOVA TRADE AI - TEST MOTEUR 2 CACHE")
-    print("=" * 60)
-    print()
-
-    await cache.refresh(
-        "H1",
-        force=True,
-    )
-
-    candles = cache.get_closed_candles("H1")
-
+    print("=" * 70)
     print(
-        f"XAUUSD H1 : {len(candles)} "
-        f"bougies clôturées"
+        "NOVA TRADE AI - TEST MOTEUR 2 CACHE"
     )
-
-    latest = cache.get_latest_closed_candle(
-        "H1"
+    print("=" * 70)
+    print()
+    for symbol in cache.symbols:
+        print(
+            f"--- {symbol} H1 ---"
+        )
+        try:
+            await cache.refresh(
+                symbol,
+                "H1",
+                force=True,
+            )
+            candles = (
+                cache.get_closed_candles(
+                    symbol,
+                    "H1",
+                )
+            )
+            print(
+                f"{symbol} H1 : "
+                f"{len(candles)} "
+                f"bougies clôturées"
+            )
+            latest = (
+                cache.get_latest_closed_candle(
+                    symbol,
+                    "H1",
+                )
+            )
+            if latest is not None:
+                print(
+                    f"Open  : {latest.open}"
+                )
+                print(
+                    f"High  : {latest.high}"
+                )
+                print(
+                    f"Low   : {latest.low}"
+                )
+                print(
+                    f"Close : {latest.close}"
+                )
+        except Exception as exc:
+            print(
+                f"Erreur {symbol} : {exc}"
+            )
+        print()
+    print("=" * 70)
+    print("ÉTAT DU CACHE")
+    print("=" * 70)
+    print(
+        cache.get_status()
     )
-
-    if latest:
-        print(
-            "Dernière bougie H1 clôturée :"
-        )
-        print(
-            f"Open  : {latest.open}"
-        )
-        print(
-            f"High  : {latest.high}"
-        )
-        print(
-            f"Low   : {latest.low}"
-        )
-        print(
-            f"Close : {latest.close}"
-        )
-
     print()
-    print("État du cache :")
-    print(cache.get_status())
-    print()
-
-
 if __name__ == "__main__":
     asyncio.run(main())
