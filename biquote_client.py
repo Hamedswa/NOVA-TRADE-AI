@@ -3,15 +3,41 @@ NOVA TRADE AI
 Moteur 2 - Client BiQuote
 
 Responsabilités :
-- récupérer les ticks XAUUSD ;
+- récupérer les ticks BiQuote lorsqu'ils sont disponibles ;
 - récupérer les chandeliers OHLC ;
 - normaliser les données ;
-- vérifier la fraîcheur des données ;
+- vérifier la cohérence des données ;
+- vérifier la fraîcheur lorsqu'elle est fournie ;
 - ne contenir aucune logique de trading.
 
-Source :
-BiQuote
+Actifs Moteur 2 :
+    XAUUSD
+    BTCUSD
+    EURUSD
+    GBPUSD
+
+Timeframes :
+    H4
+    H1
+    M15
+    M5
+    M1
+
+IMPORTANT :
+Le prix temps réel privilégié du Moteur 2 provient du
+flux BiQuote SignalR via biquote_stream.py.
+
+Ce client REST ne décide jamais :
+    - BUY / SELL
+    - Entry
+    - SL
+    - TP
+    - RR
+    - score
+    - validation
+    - rejet de signal
 """
+
 
 from __future__ import annotations
 
@@ -32,11 +58,26 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://biquote.io"
 
-SYMBOL = "XAUUSD"
-
 DEFAULT_TIMEOUT = 10
 
 MAX_RETRIES = 3
+
+
+# ============================================================
+# ACTIFS SUPPORTÉS
+# ============================================================
+
+SUPPORTED_SYMBOLS = (
+    "XAUUSD",
+    "BTCUSD",
+    "EURUSD",
+    "GBPUSD",
+)
+
+
+# ============================================================
+# TIMEFRAMES SUPPORTÉS
+# ============================================================
 
 SUPPORTED_TIMEFRAMES = {
     "M1": "1m",
@@ -50,6 +91,7 @@ SUPPORTED_TIMEFRAMES = {
 # ============================================================
 # EXCEPTIONS
 # ============================================================
+
 
 class BiQuoteError(Exception):
     """Erreur générale BiQuote."""
@@ -67,11 +109,18 @@ class BiQuoteDataError(BiQuoteError):
 # MODÈLES DE DONNÉES
 # ============================================================
 
+
 @dataclass(frozen=True)
 class Tick:
-    """Tick normalisé BiQuote."""
+    """
+    Tick normalisé BiQuote.
+
+    Le tick est une donnée de marché uniquement.
+    Aucune décision de trading n'est prise ici.
+    """
 
     symbol: str
+
     bid: float
     ask: float
     mid: float
@@ -88,7 +137,9 @@ class Tick:
 
 @dataclass(frozen=True)
 class Candle:
-    """Bougie OHLC normalisée."""
+    """
+    Bougie OHLC normalisée.
+    """
 
     open_time: str
 
@@ -106,13 +157,20 @@ class Candle:
 # CLIENT
 # ============================================================
 
+
 class BiQuoteClient:
     """
     Client REST minimal pour le Moteur 2.
 
     Cette classe fournit uniquement les données BiQuote.
 
-    Elle ne contient aucune logique de trading.
+    Elle ne contient aucune logique :
+        - de setup ;
+        - de signal ;
+        - de score ;
+        - de risque ;
+        - de validation ;
+        - d'exécution.
     """
 
     def __init__(
@@ -138,6 +196,72 @@ class BiQuoteClient:
         )
 
     # ========================================================
+    # NORMALISATION SYMBOLE
+    # ========================================================
+
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        """
+        Normalise un symbole vers le format interne BiQuote.
+
+        Exemples :
+            XAU/USD -> XAUUSD
+            BTC/USD -> BTCUSD
+            EUR/USD -> EURUSD
+            GBP/USD -> GBPUSD
+        """
+
+        if not isinstance(symbol, str):
+            raise ValueError(
+                "Le symbole doit être une chaîne."
+            )
+
+        normalized = (
+            symbol.strip()
+            .upper()
+            .replace("/", "")
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )
+
+        if normalized not in SUPPORTED_SYMBOLS:
+            raise ValueError(
+                f"Symbole BiQuote non supporté : {symbol}. "
+                f"Symboles autorisés : "
+                f"{', '.join(SUPPORTED_SYMBOLS)}"
+            )
+
+        return normalized
+
+    # ========================================================
+    # VALIDATION TIMEFRAME
+    # ========================================================
+
+    @staticmethod
+    def normalize_timeframe(timeframe: str) -> str:
+        """
+        Normalise et vérifie un timeframe.
+        """
+
+        if not isinstance(timeframe, str):
+            raise ValueError(
+                "Le timeframe doit être une chaîne."
+            )
+
+        normalized = timeframe.strip().upper()
+
+        if normalized not in SUPPORTED_TIMEFRAMES:
+            raise ValueError(
+                f"Timeframe BiQuote non supporté : "
+                f"{timeframe}. "
+                f"Timeframes autorisés : "
+                f"{', '.join(SUPPORTED_TIMEFRAMES)}"
+            )
+
+        return normalized
+
+    # ========================================================
     # HTTP
     # ========================================================
 
@@ -146,6 +270,10 @@ class BiQuoteClient:
         endpoint: str,
         params: Optional[dict[str, Any]] = None,
     ) -> Any:
+        """
+        Effectue une requête GET avec quelques protections
+        réseau basiques.
+        """
 
         url = f"{self.base_url}{endpoint}"
 
@@ -164,18 +292,36 @@ class BiQuoteClient:
                     timeout=self.timeout,
                 )
 
+                # ------------------------------------------------
+                # RATE LIMIT
+                # ------------------------------------------------
+
                 if response.status_code == 429:
 
-                    retry_after = int(
+                    retry_after_raw = (
                         response.headers.get(
                             "Retry-After",
                             "2",
                         )
                     )
 
+                    try:
+                        retry_after = max(
+                            1,
+                            int(retry_after_raw),
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+                        retry_after = 2
+
                     logger.warning(
-                        "BiQuote rate limit. "
+                        "BiQuote rate limit "
+                        "(tentative %s/%s). "
                         "Attente de %ss.",
+                        attempt,
+                        self.max_retries,
                         retry_after,
                     )
 
@@ -184,6 +330,10 @@ class BiQuoteClient:
                     )
 
                     continue
+
+                # ------------------------------------------------
+                # ERREUR HTTP
+                # ------------------------------------------------
 
                 if response.status_code >= 400:
 
@@ -199,7 +349,26 @@ class BiQuoteClient:
                         f"{payload}"
                     )
 
-                return response.json()
+                # ------------------------------------------------
+                # JSON
+                # ------------------------------------------------
+
+                try:
+
+                    return response.json()
+
+                except ValueError as exc:
+
+                    raise BiQuoteDataError(
+                        "BiQuote a retourné une réponse "
+                        "qui n'est pas un JSON valide."
+                    ) from exc
+
+            except BiQuoteHTTPError:
+                raise
+
+            except BiQuoteDataError:
+                raise
 
             except requests.RequestException as exc:
 
@@ -215,9 +384,7 @@ class BiQuoteClient:
 
                 if attempt < self.max_retries:
 
-                    time.sleep(
-                        attempt
-                    )
+                    time.sleep(attempt)
 
         raise BiQuoteError(
             "Impossible de contacter BiQuote "
@@ -230,16 +397,20 @@ class BiQuoteClient:
 
     def get_tick(
         self,
-        symbol: str = SYMBOL,
+        symbol: str,
         allow_stale: bool = False,
     ) -> Tick:
+        """
+        Récupère un tick REST BiQuote.
 
-        symbol = symbol.upper()
+        IMPORTANT :
+        Le flux SignalR de biquote_stream.py reste la source
+        privilégiée pour le prix temps réel du Moteur 2.
 
-        if symbol != SYMBOL:
-            raise ValueError(
-                "Le Moteur 2 BiQuote est limité à XAUUSD."
-            )
+        Cette méthode ne contient aucune logique de trading.
+        """
+
+        symbol = self.normalize_symbol(symbol)
 
         payload = self._get(
             f"/api/{symbol}",
@@ -261,16 +432,16 @@ class BiQuoteClient:
 
         try:
 
-            mid = float(
-                payload["mid"]
-            )
-
             bid = float(
                 payload["bid"]
             )
 
             ask = float(
                 payload["ask"]
+            )
+
+            mid = float(
+                payload["mid"]
             )
 
             spread = float(
@@ -284,23 +455,117 @@ class BiQuoteClient:
         ) as exc:
 
             raise BiQuoteDataError(
-                "Tick BiQuote incomplet ou invalide."
+                f"Tick BiQuote incomplet ou "
+                f"invalide pour {symbol}."
             ) from exc
 
-        if mid <= 0:
+        # ----------------------------------------------------
+        # VALIDATION PRIX
+        # ----------------------------------------------------
 
+        if bid <= 0:
             raise BiQuoteDataError(
-                f"Prix mid invalide pour "
-                f"{symbol}: {mid}"
+                f"Bid invalide pour {symbol}: {bid}"
             )
 
-        return Tick(
-            symbol=str(
-                payload.get(
-                    "symbol",
-                    symbol,
+        if ask <= 0:
+            raise BiQuoteDataError(
+                f"Ask invalide pour {symbol}: {ask}"
+            )
+
+        if mid <= 0:
+            raise BiQuoteDataError(
+                f"Mid invalide pour {symbol}: {mid}"
+            )
+
+        if ask < bid:
+            raise BiQuoteDataError(
+                f"Ask inférieur au bid pour {symbol}: "
+                f"bid={bid}, ask={ask}"
+            )
+
+        if spread < 0:
+            raise BiQuoteDataError(
+                f"Spread négatif pour {symbol}: {spread}"
+            )
+
+        # ----------------------------------------------------
+        # SYMBOLE RETOURNÉ
+        # ----------------------------------------------------
+
+        payload_symbol = str(
+            payload.get(
+                "symbol",
+                symbol,
+            )
+        )
+
+        try:
+
+            normalized_payload_symbol = (
+                self.normalize_symbol(
+                    payload_symbol
                 )
-            ),
+            )
+
+        except ValueError:
+
+            normalized_payload_symbol = symbol
+
+        # ----------------------------------------------------
+        # ÂGE DE LA COTE
+        # ----------------------------------------------------
+
+        raw_age = payload.get(
+            "quoteAgeSeconds",
+            0,
+        )
+
+        try:
+
+            quote_age_seconds = float(
+                raw_age or 0
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            quote_age_seconds = 0.0
+
+        quote_age_seconds = max(
+            0.0,
+            quote_age_seconds,
+        )
+
+        # ----------------------------------------------------
+        # ÉTAT DU MARCHÉ
+        # ----------------------------------------------------
+
+        market_state = str(
+            payload.get(
+                "marketState",
+                "unknown",
+            )
+        )
+
+        stale = bool(
+            payload.get(
+                "stale",
+                False,
+            )
+        )
+
+        direction = str(
+            payload.get(
+                "direction",
+                "FLAT",
+            )
+        ).upper()
+
+        return Tick(
+            symbol=normalized_payload_symbol,
             bid=bid,
             ask=ask,
             mid=mid,
@@ -311,31 +576,10 @@ class BiQuoteClient:
                     "",
                 )
             ),
-            market_state=str(
-                payload.get(
-                    "marketState",
-                    "unknown",
-                )
-            ),
-            stale=bool(
-                payload.get(
-                    "stale",
-                    False,
-                )
-            ),
-            quote_age_seconds=float(
-                payload.get(
-                    "quoteAgeSeconds",
-                    0,
-                )
-                or 0
-            ),
-            direction=str(
-                payload.get(
-                    "direction",
-                    "FLAT",
-                )
-            ),
+            market_state=market_state,
+            stale=stale,
+            quote_age_seconds=quote_age_seconds,
+            direction=direction,
         )
 
     # ========================================================
@@ -345,28 +589,23 @@ class BiQuoteClient:
     def get_candles(
         self,
         timeframe: str,
-        symbol: str = SYMBOL,
+        symbol: str,
         limit: int = 500,
         closed_only: bool = False,
     ) -> list[Candle]:
+        """
+        Récupère les chandeliers OHLC BiQuote.
 
-        timeframe = timeframe.upper()
+        Les données restent strictement isolées par :
+            symbole
+            timeframe
+        """
 
-        symbol = symbol.upper()
+        symbol = self.normalize_symbol(symbol)
 
-        if symbol != SYMBOL:
-
-            raise ValueError(
-                "Le Moteur 2 BiQuote est limité à XAUUSD."
-            )
-
-        if timeframe not in SUPPORTED_TIMEFRAMES:
-
-            raise ValueError(
-                f"Timeframe non supporté: {timeframe}. "
-                f"Utiliser: "
-                f"{', '.join(SUPPORTED_TIMEFRAMES)}"
-            )
+        timeframe = self.normalize_timeframe(
+            timeframe
+        )
 
         if not 1 <= limit <= 1000:
 
@@ -459,16 +698,51 @@ class BiQuoteClient:
             ):
 
                 logger.warning(
-                    "Bougie BiQuote ignorée: %s",
+                    "Bougie BiQuote ignorée "
+                    "pour %s %s : %s",
+                    symbol,
+                    timeframe,
                     bar,
                 )
 
                 continue
 
+            # ------------------------------------------------
+            # VALIDATION OHLC
+            # ------------------------------------------------
+
+            if candle.open <= 0:
+                logger.warning(
+                    "Open invalide ignoré : %s",
+                    candle,
+                )
+                continue
+
+            if candle.high <= 0:
+                logger.warning(
+                    "High invalide ignoré : %s",
+                    candle,
+                )
+                continue
+
+            if candle.low <= 0:
+                logger.warning(
+                    "Low invalide ignoré : %s",
+                    candle,
+                )
+                continue
+
+            if candle.close <= 0:
+                logger.warning(
+                    "Close invalide ignoré : %s",
+                    candle,
+                )
+                continue
+
             if candle.high < candle.low:
 
                 logger.warning(
-                    "Bougie incohérente ignorée: %s",
+                    "Bougie incohérente ignorée : %s",
                     candle,
                 )
 
@@ -481,7 +755,7 @@ class BiQuoteClient:
             ):
 
                 logger.warning(
-                    "Open incohérent ignoré: %s",
+                    "Open incohérent ignoré : %s",
                     candle,
                 )
 
@@ -494,11 +768,15 @@ class BiQuoteClient:
             ):
 
                 logger.warning(
-                    "Close incohérent ignoré: %s",
+                    "Close incohérent ignoré : %s",
                     candle,
                 )
 
                 continue
+
+            # ------------------------------------------------
+            # BOUGIE OUVERTE
+            # ------------------------------------------------
 
             if (
                 closed_only
@@ -518,6 +796,10 @@ class BiQuoteClient:
                 f"pour {symbol} {timeframe}."
             )
 
+        # ----------------------------------------------------
+        # TRI CHRONOLOGIQUE
+        # ----------------------------------------------------
+
         candles.sort(
             key=lambda candle: candle.open_time
         )
@@ -525,25 +807,20 @@ class BiQuoteClient:
         return candles
 
     # ========================================================
-    # COMPATIBILITÉ MOTEUR 2
+    # ALIAS OHLC
     # ========================================================
 
     def get_ohlc(
         self,
         timeframe: str,
-        symbol: str = SYMBOL,
+        symbol: str,
         limit: int = 500,
         closed_only: bool = False,
     ) -> list[Candle]:
         """
-        Alias de compatibilité pour le Moteur 2.
+        Alias de compatibilité pour get_candles().
 
-        Le client BiQuote officiel du projet utilise
-        get_candles(). Cette méthode permet aux anciennes
-        parties du Moteur 2 qui appellent encore get_ohlc()
-        de fonctionner sans dupliquer la logique OHLC.
-
-        Aucun calcul de trading n'est effectué ici.
+        Aucune logique supplémentaire.
         """
 
         return self.get_candles(
@@ -559,18 +836,20 @@ class BiQuoteClient:
 
     def get_all_timeframes(
         self,
-        symbol: str = SYMBOL,
+        symbol: str,
         limit: int = 500,
         closed_only: bool = True,
     ) -> dict[str, list[Candle]]:
+        """
+        Récupère les cinq timeframes du Moteur 2
+        pour un seul symbole.
 
-        symbol = symbol.upper()
+        Important :
+        une invocation concerne un seul symbole afin d'éviter
+        tout mélange de données entre actifs.
+        """
 
-        if symbol != SYMBOL:
-
-            raise ValueError(
-                "Le Moteur 2 BiQuote est limité à XAUUSD."
-            )
+        symbol = self.normalize_symbol(symbol)
 
         data: dict[
             str,
@@ -595,10 +874,62 @@ class BiQuoteClient:
         return data
 
     # ========================================================
-    # FERMETURE
+    # TOUS LES ACTIFS
+    # ========================================================
+
+    def get_all_symbols_timeframes(
+        self,
+        limit: int = 500,
+        closed_only: bool = True,
+    ) -> dict[
+        str,
+        dict[str, list[Candle]],
+    ]:
+        """
+        Récupère les cinq timeframes pour chacun des quatre
+        actifs du Moteur 2.
+
+        Structure retournée :
+
+        {
+            "XAUUSD": {
+                "H4": [...],
+                "H1": [...],
+                "M15": [...],
+                "M5": [...],
+                "M1": [...],
+            },
+            "BTCUSD": {...},
+            "EURUSD": {...},
+            "GBPUSD": {...},
+        }
+
+        Cette méthode ne fait aucun calcul de trading.
+        """
+
+        result: dict[
+            str,
+            dict[str, list[Candle]],
+        ] = {}
+
+        for symbol in SUPPORTED_SYMBOLS:
+
+            result[symbol] = self.get_all_timeframes(
+                symbol=symbol,
+                limit=limit,
+                closed_only=closed_only,
+            )
+
+        return result
+
+    # ========================================================
+    # FERMETURE SESSION HTTP
     # ========================================================
 
     def close(self) -> None:
+        """
+        Ferme proprement la session HTTP.
+        """
 
         self.session.close()
 
