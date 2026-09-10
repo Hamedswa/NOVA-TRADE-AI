@@ -6,4 +6,3 @@ python-telegram-bot>=21,<22
 pytest>=8,<9
 beautifulsoup4>=4.12,<5
 groq>=0.11,<1
-signalrcore
