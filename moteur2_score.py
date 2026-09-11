@@ -1,66 +1,97 @@
 """
 NOVA TRADE AI - ENGINE 2
 moteur2_score.py
-
-Score de qualité du setup.
-
-Le score mesure la qualité globale du setup.
-Il ne remplace PAS les règles bloquantes :
-
-    - setup inexistant
-    - direction incohérente
-    - Entry / SL / TP incohérents
-    - RR insuffisant
-    - contradiction majeure
-
-IMPORTANT :
-    Aucun BOS
-    Aucun CHoCH
-    Aucun Order Block
-    Aucun FVG
-    Aucun concept SMC obligatoire
-
-Le score est déterministe.
-Groq n'intervient pas ici.
+Score déterministe de qualité du setup.
+Le score mesure la qualité globale d'un setup déjà détecté.
+IMPORTANT
+---------
+Le score ne remplace jamais les conditions bloquantes.
+Il ne peut pas :
+- créer un setup ;
+- créer un plan de risque ;
+- remplacer le RR minimum ;
+- remplacer la confirmation M5 ;
+- annuler une contradiction majeure ;
+- produire READY_FOR_SIGNAL ;
+- déclencher une entrée.
+La validation finale appartient exclusivement à :
+    moteur2_validation.py
+Hiérarchie :
+    H4 / H1 / M15
+        ↓
+    Setup
+        ↓
+    Risk
+        ↓
+    M5
+        ↓
+    M1
+        ↓
+    Score
+        ↓
+    Validation finale
+Aucune logique externe d'interprétation n'intervient ici.
 """
-
 from __future__ import annotations
-
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 import math
-
-
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
+SUPPORTED_SYMBOLS = (
+    "XAUUSD",
+    "BTCUSD",
+    "EURUSD",
+    "GBPUSD",
+)
 MAX_SCORE = 100.0
-
-# Pondération principale
-ZONE_MAX = 20.0
+# ------------------------------------------------------------
+# Pondération
+# ------------------------------------------------------------
+#
+# Les composantes descriptives ne doivent pas se compter
+# plusieurs fois.
+#
+# Le timing M5/M1 reste secondaire par rapport au cœur
+# H4/H1/M15 + qualité du risque.
+# ------------------------------------------------------------
+ZONE_MAX = 18.0
 CONTEXT_MAX = 15.0
-STRUCTURE_MAX = 15.0
-REACTION_MAX = 15.0
+STRUCTURE_MAX = 12.0
+REACTION_MAX = 12.0
 CONFLUENCE_MAX = 10.0
-M5_MAX = 10.0
-M1_MAX = 5.0
-RR_MAX = 10.0
-
-
+M5_MAX = 12.0
+M1_MAX = 4.0
+RR_MAX = 17.0
+# Vérification de cohérence.
+TOTAL_MAX = (
+    ZONE_MAX
+    + CONTEXT_MAX
+    + STRUCTURE_MAX
+    + REACTION_MAX
+    + CONFLUENCE_MAX
+    + M5_MAX
+    + M1_MAX
+    + RR_MAX
+)
+# Seuil informatif.
+# La validation finale pourra utiliser ce seuil,
+# mais le score ne l'impose pas lui-même.
+SCORE_THRESHOLD = 60.0
+# Exigence structurelle du moteur.
+MINIMUM_RR = 3.0
+EPSILON = 1e-9
 # ============================================================
 # RESULTAT
 # ============================================================
-
 @dataclass
 class ScoreResult:
     symbol: str
     setup_id: str
     direction: str
-
     score: float
     quality: str
-
     zone_score: float
     context_score: float
     structure_score: float
@@ -69,75 +100,118 @@ class ScoreResult:
     m5_score: float
     m1_score: float
     rr_score: float
-
     strengths: List[str]
     weaknesses: List[str]
-
     metadata: Dict[str, Any]
-
-
 # ============================================================
 # MOTEUR
 # ============================================================
-
 class Moteur2Score:
     """
-    Calcule le score de qualité du setup.
-
-    Le score n'est pas une autorisation de trader.
+    Calcule le score de qualité d'un setup.
+    Le score est descriptif et déterministe.
+    Il ne possède aucune autorité de validation finale.
     """
-
-    def __init__(self):
-        pass
-
+    def __init__(
+        self,
+        score_threshold: float = SCORE_THRESHOLD,
+        minimum_rr: float = MINIMUM_RR,
+    ):
+        self.score_threshold = float(
+            score_threshold
+        )
+        self.minimum_rr = float(
+            minimum_rr
+        )
     # ========================================================
     # OUTILS
     # ========================================================
-
     @staticmethod
     def _get(
         obj: Any,
         key: str,
         default: Any = None,
     ) -> Any:
-
         if obj is None:
             return default
-
         if isinstance(obj, dict):
-            return obj.get(key, default)
-
-        return getattr(obj, key, default)
-
+            return obj.get(
+                key,
+                default,
+            )
+        return getattr(
+            obj,
+            key,
+            default,
+        )
     @staticmethod
     def _number(
         value: Any,
     ) -> Optional[float]:
-
         if value is None:
             return None
-
         try:
             number = float(value)
-
             if not math.isfinite(number):
                 return None
-
             return number
-
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             return None
-
+    @staticmethod
+    def _normalize_symbol(
+        symbol: Any,
+    ) -> Optional[str]:
+        if symbol is None:
+            return None
+        value = (
+            str(symbol)
+            .upper()
+            .replace("/", "")
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+            .strip()
+        )
+        if value in SUPPORTED_SYMBOLS:
+            return value
+        return None
+    def _extract_symbol(
+        self,
+        *objects: Any,
+    ) -> Optional[str]:
+        for obj in objects:
+            symbol = (
+                self._get(
+                    obj,
+                    "symbol",
+                )
+                or self._get(
+                    obj,
+                    "ticker",
+                )
+            )
+            normalized = (
+                self._normalize_symbol(
+                    symbol
+                )
+            )
+            if normalized:
+                return normalized
+        return None
     @staticmethod
     def _normalize_direction(
         direction: Any,
     ) -> str:
-
         if direction is None:
             return "UNKNOWN"
-
-        value = str(direction).upper().strip()
-
+        value = (
+            str(direction)
+            .upper()
+            .strip()
+        )
         if value in {
             "BUY",
             "LONG",
@@ -147,7 +221,6 @@ class Moteur2Score:
             "BULLISH",
         }:
             return "BUY"
-
         if value in {
             "SELL",
             "SHORT",
@@ -157,414 +230,486 @@ class Moteur2Score:
             "BEARISH",
         }:
             return "SELL"
-
         return "UNKNOWN"
-
-    @staticmethod
-    def _extract_symbol(
-        obj: Any,
-        default: str = "XAUUSD",
-    ) -> str:
-
-        symbol = (
-            Moteur2Score._get(obj, "symbol")
-            or Moteur2Score._get(obj, "ticker")
-            or default
-        )
-
-        return str(symbol)
-
     @staticmethod
     def _clamp(
         value: float,
         minimum: float,
         maximum: float,
     ) -> float:
-
         return max(
             minimum,
-            min(maximum, value),
+            min(
+                maximum,
+                value,
+            ),
         )
-
-    # ========================================================
-    # EXTRACTION SCORE
-    # ========================================================
-
     def _extract_score(
         self,
         obj: Any,
         keys: List[str],
         default: float = 0.0,
     ) -> float:
-
         for key in keys:
-
             value = self._number(
-                self._get(obj, key)
+                self._get(
+                    obj,
+                    key,
+                )
             )
-
             if value is not None:
                 return value
-
         return default
-
     # ========================================================
-    # ZONE
+    # SCORE ZONE
     # ========================================================
-
     def _score_zone(
         self,
         zones: Any,
         setup: Any,
     ) -> tuple[float, str]:
-
         zone = self._get(
             setup,
             "zone",
         )
-
         if zone is None:
             zone = self._get(
                 setup,
                 "selected_zone",
             )
-
-        if zone is None and isinstance(zones, dict):
-            important = zones.get(
+        if zone is None:
+            zone_id = (
+                self._get(
+                    setup,
+                    "zone_id",
+                )
+            )
+            important_zones = (
+                self._get(
+                    zones,
+                    "important_zones",
+                    [],
+                )
+            )
+            if (
+                zone_id
+                and isinstance(
+                    important_zones,
+                    list,
+                )
+            ):
+                for candidate in important_zones:
+                    candidate_id = (
+                        self._get(
+                            candidate,
+                            "zone_id",
+                        )
+                        or self._get(
+                            candidate,
+                            "id",
+                        )
+                    )
+                    if str(candidate_id) == str(
+                        zone_id
+                    ):
+                        zone = candidate
+                        break
+        if zone is None:
+            important = self._get(
+                zones,
                 "important_zones",
                 [],
             )
-
-            if important:
+            if (
+                isinstance(
+                    important,
+                    list,
+                )
+                and important
+            ):
                 zone = important[0]
-
         if zone is None:
-            return 0.0, "Aucune zone importante clairement identifiée."
-
+            return (
+                0.0,
+                "Aucune zone importante clairement identifiée.",
+            )
         strength = self._extract_score(
             zone,
             [
                 "strength",
-                "score",
                 "importance",
                 "relevance",
+                "score",
             ],
             50.0,
         )
-
         strength = self._clamp(
             strength,
             0.0,
             100.0,
         )
-
         score = (
-            strength / 100.0
+            strength
+            / 100.0
         ) * ZONE_MAX
-
-        return score, (
-            "Zone importante correctement identifiée."
-            if score >= ZONE_MAX * 0.65
-            else "Zone présente mais pertinence moyenne."
-        )
-
+        if score >= ZONE_MAX * 0.70:
+            reason = (
+                "Zone importante et suffisamment pertinente."
+            )
+        elif score >= ZONE_MAX * 0.45:
+            reason = (
+                "Zone exploitable mais de pertinence moyenne."
+            )
+        else:
+            reason = (
+                "Zone faiblement qualifiée."
+            )
+        return score, reason
     # ========================================================
     # CONTEXTE
     # ========================================================
-
     def _score_context(
         self,
         context: Any,
         setup: Any,
     ) -> tuple[float, str]:
-
-        source = context
-
-        if source is None:
-            source = self._get(
+        if context is None:
+            context = self._get(
                 setup,
                 "context",
             )
-
-        if source is None:
-            return 0.0, "Contexte indisponible."
-
-        # Score explicite éventuel
-        explicit = self._number(
+        if context is None:
+            return (
+                0.0,
+                "Contexte indisponible.",
+            )
+        direction = self._normalize_direction(
             self._get(
-                source,
-                "context_score",
+                setup,
+                "direction",
             )
         )
-
-        if explicit is not None:
-
-            score = self._clamp(
-                explicit,
+        global_bias = str(
+            self._get(
+                context,
+                "global_bias",
+                "",
+            )
+        ).upper()
+        alignment = str(
+            self._get(
+                context,
+                "alignment",
+                "",
+            )
+        ).upper()
+        score = CONTEXT_MAX * 0.45
+        # ----------------------------------------------------
+        # Direction du contexte
+        # ----------------------------------------------------
+        context_direction = (
+            self._normalize_direction(
+                global_bias
+            )
+        )
+        if (
+            context_direction == direction
+        ):
+            score = CONTEXT_MAX * 0.90
+        elif (
+            context_direction in {
+                "BUY",
+                "SELL",
+            }
+            and context_direction != direction
+        ):
+            score = CONTEXT_MAX * 0.10
+        elif (
+            "COHERENT" in alignment
+            and "MIXTE" not in alignment
+        ):
+            score = CONTEXT_MAX * 0.75
+        elif (
+            "MIXTE" in alignment
+        ):
+            score = CONTEXT_MAX * 0.35
+        elif (
+            "NON_DEFINI" in alignment
+        ):
+            score = CONTEXT_MAX * 0.30
+        return (
+            self._clamp(
+                score,
                 0.0,
                 CONTEXT_MAX,
-            )
-
-        else:
-
-            global_bias = str(
-                self._get(
-                    source,
-                    "global_bias",
-                    "",
-                )
-            ).upper()
-
-            direction = self._normalize_direction(
-                self._get(
-                    setup,
-                    "direction",
-                )
-            )
-
-            score = CONTEXT_MAX * 0.45
-
-            if (
-                direction == "BUY"
-                and (
-                    "BUY" in global_bias
-                    or "HAUSS" in global_bias
-                )
-            ):
-                score = CONTEXT_MAX * 0.90
-
-            elif (
-                direction == "SELL"
-                and (
-                    "SELL" in global_bias
-                    or "BAISS" in global_bias
-                )
-            ):
-                score = CONTEXT_MAX * 0.90
-
-            elif (
-                "NEUTRAL" in global_bias
-                or "NEUTRE" in global_bias
-            ):
-                score = CONTEXT_MAX * 0.50
-
-        return score, (
-            "Contexte global cohérent avec le setup."
-            if score >= CONTEXT_MAX * 0.70
-            else "Contexte exploitable mais pas parfaitement aligné."
+            ),
+            (
+                "Contexte global cohérent avec la direction."
+                if score >= CONTEXT_MAX * 0.70
+                else
+                "Contexte global encore partiellement exploitable."
+            ),
         )
-
     # ========================================================
     # STRUCTURE
     # ========================================================
-
     def _score_structure(
         self,
         context: Any,
         confluences: Any,
         setup: Any,
     ) -> tuple[float, str]:
-
-        source = context
-
+        source = (
+            confluences
+            or context
+            or setup
+        )
         if source is None:
-            source = confluences
-
-        if source is None:
-            source = setup
-
+            return (
+                0.0,
+                "Structure indisponible.",
+            )
+        direction = self._normalize_direction(
+            self._get(
+                setup,
+                "direction",
+            )
+        )
         explicit = self._number(
             self._get(
                 source,
                 "structure_score",
             )
         )
-
         if explicit is not None:
-
+            # Accepte un score 0-100 ou 0-12.
+            if explicit > STRUCTURE_MAX:
+                explicit = (
+                    explicit
+                    / 100.0
+                ) * STRUCTURE_MAX
             score = self._clamp(
                 explicit,
                 0.0,
                 STRUCTURE_MAX,
             )
-
-        else:
-
-            score = STRUCTURE_MAX * 0.45
-
-            structure = str(
-                self._get(
-                    source,
-                    "structure",
-                    "",
-                )
-            ).upper()
-
-            if any(
-                word in structure
-                for word in (
-                    "HAUSSI",
-                    "BULLISH",
-                )
-            ):
-                score = STRUCTURE_MAX * 0.90
-
-            elif any(
-                word in structure
-                for word in (
-                    "BAISS",
-                    "BEARISH",
-                )
-            ):
-                score = STRUCTURE_MAX * 0.90
-
-            elif "RANGE" in structure:
-                score = STRUCTURE_MAX * 0.55
-
-            elif "TRANSITION" in structure:
-                score = STRUCTURE_MAX * 0.40
-
-        return score, (
-            "Structure cohérente avec le scénario."
-            if score >= STRUCTURE_MAX * 0.70
-            else "Structure encore partiellement exploitable."
+            return (
+                score,
+                (
+                    "Structure exploitable."
+                    if score >= STRUCTURE_MAX * 0.70
+                    else "Structure partiellement exploitable."
+                ),
+            )
+        structure = str(
+            self._get(
+                source,
+                "structure",
+                "",
+            )
+        ).upper()
+        score = STRUCTURE_MAX * 0.45
+        bullish_words = (
+            "HAUSSI",
+            "BULLISH",
+            "BUY",
         )
-
+        bearish_words = (
+            "BAISS",
+            "BEARISH",
+            "SELL",
+        )
+        is_bullish = any(
+            word in structure
+            for word in bullish_words
+        )
+        is_bearish = any(
+            word in structure
+            for word in bearish_words
+        )
+        if (
+            direction == "BUY"
+            and is_bullish
+        ):
+            score = STRUCTURE_MAX * 0.90
+        elif (
+            direction == "SELL"
+            and is_bearish
+        ):
+            score = STRUCTURE_MAX * 0.90
+        elif (
+            direction == "BUY"
+            and is_bearish
+        ):
+            score = STRUCTURE_MAX * 0.10
+        elif (
+            direction == "SELL"
+            and is_bullish
+        ):
+            score = STRUCTURE_MAX * 0.10
+        elif "RANGE" in structure:
+            score = STRUCTURE_MAX * 0.50
+        elif "TRANSITION" in structure:
+            score = STRUCTURE_MAX * 0.35
+        return (
+            self._clamp(
+                score,
+                0.0,
+                STRUCTURE_MAX,
+            ),
+            (
+                "Structure cohérente avec la direction."
+                if score >= STRUCTURE_MAX * 0.70
+                else "Structure encore partiellement exploitable."
+            ),
+        )
     # ========================================================
     # REACTION
     # ========================================================
-
     def _score_reaction(
         self,
         confluences: Any,
         setup: Any,
     ) -> tuple[float, str]:
-
-        source = confluences
-
+        source = (
+            confluences
+            or self._get(
+                setup,
+                "confluences",
+            )
+            or setup
+        )
         if source is None:
-            source = setup
-
+            return (
+                0.0,
+                "Réaction indisponible.",
+            )
         explicit = self._number(
             self._get(
                 source,
                 "reaction_score",
             )
         )
-
         if explicit is not None:
-
-            score = self._clamp(
-                explicit,
-                0.0,
-                REACTION_MAX,
-            )
-
+            if explicit <= 1.0:
+                score = (
+                    explicit
+                    * REACTION_MAX
+                )
+            elif explicit <= 100.0:
+                score = (
+                    explicit
+                    / 100.0
+                ) * REACTION_MAX
+            else:
+                score = REACTION_MAX
         else:
-
             reaction = self._get(
                 source,
                 "reaction",
             )
-
-            if isinstance(reaction, dict):
-
+            if isinstance(
+                reaction,
+                dict,
+            ):
                 strength = self._number(
                     reaction.get(
-                        "strength",
+                        "strength"
                     )
                 )
-
             else:
-
                 strength = self._number(
                     self._get(
                         source,
                         "reaction_strength",
                     )
                 )
-
             if strength is None:
                 strength = 0.0
-
             if strength <= 1.0:
-                score = strength * REACTION_MAX
+                score = (
+                    strength
+                    * REACTION_MAX
+                )
             else:
                 score = (
-                    strength / 100.0
+                    strength
+                    / 100.0
                 ) * REACTION_MAX
-
-            score = self._clamp(
-                score,
-                0.0,
-                REACTION_MAX,
-            )
-
-        return score, (
-            "Réaction du prix favorable détectée."
-            if score >= REACTION_MAX * 0.65
-            else "Réaction présente mais encore modérée."
+        score = self._clamp(
+            score,
+            0.0,
+            REACTION_MAX,
         )
-
+        if score >= REACTION_MAX * 0.70:
+            reason = (
+                "Réaction du prix clairement favorable."
+            )
+        elif score >= REACTION_MAX * 0.45:
+            reason = (
+                "Réaction présente mais modérée."
+            )
+        else:
+            reason = (
+                "Réaction encore faible."
+            )
+        return score, reason
     # ========================================================
     # CONFLUENCES
     # ========================================================
-
     def _score_confluence(
         self,
         confluences: Any,
     ) -> tuple[float, str]:
-
         if confluences is None:
-            return 0.0, "Aucune confluence disponible."
-
+            return (
+                0.0,
+                "Aucune confluence disponible.",
+            )
         explicit = self._number(
             self._get(
                 confluences,
                 "confluence_score",
             )
         )
-
         if explicit is not None:
-
-            # Accepte aussi bien 0-10 que 0-100.
             if explicit > CONFLUENCE_MAX:
                 explicit = (
-                    explicit / 100.0
+                    explicit
+                    / 100.0
                 ) * CONFLUENCE_MAX
-
             score = self._clamp(
                 explicit,
                 0.0,
                 CONFLUENCE_MAX,
             )
-
-            return score, (
-                "Confluences cohérentes."
-                if score >= CONFLUENCE_MAX * 0.65
-                else "Confluences encore limitées."
+            return (
+                score,
+                (
+                    "Confluences suffisamment cohérentes."
+                    if score >= CONFLUENCE_MAX * 0.65
+                    else "Confluences encore limitées."
+                ),
             )
-
         items = self._get(
             confluences,
             "confluences",
             [],
         )
-
-        if not isinstance(items, list):
+        if not isinstance(
+            items,
+            list,
+        ):
             items = []
-
         useful = 0
-
+        strengths = []
         for item in items:
-
             strength = self._number(
                 self._get(
                     item,
                     "strength",
                 )
             )
-
             if strength is None:
                 strength = self._number(
                     self._get(
@@ -572,44 +717,63 @@ class Moteur2Score:
                         "score",
                     )
                 )
-
             if strength is None:
                 strength = 50.0
-
-            if strength >= 40:
+            strength = self._clamp(
+                strength,
+                0.0,
+                100.0,
+            )
+            if strength >= 45.0:
                 useful += 1
-
-        score = min(
-            CONFLUENCE_MAX,
-            useful * 2.5,
+                strengths.append(
+                    strength
+                )
+        # Rendement décroissant :
+        # la 4e ou 5e confluence ne doit pas
+        # gonfler artificiellement le score.
+        if useful == 0:
+            score = 0.0
+        elif useful == 1:
+            score = CONFLUENCE_MAX * 0.35
+        elif useful == 2:
+            score = CONFLUENCE_MAX * 0.60
+        elif useful == 3:
+            score = CONFLUENCE_MAX * 0.78
+        else:
+            score = CONFLUENCE_MAX * 0.90
+        return (
+            self._clamp(
+                score,
+                0.0,
+                CONFLUENCE_MAX,
+            ),
+            (
+                f"{useful} confluence(s) exploitable(s)."
+                if useful
+                else
+                "Peu de confluences exploitables."
+            ),
         )
-
-        return score, (
-            f"{useful} confluence(s) exploitable(s)."
-            if useful > 0
-            else "Peu de confluences exploitables."
-        )
-
     # ========================================================
     # M5
     # ========================================================
-
     def _score_m5(
         self,
         confirmation: Any,
         direction: str,
     ) -> tuple[float, str]:
-
         if confirmation is None:
-            return 0.0, "Confirmation M5 indisponible."
-
+            return (
+                0.0,
+                "Confirmation M5 indisponible.",
+            )
         value = self._number(
             self._get(
                 confirmation,
                 "m5_score",
             )
         )
-
         if value is None:
             value = self._number(
                 self._get(
@@ -617,59 +781,73 @@ class Moteur2Score:
                     "score_m5",
                 )
             )
-
         if value is None:
-            return 0.0, "Score M5 indisponible."
-
+            return (
+                0.0,
+                "Score M5 indisponible.",
+            )
         value = self._clamp(
             value,
             0.0,
             100.0,
         )
-
-        score = (
-            value / 100.0
-        ) * M5_MAX
-
         bias = self._normalize_direction(
             self._get(
                 confirmation,
                 "m5_bias",
             )
         )
-
-        if bias not in {
-            direction,
-            "UNKNOWN",
-        }:
-            score *= 0.50
-
-        return score, (
-            "M5 confirme correctement le timing."
-            if score >= M5_MAX * 0.65
-            else "M5 apporte une confirmation limitée."
+        # Le score M5 est directionnel.
+        if (
+            bias not in {
+                direction,
+                "UNKNOWN",
+            }
+        ):
+            value *= 0.45
+        score = (
+            value
+            / 100.0
+        ) * M5_MAX
+        if score >= M5_MAX * 0.70:
+            reason = (
+                "M5 fournit un timing de bonne qualité."
+            )
+        elif score >= M5_MAX * 0.45:
+            reason = (
+                "M5 apporte une confirmation modérée."
+            )
+        else:
+            reason = (
+                "M5 apporte une confirmation limitée."
+            )
+        return (
+            self._clamp(
+                score,
+                0.0,
+                M5_MAX,
+            ),
+            reason,
         )
-
     # ========================================================
     # M1
     # ========================================================
-
     def _score_m1(
         self,
         confirmation: Any,
         direction: str,
     ) -> tuple[float, str]:
-
         if confirmation is None:
-            return 0.0, "Confirmation M1 indisponible."
-
+            return (
+                0.0,
+                "Confirmation M1 indisponible.",
+            )
         value = self._number(
             self._get(
                 confirmation,
                 "m1_score",
             )
         )
-
         if value is None:
             value = self._number(
                 self._get(
@@ -677,58 +855,71 @@ class Moteur2Score:
                     "score_m1",
                 )
             )
-
         if value is None:
-            return 0.0, "Score M1 indisponible."
-
+            return (
+                0.0,
+                "Score M1 indisponible.",
+            )
         value = self._clamp(
             value,
             0.0,
             100.0,
         )
-
-        score = (
-            value / 100.0
-        ) * M1_MAX
-
         bias = self._normalize_direction(
             self._get(
                 confirmation,
                 "m1_bias",
             )
         )
-
-        if bias not in {
-            direction,
-            "UNKNOWN",
-        }:
-            score *= 0.50
-
-        return score, (
-            "M1 renforce le timing."
-            if score >= M1_MAX * 0.65
-            else "M1 apporte peu de confirmation supplémentaire."
+        if (
+            bias not in {
+                direction,
+                "UNKNOWN",
+            }
+        ):
+            value *= 0.40
+        score = (
+            value
+            / 100.0
+        ) * M1_MAX
+        if score >= M1_MAX * 0.70:
+            reason = (
+                "M1 renforce utilement le timing."
+            )
+        elif score >= M1_MAX * 0.45:
+            reason = (
+                "M1 apporte une information secondaire."
+            )
+        else:
+            reason = (
+                "M1 apporte peu d'information supplémentaire."
+            )
+        return (
+            self._clamp(
+                score,
+                0.0,
+                M1_MAX,
+            ),
+            reason,
         )
-
     # ========================================================
     # RR
     # ========================================================
-
     def _score_rr(
         self,
         risk_plan: Any,
     ) -> tuple[float, str]:
-
         if risk_plan is None:
-            return 0.0, "Plan de risque indisponible."
-
+            return (
+                0.0,
+                "Plan de risque indisponible.",
+            )
         rr = self._number(
             self._get(
                 risk_plan,
                 "primary_rr",
             )
         )
-
         if rr is None:
             rr = self._number(
                 self._get(
@@ -736,68 +927,78 @@ class Moteur2Score:
                     "rr_tp1",
                 )
             )
-
         if rr is None:
-            return 0.0, "RR indisponible."
-
-        if rr < 1.0:
-            score = 0.0
-
-        elif rr >= 4.0:
+            return (
+                0.0,
+                "RR primaire indisponible.",
+            )
+        # ----------------------------------------------------
+        # Le minimum structurel est 3R.
+        #
+        # Le score récompense davantage les RR supérieurs,
+        # mais ne transforme jamais un RR inférieur à 3
+        # en plan acceptable.
+        # ----------------------------------------------------
+        if rr < self.minimum_rr:
+            return (
+                0.0,
+                (
+                    f"RR primaire de {rr:.2f}, "
+                    f"inférieur au minimum requis de "
+                    f"{self.minimum_rr:.2f}."
+                ),
+            )
+        # 3R = environ 65 % du maximum.
+        # 4R = environ 82 %.
+        # 5R ou plus = maximum.
+        if rr >= 5.0:
             score = RR_MAX
-
+        elif rr >= 4.0:
+            score = RR_MAX * 0.82
         else:
-            # 1 → 0 point
-            # 2 → 5 points
-            # 3 → 7.5 points
-            # 4 → 10 points
+            # Entre 3R et 4R.
+            progress = (
+                rr - 3.0
+            )
             score = (
-                (rr - 1.0)
-                / 3.0
-            ) * RR_MAX
-
+                RR_MAX * 0.65
+                + progress
+                * RR_MAX
+                * 0.17
+            )
         score = self._clamp(
             score,
             0.0,
             RR_MAX,
         )
-
-        return score, (
-            f"RR primaire de {rr:.2f}, structure de risque favorable."
-            if rr >= 2.0
-            else f"RR primaire de {rr:.2f}, inférieur au minimum requis."
+        return (
+            score,
+            (
+                f"RR primaire de {rr:.2f}, "
+                "compatible avec le minimum requis."
+            ),
         )
-
     # ========================================================
-    # QUALITE
+    # QUALITÉ
     # ========================================================
-
+    @staticmethod
     def _quality_label(
-        self,
         score: float,
     ) -> str:
-
-        if score >= 85:
+        if score >= 85.0:
             return "A+"
-
-        if score >= 75:
+        if score >= 75.0:
             return "A"
-
-        if score >= 65:
+        if score >= 65.0:
             return "B"
-
-        if score >= 55:
+        if score >= 55.0:
             return "C"
-
-        if score >= 40:
+        if score >= 40.0:
             return "D"
-
         return "E"
-
     # ========================================================
     # ANALYSE
     # ========================================================
-
     def analyser(
         self,
         setup: Any,
@@ -806,12 +1007,19 @@ class Moteur2Score:
         confluences: Any = None,
         confirmation: Any = None,
         risk_plan: Any = None,
+        symbol: Optional[str] = None,
     ) -> ScoreResult:
-
-        symbol = self._extract_symbol(
-            setup
+        resolved_symbol = (
+            self._normalize_symbol(symbol)
+            if symbol is not None
+            else self._extract_symbol(
+                setup,
+                risk_plan,
+                confirmation,
+            )
         )
-
+        if resolved_symbol is None:
+            resolved_symbol = "UNKNOWN"
         setup_id = str(
             self._get(
                 setup,
@@ -823,7 +1031,6 @@ class Moteur2Score:
             )
             or "SETUP"
         )
-
         direction = self._normalize_direction(
             self._get(
                 setup,
@@ -834,25 +1041,21 @@ class Moteur2Score:
                 "direction",
             )
         )
-
         # ----------------------------------------------------
-        # SCORES
+        # COMPOSANTS
         # ----------------------------------------------------
-
         zone_score, zone_reason = (
             self._score_zone(
                 zones,
                 setup,
             )
         )
-
         context_score, context_reason = (
             self._score_context(
                 context,
                 setup,
             )
         )
-
         structure_score, structure_reason = (
             self._score_structure(
                 context,
@@ -860,44 +1063,37 @@ class Moteur2Score:
                 setup,
             )
         )
-
         reaction_score, reaction_reason = (
             self._score_reaction(
                 confluences,
                 setup,
             )
         )
-
         confluence_score, confluence_reason = (
             self._score_confluence(
                 confluences,
             )
         )
-
         m5_score, m5_reason = (
             self._score_m5(
                 confirmation,
                 direction,
             )
         )
-
         m1_score, m1_reason = (
             self._score_m1(
                 confirmation,
                 direction,
             )
         )
-
         rr_score, rr_reason = (
             self._score_rr(
                 risk_plan,
             )
         )
-
         # ----------------------------------------------------
         # TOTAL
         # ----------------------------------------------------
-
         total = (
             zone_score
             + context_score
@@ -908,114 +1104,142 @@ class Moteur2Score:
             + m1_score
             + rr_score
         )
-
         total = self._clamp(
             total,
             0.0,
             MAX_SCORE,
         )
-
         total = round(
             total,
             2,
         )
-
         # ----------------------------------------------------
         # FORCES / FAIBLESSES
         # ----------------------------------------------------
-
+        strengths: List[str] = []
+        weaknesses: List[str] = []
         components = [
             (
                 zone_score,
+                ZONE_MAX,
                 "Zone fortement pertinente.",
                 "Zone peu pertinente.",
             ),
             (
                 context_score,
+                CONTEXT_MAX,
                 "Contexte global favorable.",
-                "Contexte global moyen.",
+                "Contexte global faible ou opposé.",
             ),
             (
                 structure_score,
+                STRUCTURE_MAX,
                 "Structure exploitable.",
-                "Structure peu claire.",
+                "Structure peu claire ou opposée.",
             ),
             (
                 reaction_score,
+                REACTION_MAX,
                 "Réaction intéressante.",
                 "Réaction encore faible.",
             ),
             (
                 confluence_score,
+                CONFLUENCE_MAX,
                 "Bon ensemble de confluences.",
                 "Peu de confluences.",
             ),
             (
                 m5_score,
+                M5_MAX,
                 "M5 apporte un bon timing.",
                 "M5 apporte peu de confirmation.",
             ),
             (
                 m1_score,
+                M1_MAX,
                 "M1 renforce le timing.",
-                "M1 apporte peu d'information.",
+                "M1 apporte peu d'information supplémentaire.",
             ),
             (
                 rr_score,
-                "RR favorable.",
-                "RR peu favorable.",
+                RR_MAX,
+                "RR compatible avec le minimum requis.",
+                "RR insuffisant.",
             ),
         ]
-
-        maximums = [
-            ZONE_MAX,
-            CONTEXT_MAX,
-            STRUCTURE_MAX,
-            REACTION_MAX,
-            CONFLUENCE_MAX,
-            M5_MAX,
-            M1_MAX,
-            RR_MAX,
-        ]
-
-        strengths = []
-        weaknesses = []
-
-        for index, item in enumerate(components):
-
-            value, positive, negative = item
-            maximum = maximums[index]
-
+        for (
+            value,
+            maximum,
+            positive,
+            negative,
+        ) in components:
             if value >= maximum * 0.70:
-                strengths.append(positive)
-
-            elif value < maximum * 0.45:
-                weaknesses.append(negative)
-
-        # Ajouter les raisons principales si nécessaire.
-        reason_pairs = [
-            (zone_score, zone_reason),
-            (context_score, context_reason),
-            (structure_score, structure_reason),
-            (reaction_score, reaction_reason),
-            (confluence_score, confluence_reason),
-            (m5_score, m5_reason),
-            (m1_score, m1_reason),
-            (rr_score, rr_reason),
-        ]
-
+                strengths.append(
+                    positive
+                )
+            elif value < maximum * 0.40:
+                weaknesses.append(
+                    negative
+                )
+        # ----------------------------------------------------
+        # INFORMATIONS DÉTAILLÉES
+        # ----------------------------------------------------
+        rr_primary = self._number(
+            self._get(
+                risk_plan,
+                "primary_rr",
+            )
+        )
+        confirmation_valid = bool(
+            self._get(
+                confirmation,
+                "confirmation_valid",
+                False,
+            )
+        )
+        risk_valid = bool(
+            self._get(
+                risk_plan,
+                "valid",
+                False,
+            )
+        )
         metadata = {
             "components": {
-                "zone": round(zone_score, 2),
-                "context": round(context_score, 2),
-                "structure": round(structure_score, 2),
-                "reaction": round(reaction_score, 2),
-                "confluence": round(confluence_score, 2),
-                "m5": round(m5_score, 2),
-                "m1": round(m1_score, 2),
-                "rr": round(rr_score, 2),
+                "zone": round(
+                    zone_score,
+                    2,
+                ),
+                "context": round(
+                    context_score,
+                    2,
+                ),
+                "structure": round(
+                    structure_score,
+                    2,
+                ),
+                "reaction": round(
+                    reaction_score,
+                    2,
+                ),
+                "confluence": round(
+                    confluence_score,
+                    2,
+                ),
+                "m5": round(
+                    m5_score,
+                    2,
+                ),
+                "m1": round(
+                    m1_score,
+                    2,
+                ),
+                "rr": round(
+                    rr_score,
+                    2,
+                ),
             },
-
             "maximums": {
                 "zone": ZONE_MAX,
                 "context": CONTEXT_MAX,
@@ -1026,55 +1250,90 @@ class Moteur2Score:
                 "m1": M1_MAX,
                 "rr": RR_MAX,
             },
-
-            "rr_primary": self._number(
-                self._get(
-                    risk_plan,
-                    "primary_rr",
-                )
+            "total_maximum": TOTAL_MAX,
+            "score_threshold": (
+                self.score_threshold
             ),
-
-            "risk_plan_valid": bool(
-                self._get(
-                    risk_plan,
-                    "valid",
-                    False,
-                )
+            "minimum_rr": (
+                self.minimum_rr
             ),
-
+            "rr_primary": rr_primary,
+            "rr_requirement_met": (
+                rr_primary is not None
+                and rr_primary >= self.minimum_rr
+            ),
+            "risk_plan_valid": risk_valid,
+            "confirmation_valid": (
+                confirmation_valid
+            ),
             "confirmation_status": self._get(
                 confirmation,
                 "confirmation_status",
             ),
+            "m5_is_primary_confirmation": True,
+            "m1_is_secondary_confirmation": True,
+            "score_is_decisive": False,
+            "final_validation_owner": (
+                "moteur2_validation.py"
+            ),
+            "reasons": {
+                "zone": zone_reason,
+                "context": context_reason,
+                "structure": structure_reason,
+                "reaction": reaction_reason,
+                "confluence": confluence_reason,
+                "m5": m5_reason,
+                "m1": m1_reason,
+                "rr": rr_reason,
+            },
         }
-
         return ScoreResult(
-            symbol=symbol,
+            symbol=resolved_symbol,
             setup_id=setup_id,
             direction=direction,
-
             score=total,
-            quality=self._quality_label(total),
-
-            zone_score=round(zone_score, 2),
-            context_score=round(context_score, 2),
-            structure_score=round(structure_score, 2),
-            reaction_score=round(reaction_score, 2),
-            confluence_score=round(confluence_score, 2),
-            m5_score=round(m5_score, 2),
-            m1_score=round(m1_score, 2),
-            rr_score=round(rr_score, 2),
-
+            quality=self._quality_label(
+                total
+            ),
+            zone_score=round(
+                zone_score,
+                2,
+            ),
+            context_score=round(
+                context_score,
+                2,
+            ),
+            structure_score=round(
+                structure_score,
+                2,
+            ),
+            reaction_score=round(
+                reaction_score,
+                2,
+            ),
+            confluence_score=round(
+                confluence_score,
+                2,
+            ),
+            m5_score=round(
+                m5_score,
+                2,
+            ),
+            m1_score=round(
+                m1_score,
+                2,
+            ),
+            rr_score=round(
+                rr_score,
+                2,
+            ),
             strengths=strengths,
             weaknesses=weaknesses,
-
             metadata=metadata,
         )
-
     # ========================================================
     # PLUSIEURS SETUPS
     # ========================================================
-
     def analyser_setups(
         self,
         setups: Any,
@@ -1084,41 +1343,60 @@ class Moteur2Score:
         confirmations: Any = None,
         risk_plans: Any = None,
     ) -> List[ScoreResult]:
-
         if setups is None:
             return []
-
-        if isinstance(setups, dict):
-
+        if isinstance(
+            setups,
+            dict,
+        ):
             setup_list = (
                 setups.get("setups")
-                or setups.get("detected_setups")
-                or setups.get("results")
+                or setups.get(
+                    "detected_setups"
+                )
+                or setups.get(
+                    "results"
+                )
                 or []
             )
-
-        elif isinstance(setups, (list, tuple)):
-
-            setup_list = list(setups)
-
+        elif isinstance(
+            setups,
+            (list, tuple),
+        ):
+            setup_list = list(
+                setups
+            )
         else:
-
-            setup_list = [setups]
-
-        results = []
-
-        for index, setup in enumerate(setup_list):
-
+            setup_list = [
+                setups
+            ]
+        results: List[
+            ScoreResult
+        ] = []
+        for index, setup in enumerate(
+            setup_list
+        ):
             confirmation = None
             risk_plan = None
-
-            if isinstance(confirmations, list):
-
-                if index < len(confirmations):
-                    confirmation = confirmations[index]
-
-            elif isinstance(confirmations, dict):
-
+            # ------------------------------------------------
+            # Confirmation
+            # ------------------------------------------------
+            if isinstance(
+                confirmations,
+                list,
+            ):
+                if index < len(
+                    confirmations
+                ):
+                    confirmation = (
+                        confirmations[
+                            index
+                        ]
+                    )
+            elif isinstance(
+                confirmations,
+                dict,
+            ):
                 setup_id = str(
                     self._get(
                         setup,
@@ -1130,18 +1408,30 @@ class Moteur2Score:
                     )
                     or ""
                 )
-
-                confirmation = confirmations.get(
-                    setup_id
+                confirmation = (
+                    confirmations.get(
+                        setup_id
+                    )
                 )
-
-            if isinstance(risk_plans, list):
-
-                if index < len(risk_plans):
-                    risk_plan = risk_plans[index]
-
-            elif isinstance(risk_plans, dict):
-
+            # ------------------------------------------------
+            # Risk
+            # ------------------------------------------------
+            if isinstance(
+                risk_plans,
+                list,
+            ):
+                if index < len(
+                    risk_plans
+                ):
+                    risk_plan = (
+                        risk_plans[
+                            index
+                        ]
+                    )
+            elif isinstance(
+                risk_plans,
+                dict,
+            ):
                 setup_id = str(
                     self._get(
                         setup,
@@ -1153,11 +1443,11 @@ class Moteur2Score:
                     )
                     or ""
                 )
-
-                risk_plan = risk_plans.get(
-                    setup_id
+                risk_plan = (
+                    risk_plans.get(
+                        setup_id
+                    )
                 )
-
             result = self.analyser(
                 setup=setup,
                 zones=zones,
@@ -1166,27 +1456,23 @@ class Moteur2Score:
                 confirmation=confirmation,
                 risk_plan=risk_plan,
             )
-
-            results.append(result)
-
+            results.append(
+                result
+            )
         return results
-
     # ========================================================
     # DICTIONNAIRE
     # ========================================================
-
     @staticmethod
     def to_dict(
         result: ScoreResult,
     ) -> Dict[str, Any]:
-
-        return asdict(result)
-
-
+        return asdict(
+            result
+        )
 # ============================================================
 # FONCTION PUBLIQUE
 # ============================================================
-
 def calculer_score(
     setup: Any,
     zones: Any = None,
@@ -1194,10 +1480,9 @@ def calculer_score(
     confluences: Any = None,
     confirmation: Any = None,
     risk_plan: Any = None,
+    symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
-
     moteur = Moteur2Score()
-
     result = moteur.analyser(
         setup=setup,
         zones=zones,
@@ -1205,39 +1490,36 @@ def calculer_score(
         confluences=confluences,
         confirmation=confirmation,
         risk_plan=risk_plan,
+        symbol=symbol,
     )
-
-    return moteur.to_dict(result)
-
-
+    return moteur.to_dict(
+        result
+    )
 # ============================================================
 # TEST LOCAL
 # ============================================================
-
 if __name__ == "__main__":
-
     setup_test = {
         "setup_id": "XAUUSD_BUY_TEST",
         "symbol": "XAUUSD",
         "direction": "BUY",
         "setup_type": "CONTINUATION",
     }
-
     zones_test = {
         "important_zones": [
             {
+                "zone_id": "ZONE_01",
                 "low": 4600,
                 "high": 4610,
                 "strength": 85,
             }
         ]
     }
-
     context_test = {
         "global_bias": "BUY",
-        "structure": "STRUCTURE_HAUSSIERE",
+        "alignment": "COHERENT",
+        "structure": "HAUSSIERE",
     }
-
     confluences_test = {
         "confluences": [
             {
@@ -1253,23 +1535,22 @@ if __name__ == "__main__":
                 "strength": 70,
             },
         ],
-        "reaction_score": 12,
+        "reaction_score": 75,
     }
-
     confirmation_test = {
         "m5_score": 78,
         "m1_score": 68,
         "m5_bias": "BUY",
         "m1_bias": "BUY",
-        "confirmation_status": "ENTRY_TRIGGERED",
+        "confirmation_status": "CONFIRMED_M5_M1",
+        "confirmation_valid": True,
     }
-
     risk_plan_test = {
+        "symbol": "XAUUSD",
         "direction": "BUY",
-        "primary_rr": 2.8,
+        "primary_rr": 3.2,
         "valid": True,
     }
-
     result = calculer_score(
         setup=setup_test,
         zones=zones_test,
@@ -1278,7 +1559,5 @@ if __name__ == "__main__":
         confirmation=confirmation_test,
         risk_plan=risk_plan_test,
     )
-
     from pprint import pprint
-
     pprint(result)
