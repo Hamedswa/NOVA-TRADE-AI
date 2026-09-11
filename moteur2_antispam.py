@@ -61,9 +61,7 @@ class AntiSpamResult:
     duplicate: bool = False
     active_duplicate: bool = False
     cooldown: bool = False
-    metadata: Dict[str, Any] = field(
-        default_factory=dict
-    )
+    metadata: Dict[str, Any] = field(default_factory=dict)
 # ============================================================
 # MOTEUR ANTISPAM
 # ============================================================
@@ -94,7 +92,7 @@ class Moteur2AntiSpam:
             10,
             int(max_history),
         )
-        # Historique des signaux envoyés.
+        # Historique des signaux effectivement enregistrés.
         self.history: List[Dict[str, Any]] = []
         # Signaux actuellement actifs.
         self.active_setups: Dict[
@@ -182,6 +180,83 @@ class Moteur2AntiSpam:
             default,
         )
     # ========================================================
+    # IDENTITE DU SYMBOLE
+    # ========================================================
+    def _get_setup_symbol(
+        self,
+        setup: Any,
+    ) -> str:
+        return self._normalize_symbol(
+            self._extract(
+                setup,
+                "symbol",
+                None,
+            )
+        )
+    def _get_validation_symbol(
+        self,
+        validation: Any,
+    ) -> str:
+        return self._normalize_symbol(
+            self._extract(
+                validation,
+                "symbol",
+                None,
+            )
+        )
+    def _get_risk_symbol(
+        self,
+        risk_plan: Any,
+    ) -> str:
+        return self._normalize_symbol(
+            self._extract(
+                risk_plan,
+                "symbol",
+                None,
+            )
+        )
+    def _symbols_coherent(
+        self,
+        setup: Any,
+        risk_plan: Any,
+        validation: Any,
+    ) -> tuple[bool, str]:
+        """
+        Vérifie que les symboles explicitement présents
+        dans les différents résultats sont cohérents.
+        Un symbole absent dans un résultat optionnel n'est
+        pas considéré comme une erreur.
+        En revanche, un symbole explicitement renseigné
+        mais différent du setup bloque le passage.
+        """
+        setup_symbol = self._get_setup_symbol(setup)
+        risk_symbol = self._get_risk_symbol(risk_plan)
+        validation_symbol = self._get_validation_symbol(validation)
+        if not setup_symbol:
+            return False, "Symbole du setup absent ou non supporté."
+        explicit_symbols = {
+            "setup": setup_symbol,
+        }
+        if self._extract(risk_plan, "symbol", None) is not None:
+            if not risk_symbol:
+                return False, "Symbole du risk plan absent ou non supporté."
+            explicit_symbols["risk"] = risk_symbol
+        if self._extract(validation, "symbol", None) is not None:
+            if not validation_symbol:
+                return (
+                    False,
+                    "Symbole de la validation absent ou non supporté.",
+                )
+            explicit_symbols["validation"] = validation_symbol
+        symbols = set(explicit_symbols.values())
+        if len(symbols) > 1:
+            return (
+                False,
+                "Les symboles du setup, risk plan et validation "
+                "ne sont pas cohérents.",
+            )
+        return True, ""
+    # ========================================================
     # IDENTIFIANT UNIQUE
     # ========================================================
     def generer_setup_id(
@@ -199,8 +274,6 @@ class Moteur2AntiSpam:
             zone
             Entry
             SL
-        Cela permet de distinguer correctement les setups
-        entre XAUUSD, BTCUSD, EURUSD et GBPUSD.
         """
         existing_id = self._extract(
             setup,
@@ -211,13 +284,7 @@ class Moteur2AntiSpam:
             return str(
                 existing_id
             ).strip()
-        symbol = self._normalize_symbol(
-            self._extract(
-                setup,
-                "symbol",
-                None,
-            )
-        )
+        symbol = self._get_setup_symbol(setup)
         direction = self._normalize_direction(
             self._extract(
                 setup,
@@ -253,9 +320,6 @@ class Moteur2AntiSpam:
                 0.0,
             )
         )
-        # Une précision raisonnable permet d'éviter
-        # qu'une variation flottante minime crée un nouveau
-        # signal tout en conservant une identité stable.
         entry_key = f"{entry:.5f}"
         sl_key = f"{sl:.5f}"
         raw = (
@@ -279,22 +343,16 @@ class Moteur2AntiSpam:
         # Signaux actifs expirés
         # ----------------------------------------------------
         expired_ids: List[str] = []
-        for setup_id, data in (
-            self.active_setups.items()
-        ):
+        for setup_id, data in self.active_setups.items():
             timestamp = self._safe_float(
-                data.get(
-                    "timestamp"
-                ),
+                data.get("timestamp"),
                 0.0,
             )
             if (
                 now - timestamp
                 > self.active_timeout_seconds
             ):
-                expired_ids.append(
-                    setup_id
-                )
+                expired_ids.append(setup_id)
         for setup_id in expired_ids:
             self.active_setups.pop(
                 setup_id,
@@ -304,11 +362,9 @@ class Moteur2AntiSpam:
         # Historique limité
         # ----------------------------------------------------
         if len(self.history) > self.max_history:
-            self.history = (
-                self.history[
-                    -self.max_history:
-                ]
-            )
+            self.history = self.history[
+                -self.max_history:
+            ]
     # ========================================================
     # HISTORIQUE
     # ========================================================
@@ -316,13 +372,8 @@ class Moteur2AntiSpam:
         self,
         setup_id: str,
     ) -> Optional[Dict[str, Any]]:
-        for item in reversed(
-            self.history
-        ):
-            if (
-                item.get("setup_id")
-                == setup_id
-            ):
+        for item in reversed(self.history):
+            if item.get("setup_id") == setup_id:
                 return item
         return None
     # ========================================================
@@ -341,18 +392,11 @@ class Moteur2AntiSpam:
         if last is None:
             return False
         last_timestamp = self._safe_float(
-            last.get(
-                "timestamp"
-            ),
+            last.get("timestamp"),
             0.0,
         )
-        elapsed = (
-            now - last_timestamp
-        )
-        return (
-            elapsed
-            < self.cooldown_seconds
-        )
+        elapsed = now - last_timestamp
+        return elapsed < self.cooldown_seconds
     # ========================================================
     # SETUP ACTIF
     # ========================================================
@@ -360,10 +404,7 @@ class Moteur2AntiSpam:
         self,
         setup_id: str,
     ) -> bool:
-        return (
-            setup_id
-            in self.active_setups
-        )
+        return setup_id in self.active_setups
     # ========================================================
     # VALIDATION PREALABLE
     # ========================================================
@@ -374,7 +415,7 @@ class Moteur2AntiSpam:
         """
         L'anti-spam n'accepte qu'une validation finale
         explicitement READY_FOR_SIGNAL.
-        Il ne crée jamais lui-même cette validation.
+        Il ne crée jamais cette validation.
         """
         if validation is None:
             return False
@@ -404,13 +445,15 @@ class Moteur2AntiSpam:
     ) -> AntiSpamResult:
         """
         Vérifie si un signal déjà validé peut être envoyé.
-        L'ordre est volontaire :
+        Ordre :
             1. validation finale ;
             2. identité du setup ;
-            3. setup actif ;
-            4. cooldown ;
-            5. autorisation.
-        L'anti-spam ne remplace jamais moteur2_validation.py.
+            3. cohérence des symboles ;
+            4. setup actif ;
+            5. cooldown ;
+            6. autorisation.
+        L'anti-spam ne remplace jamais
+        moteur2_validation.py.
         """
         self._cleanup()
         now = time.time()
@@ -421,9 +464,7 @@ class Moteur2AntiSpam:
         # ----------------------------------------------------
         # Validation obligatoire
         # ----------------------------------------------------
-        if not self._validation_ready(
-            validation
-        ):
+        if not self._validation_ready(validation):
             return AntiSpamResult(
                 allowed=False,
                 status="REJECTED_VALIDATION",
@@ -434,44 +475,42 @@ class Moteur2AntiSpam:
                     "le passage dans l'anti-spam."
                 ),
                 metadata={
-                    "required_status": (
-                        READY_FOR_SIGNAL
-                    ),
+                    "required_status": READY_FOR_SIGNAL,
                     "validation_authority": (
                         "moteur2_validation.py"
                     ),
                 },
             )
         # ----------------------------------------------------
-        # Symbole valide
+        # Symbole et cohérence
         # ----------------------------------------------------
-        symbol = self._normalize_symbol(
-            self._extract(
-                setup,
-                "symbol",
-                None,
-            )
+        symbols_ok, symbol_reason = self._symbols_coherent(
+            setup,
+            risk_plan,
+            validation,
         )
-        if not symbol:
+        if not symbols_ok:
             return AntiSpamResult(
                 allowed=False,
-                status="INVALID_SYMBOL",
+                status="SYMBOL_INCOHERENT",
                 setup_id=setup_id,
-                reason=(
-                    "Symbole absent ou non supporté."
-                ),
+                reason=symbol_reason,
                 metadata={
-                    "supported_symbols": (
-                        list(SUPPORTED_SYMBOLS)
+                    "setup_symbol": self._get_setup_symbol(setup),
+                    "risk_symbol": self._get_risk_symbol(risk_plan),
+                    "validation_symbol": (
+                        self._get_validation_symbol(validation)
+                    ),
+                    "supported_symbols": list(
+                        SUPPORTED_SYMBOLS
                     ),
                 },
             )
+        symbol = self._get_setup_symbol(setup)
         # ----------------------------------------------------
         # Setup déjà actif
         # ----------------------------------------------------
-        if self._check_active_duplicate(
-            setup_id
-        ):
+        if self._check_active_duplicate(setup_id):
             return AntiSpamResult(
                 allowed=False,
                 status="ACTIVE_DUPLICATE",
@@ -496,13 +535,11 @@ class Moteur2AntiSpam:
             last = self._find_history(
                 setup_id
             )
-            last_timestamp = (
-                self._safe_float(
-                    last.get("timestamp")
-                    if last
-                    else 0.0,
-                    0.0,
-                )
+            last_timestamp = self._safe_float(
+                last.get("timestamp")
+                if last
+                else 0.0,
+                0.0,
             )
             elapsed = max(
                 0.0,
@@ -510,8 +547,7 @@ class Moteur2AntiSpam:
             )
             remaining = max(
                 0.0,
-                self.cooldown_seconds
-                - elapsed,
+                self.cooldown_seconds - elapsed,
             )
             return AntiSpamResult(
                 allowed=False,
@@ -554,9 +590,7 @@ class Moteur2AntiSpam:
                 "cooldown_seconds": (
                     self.cooldown_seconds
                 ),
-                "validation_required": (
-                    READY_FOR_SIGNAL
-                ),
+                "validation_required": READY_FOR_SIGNAL,
             },
         )
     # ========================================================
@@ -568,27 +602,39 @@ class Moteur2AntiSpam:
         risk_plan: Any = None,
         setup_id: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None,
-    ) -> str:
+        validation: Any = None,
+    ) -> Optional[str]:
         """
         Enregistre un signal effectivement publié.
-        Aucun calcul de risque ou de rentabilité n'est effectué.
+        Par sécurité, cette méthode accepte désormais
+        uniquement un signal dont la validation est
+        READY_FOR_SIGNAL.
+        Aucun calcul de risque ou de rentabilité
+        n'est effectué.
         """
         self._cleanup()
+        # ----------------------------------------------------
+        # Verrou de sécurité
+        # ----------------------------------------------------
+        if not self._validation_ready(validation):
+            return None
+        # ----------------------------------------------------
+        # Cohérence des symboles
+        # ----------------------------------------------------
+        symbols_ok, _ = self._symbols_coherent(
+            setup,
+            risk_plan,
+            validation,
+        )
+        if not symbols_ok:
+            return None
         now = time.time()
         if not setup_id:
-            setup_id = (
-                self.generer_setup_id(
-                    setup,
-                    risk_plan,
-                )
-            )
-        symbol = self._normalize_symbol(
-            self._extract(
+            setup_id = self.generer_setup_id(
                 setup,
-                "symbol",
-                None,
+                risk_plan,
             )
-        )
+        symbol = self._get_setup_symbol(setup)
         direction = self._normalize_direction(
             self._extract(
                 setup,
@@ -650,23 +696,17 @@ class Moteur2AntiSpam:
             "entry": entry,
             "sl": sl,
             "tp1": (
-                self._safe_float(
-                    tp1
-                )
+                self._safe_float(tp1)
                 if tp1
                 else None
             ),
             "tp2": (
-                self._safe_float(
-                    tp2_value
-                )
+                self._safe_float(tp2_value)
                 if tp2_value is not None
                 else None
             ),
             "tp3": (
-                self._safe_float(
-                    tp3_value
-                )
+                self._safe_float(tp3_value)
                 if tp3_value is not None
                 else None
             ),
@@ -674,17 +714,15 @@ class Moteur2AntiSpam:
             "status": "ACTIVE",
         }
         if extra:
-            record["extra"] = dict(
-                extra
-            )
+            record["extra"] = dict(extra)
+        # ----------------------------------------------------
         # Historique
-        self.history.append(
-            record
-        )
+        # ----------------------------------------------------
+        self.history.append(record)
+        # ----------------------------------------------------
         # Actif
-        self.active_setups[
-            setup_id
-        ] = record
+        # ----------------------------------------------------
+        self.active_setups[setup_id] = record
         self._cleanup()
         return setup_id
     # ========================================================
@@ -699,24 +737,15 @@ class Moteur2AntiSpam:
         Retire un signal de la liste active.
         Le retrait ne supprime pas son historique.
         """
-        if (
-            setup_id
-            not in self.active_setups
-        ):
+        if setup_id not in self.active_setups:
             return False
-        record = (
-            self.active_setups.pop(
-                setup_id,
-                None,
-            )
+        record = self.active_setups.pop(
+            setup_id,
+            None,
         )
         if record is not None:
-            record["status"] = (
-                str(reason)
-            )
-            record[
-                "closed_timestamp"
-            ] = time.time()
+            record["status"] = str(reason)
+            record["closed_timestamp"] = time.time()
         return True
     # ========================================================
     # SIGNAL ACTIF ?
@@ -726,10 +755,7 @@ class Moteur2AntiSpam:
         setup_id: str,
     ) -> bool:
         self._cleanup()
-        return (
-            setup_id
-            in self.active_setups
-        )
+        return setup_id in self.active_setups
     # ========================================================
     # HISTORIQUE
     # ========================================================
@@ -744,9 +770,7 @@ class Moteur2AntiSpam:
         )
         return list(
             reversed(
-                self.history[
-                    -limit:
-                ]
+                self.history[-limit:]
             )
         )
     # ========================================================
@@ -788,6 +812,14 @@ class Moteur2AntiSpam:
             "active_setup_ids": list(
                 self.active_setups.keys()
             ),
+            "validation_required": READY_FOR_SIGNAL,
+            "validation_authority": (
+                "moteur2_validation.py"
+            ),
+            "analysis_logic": False,
+            "risk_logic": False,
+            "signal_modification": False,
+            "execution": False,
         }
 # ============================================================
 # FONCTION PUBLIQUE
@@ -818,6 +850,7 @@ if __name__ == "__main__":
         "zone_id": "ZONE_H1_001",
     }
     risk = {
+        "symbol": "XAUUSD",
         "entry": 4650.00,
         "sl": 4640.00,
         "tp1": 4680.00,
@@ -825,9 +858,8 @@ if __name__ == "__main__":
         "tp3": 4700.00,
         "rr": 3.0,
     }
-    # Validation correspondant au nouveau
-    # moteur2_validation.py.
     validation = {
+        "symbol": "XAUUSD",
         "valid": True,
         "status": "READY_FOR_SIGNAL",
     }
@@ -847,12 +879,11 @@ if __name__ == "__main__":
     # Enregistrement
     # --------------------------------------------------------
     if result_1.allowed:
-        setup_id = (
-            moteur.enregistrer_signal(
-                setup=setup,
-                risk_plan=risk,
-                setup_id=result_1.setup_id,
-            )
+        setup_id = moteur.enregistrer_signal(
+            setup=setup,
+            risk_plan=risk,
+            setup_id=result_1.setup_id,
+            validation=validation,
         )
         print(
             "\nSIGNAL ENREGISTRE :",
