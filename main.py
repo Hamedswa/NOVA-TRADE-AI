@@ -1,9 +1,12 @@
-from future import annotations
-
 import asyncio
 import logging
 
 from telegram_bot import run_bot
+
+logging.basicConfig(
+level=logging.INFO,
+format=”%(asctime)s | %(levelname)s | %(name)s | %(message)s”,
+)
 
 logger = logging.getLogger(name)
 
@@ -33,7 +36,7 @@ AUTO_EXECUTION = False
 BOT_TASK = None
 
 def print_banner():
-print()
+print(””)
 print(”=” * 60)
 print(“NOVA TRADE AI”)
 print(”=” * 60)
@@ -47,18 +50,11 @@ print(“Confirmation     : M5 primary + M1 secondary”)
 print(“Final validation : moteur2_validation.py”)
 print(“Auto execution   : disabled”)
 print(”=” * 60)
-print()
-
-def configure_logging():
-logging.basicConfig(
-level=logging.INFO,
-format=”%(asctime)s | %(levelname)s | %(name)s | %(message)s”,
-)
+print(””)
 
 def start_bot():
-configure_logging()
-
 print_banner()
+
 logger.info(
     "Starting NOVA TRADE AI - %s",
     ENGINE_NAME,
@@ -89,8 +85,8 @@ except Exception:
     raise
 
 async def app(scope, receive, send):
-global BOT_TASK
 
+global BOT_TASK
 if scope["type"] == "lifespan":
     while True:
         message = await receive()
@@ -128,8 +124,14 @@ await send(
         "type": "http.response.start",
         "status": 200,
         "headers": [
-            [b"content-type", b"text/plain; charset=utf-8"],
-            [b"content-length", str(len(body)).encode()],
+            [
+                b"content-type",
+                b"text/plain; charset=utf-8",
+            ],
+            [
+                b"content-length",
+                str(len(body)).encode(),
+            ],
         ],
     }
 )
