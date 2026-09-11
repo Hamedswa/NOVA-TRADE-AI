@@ -103,6 +103,17 @@ ENGINE_NAME = "NOVA TRADE AI - ENGINE 2"
 
 SYMBOL = "XAUUSD"
 
+# ---------------------------------------------------------------------------
+# ACTIFS SUPPORTÉS PAR ENGINE 2
+# ---------------------------------------------------------------------------
+
+SUPPORTED_SYMBOLS = (
+    "XAUUSD",
+    "BTCUSD",
+    "GBPUSD",
+    "EURUSD",
+)
+
 TIMEFRAMES = (
     "H4",
     "H1",
@@ -153,9 +164,16 @@ class Moteur2:
             .replace(" ", "")
         )
 
-        if self.symbol != SYMBOL:
+        # --------------------------------------------------------------------
+        # VALIDATION DU SYMBOLE
+        # --------------------------------------------------------------------
+
+        if self.symbol not in SUPPORTED_SYMBOLS:
             raise ValueError(
-                "Engine 2 fonctionne uniquement sur XAUUSD."
+                "Symbole non supporté par Engine 2 : "
+                f"{self.symbol}. "
+                f"Symboles autorisés : "
+                f"{', '.join(SUPPORTED_SYMBOLS)}"
             )
 
         # --------------------------------------------------------------------
@@ -1700,7 +1718,9 @@ class Moteur2:
                 # ------------------------------------------------------------
 
                 current_price = (
-                    self.cache.get_current_price()
+                    self.cache.get_current_price(
+                        self.symbol
+                    )
                 )
 
                 if current_price is None:
@@ -2539,7 +2559,9 @@ class Moteur2:
                 self.initialized,
 
             "current_price":
-                self.cache.get_current_price(),
+                self.cache.get_current_price(
+                    self.symbol
+                ),
 
             "timeframes":
                 list(TIMEFRAMES),
