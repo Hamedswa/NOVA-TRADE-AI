@@ -26,6 +26,15 @@ Le Risk Engine construit uniquement le plan Entry/SL/TP.
 M5/M1 sont informatifs et non bloquants.
 
 Auto-exécution désactivée.
+
+ENGINE 2 :
+    XAUUSD
+    BTCUSD
+    GBPUSD
+    EURUSD
+
+Chaque symbole possède son propre moteur,
+son propre cache et son propre flux BiQuote.
 """
 
 from __future__ import annotations
@@ -131,9 +140,41 @@ else:
 # ENGINE 2
 # ============================================================================
 
-moteur2 = Moteur2(
-    symbol="XAUUSD"
+SUPPORTED_SYMBOLS = (
+    "XAUUSD",
+    "BTCUSD",
+    "GBPUSD",
+    "EURUSD",
 )
+
+DISPLAY_SYMBOLS = {
+    "XAUUSD": "XAU/USD",
+    "BTCUSD": "BTC/USD",
+    "GBPUSD": "GBP/USD",
+    "EURUSD": "EUR/USD",
+}
+
+
+# ============================================================================
+# MOTEURS INDÉPENDANTS
+# ============================================================================
+
+moteurs2: Dict[str, Moteur2] = {
+    symbol: Moteur2(
+        symbol=symbol
+    )
+    for symbol in SUPPORTED_SYMBOLS
+}
+
+logger.info(
+    "Engine 2 multi-actifs initialisés : %s",
+    ", ".join(SUPPORTED_SYMBOLS),
+)
+
+
+# Alias conservé pour compatibilité avec d'éventuelles
+# références internes à l'ancien moteur XAU/USD.
+moteur2 = moteurs2["XAUUSD"]
 
 
 # ============================================================================
@@ -147,9 +188,10 @@ analysis_lock = asyncio.Lock()
 # TÂCHES DE FOND
 # ============================================================================
 
-engine_task: Optional[
-    asyncio.Task
-] = None
+engine_tasks: Dict[
+    str,
+    asyncio.Task,
+] = {}
 
 signal_monitor_task: Optional[
     asyncio.Task
@@ -160,7 +202,14 @@ supervisor_task: Optional[
 ] = None
 
 
-engine_started = False
+engine_started: Dict[
+    str,
+    bool,
+] = {
+    symbol: False
+    for symbol in SUPPORTED_SYMBOLS
+}
+
 signal_monitor_started = False
 supervisor_started = False
 
@@ -195,26 +244,18 @@ SIGNAL_MONITOR_INTERVAL_SECONDS = 5
 
 
 # ============================================================================
-# SYMBOL
+# SYMBOL UTILITIES
 # ============================================================================
 
-SUPPORTED_SYMBOLS = (
-    "XAUUSD",
-)
-
-DISPLAY_SYMBOLS = {
-    "XAUUSD": "XAU/USD",
-}
-
-
-def display_symbol(
+def normalize_symbol(
     symbol: Any,
 ) -> str:
 
     if symbol is None:
-        return "N/A"
 
-    normalized = (
+        return ""
+
+    return (
         str(symbol)
         .upper()
         .replace("/", "")
@@ -223,9 +264,35 @@ def display_symbol(
         .replace(" ", "")
     )
 
+
+def display_symbol(
+    symbol: Any,
+) -> str:
+
+    normalized = normalize_symbol(
+        symbol
+    )
+
+    if not normalized:
+
+        return "N/A"
+
     return DISPLAY_SYMBOLS.get(
         normalized,
         str(symbol),
+    )
+
+
+def get_engine(
+    symbol: Any,
+) -> Optional[Moteur2]:
+
+    normalized = normalize_symbol(
+        symbol
+    )
+
+    return moteurs2.get(
+        normalized
     )
 
 
@@ -386,9 +453,26 @@ def main_menu() -> InlineKeyboardMarkup:
 
         [
             InlineKeyboardButton(
-                "📊 XAU/USD",
+                "🟡 XAU/USD",
                 callback_data="analyse:XAUUSD",
-            )
+            ),
+
+            InlineKeyboardButton(
+                "₿ BTC/USD",
+                callback_data="analyse:BTCUSD",
+            ),
+        ],
+
+        [
+            InlineKeyboardButton(
+                "💷 GBP/USD",
+                callback_data="analyse:GBPUSD",
+            ),
+
+            InlineKeyboardButton(
+                "💶 EUR/USD",
+                callback_data="analyse:EURUSD",
+            ),
         ],
 
         [
@@ -421,14 +505,18 @@ def main_menu_text() -> str:
     return (
         "🤖 *NOVA TRADE AI*\n\n"
         "*ENGINE 2*\n\n"
-        "📊 Marché : `XAU/USD`\n"
+        "📊 Marchés :\n"
+        "🟡 `XAU/USD`\n"
+        "₿ `BTC/USD`\n"
+        "💷 `GBP/USD`\n"
+        "💶 `EUR/USD`\n\n"
         "📡 Source : `BiQuote`\n"
         "🕐 H4 → H1 → M15 → M5 → M1\n\n"
         "🧠 Intelligence adaptative\n"
         "📡 Radar marché\n"
         "🧩 Scénarios adaptatifs\n"
         "🎯 Decision Engine\n\n"
-        "Sélectionne une action :"
+        "Sélectionne un marché :"
     )
 
 
@@ -549,23 +637,36 @@ async def run_engine2_analysis(
     symbol: str = "XAUUSD",
 ) -> Dict[str, Any]:
 
-    normalized = (
-        str(symbol)
-        .upper()
-        .replace("/", "")
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
+    normalized = normalize_symbol(
+        symbol
     )
 
-    if normalized != "XAUUSD":
+    if normalized not in SUPPORTED_SYMBOLS:
 
         return {
             "symbol": normalized,
             "status": "ERROR",
             "error": (
-                "Engine 2 actuel fonctionne "
-                "sur XAU/USD."
+                "Symbole non supporté par Engine 2. "
+                "Symboles disponibles : "
+                + ", ".join(
+                    SUPPORTED_SYMBOLS
+                )
+            ),
+        }
+
+    engine = get_engine(
+        normalized
+    )
+
+    if engine is None:
+
+        return {
+            "symbol": normalized,
+            "status": "ERROR",
+            "error": (
+                "Moteur Engine 2 introuvable "
+                f"pour {normalized}."
             ),
         }
 
@@ -573,7 +674,7 @@ async def run_engine2_analysis(
 
         try:
 
-            result = await moteur2.analyser()
+            result = await engine.analyser()
 
             if not isinstance(
                 result,
@@ -719,10 +820,8 @@ def extract_signal_symbol(
     if value is None:
         return ""
 
-    return (
-        str(value)
-        .upper()
-        .replace("/", "")
+    return normalize_symbol(
+        value
     )
 
 
@@ -1072,18 +1171,6 @@ def format_analysis(
         len(signals),
     )
 
-    intelligence = result.get(
-        "intelligence"
-    )
-
-    radar = result.get(
-        "radar"
-    )
-
-    scenarios = result.get(
-        "scenarios"
-    )
-
     lines = [
 
         "🤖 *NOVA TRADE AI — ENGINE 2*",
@@ -1248,7 +1335,10 @@ async def help_command(
 
         "/start — Menu principal\n"
         "/analyse XAUUSD — Analyse XAU/USD\n"
-        "/status — Statut du moteur\n"
+        "/analyse BTCUSD — Analyse BTC/USD\n"
+        "/analyse GBPUSD — Analyse GBP/USD\n"
+        "/analyse EURUSD — Analyse EUR/USD\n"
+        "/status — Statut des moteurs\n"
         "/about — Informations\n"
         "/help — Aide\n\n"
 
@@ -1285,28 +1375,31 @@ async def analyse_command(
 
         requested = context.args[0]
 
-        symbol = (
+        symbol = normalize_symbol(
             requested
-            .upper()
-            .replace("/", "")
-            .replace("-", "")
-            .replace("_", "")
-            .replace(" ", "")
         )
 
-    if symbol != "XAUUSD":
+    if symbol not in SUPPORTED_SYMBOLS:
 
         await update.message.reply_text(
-            "❌ Engine 2 actuel analyse "
-            "XAU/USD uniquement.",
+            "❌ Marché non supporté.\n\n"
+            "Marchés disponibles :\n"
+            "🟡 XAU/USD\n"
+            "₿ BTC/USD\n"
+            "💷 GBP/USD\n"
+            "💶 EUR/USD",
             reply_markup=main_menu(),
         )
 
         return
 
+    display = display_symbol(
+        symbol
+    )
+
     await update.message.reply_text(
         "🔎 *ANALYSE ENGINE 2*\n\n"
-        "📊 Marché : `XAU/USD`\n"
+        f"📊 Marché : `{display}`\n"
         "📡 BiQuote → Radar → Intelligence\n"
         "→ Scénarios → Décision\n\n"
         "Analyse en cours...",
@@ -1338,7 +1431,6 @@ def format_status(
         "",
 
         "⚙️ Moteur : `ENGINE 2`",
-        "📊 Marché : `XAU/USD`",
         "📡 Source : `BiQuote`",
         "🕐 H4 → H1 → M15 → M5 → M1",
         "",
@@ -1359,43 +1451,155 @@ def format_status(
         "",
     ]
 
-    running = status.get(
-        "running",
-        False,
-    )
-
-    lines.insert(
-        5,
-        "🟢 Fonctionnement : "
-        + (
-            "`ACTIF`"
-            if running
-            else "`ARRÊTÉ`"
-        ),
-    )
-
-    last_analysis = status.get(
-        "last_analysis"
+    engines_status = status.get(
+        "engines",
+        {},
     )
 
     if isinstance(
-        last_analysis,
+        engines_status,
         dict,
     ):
 
-        lines.extend(
-            [
-                "",
-                f"📌 Dernier état : "
-                f"`{last_analysis.get('status', 'N/A')}`",
-                f"🚨 Signaux : "
-                f"`{last_analysis.get('signal_count', 0)}`",
-            ]
+        lines.append(
+            "📊 *MARCHÉS*"
+        )
+
+        for symbol in SUPPORTED_SYMBOLS:
+
+            item = engines_status.get(
+                symbol,
+                {},
+            )
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+
+                item = {}
+
+            running = item.get(
+                "running",
+                False,
+            )
+
+            state = (
+                "🟢 ACTIF"
+                if running
+                else "🔴 ARRÊTÉ"
+            )
+
+            last_analysis = item.get(
+                "last_analysis"
+            )
+
+            last_status = "N/A"
+
+            signal_count = 0
+
+            current_price = None
+
+            if isinstance(
+                last_analysis,
+                dict,
+            ):
+
+                last_status = (
+                    last_analysis.get(
+                        "status",
+                        "N/A",
+                    )
+                )
+
+                signal_count = (
+                    last_analysis.get(
+                        "signal_count",
+                        0,
+                    )
+                )
+
+                current_price = (
+                    last_analysis.get(
+                        "current_price"
+                    )
+                )
+
+            price_text = (
+                f" | Prix `{current_price}`"
+                if current_price is not None
+                else ""
+            )
+
+            lines.append(
+                f"{state} "
+                f"`{display_symbol(symbol)}` "
+                f"| État `{last_status}` "
+                f"| Signaux `{signal_count}`"
+                f"{price_text}"
+            )
+
+    else:
+
+        running = status.get(
+            "running",
+            False,
+        )
+
+        lines.insert(
+            5,
+            "🟢 Fonctionnement : "
+            + (
+                "`ACTIF`"
+                if running
+                else "`ARRÊTÉ`"
+            ),
         )
 
     return "\n".join(
         lines
     )
+
+
+def build_all_engines_status() -> Dict[str, Any]:
+
+    result: Dict[str, Any] = {
+        "running": any(
+            engine_started.values()
+        ),
+        "engines": {},
+    }
+
+    for symbol in SUPPORTED_SYMBOLS:
+
+        engine = moteurs2[
+            symbol
+        ]
+
+        try:
+
+            engine_status = (
+                engine.get_status()
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur statut %s : %s",
+                symbol,
+                exc,
+            )
+
+            engine_status = {
+                "running": False,
+                "error": str(exc),
+            }
+
+        result["engines"][
+            symbol
+        ] = engine_status
+
+    return result
 
 
 async def status_command(
@@ -1406,23 +1610,9 @@ async def status_command(
     if not update.message:
         return
 
-    try:
-
-        status = (
-            moteur2.get_status()
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Erreur get_status : %s",
-            exc,
-        )
-
-        status = {
-            "running": False,
-            "error": str(exc),
-        }
+    status = (
+        build_all_engines_status()
+    )
 
     await update.message.reply_text(
         format_status(status),
@@ -1446,7 +1636,13 @@ async def about_command(
     text = (
         "🤖 *NOVA TRADE AI*\n\n"
 
-        "*ENGINE 2 — XAU/USD*\n\n"
+        "*ENGINE 2 — MULTI-ACTIFS*\n\n"
+
+        "📊 Marchés :\n"
+        "🟡 XAU/USD\n"
+        "₿ BTC/USD\n"
+        "💷 GBP/USD\n"
+        "💶 EUR/USD\n\n"
 
         "📡 Source : BiQuote\n\n"
 
@@ -1511,16 +1707,11 @@ async def callback_handler(
             1,
         )[1]
 
-        symbol = (
+        symbol = normalize_symbol(
             symbol
-            .upper()
-            .replace("/", "")
-            .replace("-", "")
-            .replace("_", "")
-            .replace(" ", "")
         )
 
-        if symbol != "XAUUSD":
+        if symbol not in SUPPORTED_SYMBOLS:
 
             await query.edit_message_text(
                 "❌ Marché non supporté.",
@@ -1529,9 +1720,13 @@ async def callback_handler(
 
             return
 
+        display = display_symbol(
+            symbol
+        )
+
         await query.edit_message_text(
             "🔎 *ANALYSE ENGINE 2*\n\n"
-            "📊 Marché : `XAU/USD`\n"
+            f"📊 Marché : `{display}`\n"
             "📡 BiQuote → Intelligence → "
             "Scénarios → Décision\n\n"
             "Analyse en cours...",
@@ -1560,18 +1755,84 @@ async def callback_handler(
 
         await query.edit_message_text(
             "🔄 *ACTUALISATION*\n\n"
-            "Analyse XAU/USD en cours...",
+            "Analyse des 4 marchés en cours...",
             parse_mode="Markdown",
         )
 
-        result = (
-            await run_engine2_analysis(
-                "XAUUSD"
+        results = []
+
+        for symbol in SUPPORTED_SYMBOLS:
+
+            result = (
+                await run_engine2_analysis(
+                    symbol
+                )
             )
+
+            results.append(
+                result
+            )
+
+        lines = [
+            "🔄 *ACTUALISATION ENGINE 2*",
+            "",
+        ]
+
+        for result in results:
+
+            symbol = result.get(
+                "symbol",
+                "N/A",
+            )
+
+            status = result.get(
+                "status",
+                "N/A",
+            )
+
+            price = result.get(
+                "current_price"
+            )
+
+            signal_count = result.get(
+                "signal_count",
+                len(
+                    extract_signals(
+                        result
+                    )
+                ),
+            )
+
+            lines.append(
+                f"📊 *{display_symbol(symbol)}*"
+            )
+
+            lines.append(
+                f"📌 État : `{status}`"
+            )
+
+            if price is not None:
+
+                lines.append(
+                    f"💵 Prix : `{price}`"
+                )
+
+            lines.append(
+                f"🚨 Signaux : `{signal_count}`"
+            )
+
+            lines.append("")
+
+        lines.append(
+            "📡 Source : `BiQuote`"
+        )
+
+        lines.append(
+            "⚙️ Auto-exécution : désactivée"
         )
 
         await query.edit_message_text(
-            format_analysis(result),
+            "\n".join(lines),
             parse_mode="Markdown",
             reply_markup=main_menu(),
         )
@@ -1584,18 +1845,9 @@ async def callback_handler(
 
     if action == "status":
 
-        try:
-
-            status = (
-                moteur2.get_status()
-            )
-
-        except Exception as exc:
-
-            status = {
-                "running": False,
-                "error": str(exc),
-            }
+        status = (
+            build_all_engines_status()
+        )
 
         await query.edit_message_text(
             format_status(status),
@@ -1613,7 +1865,12 @@ async def callback_handler(
 
         text = (
             "🤖 *NOVA TRADE AI*\n\n"
-            "*ENGINE 2 — XAU/USD*\n\n"
+            "*ENGINE 2 — MULTI-ACTIFS*\n\n"
+
+            "🟡 XAU/USD\n"
+            "₿ BTC/USD\n"
+            "💷 GBP/USD\n"
+            "💶 EUR/USD\n\n"
 
             "📡 BiQuote\n"
             "🧠 Market Intelligence\n"
@@ -1960,7 +2217,7 @@ async def engine2_signal_monitor(
     signal_monitor_started = True
 
     logger.info(
-        "Signal Monitor Engine 2 démarré."
+        "Signal Monitor Engine 2 multi-actifs démarré."
     )
 
     try:
@@ -1969,93 +2226,98 @@ async def engine2_signal_monitor(
 
             try:
 
-                result = (
-                    moteur2.last_analysis
-                )
+                for symbol in SUPPORTED_SYMBOLS:
 
-                if not isinstance(
-                    result,
-                    dict,
-                ):
-
-                    await asyncio.sleep(
-                        SIGNAL_MONITOR_INTERVAL_SECONDS
+                    engine = moteurs2.get(
+                        symbol
                     )
 
-                    continue
+                    if engine is None:
+                        continue
 
-                signals = (
-                    extract_signals(
-                        result
-                    )
-                )
-
-                for signal in signals:
-
-                    decision = find_value(
-                        signal,
-                        (
-                            "decision",
-                        ),
+                    result = (
+                        engine.last_analysis
                     )
 
-                    if decision is not None:
-
-                        decision = (
-                            str(
-                                decision
-                            )
-                            .upper()
-                            .strip()
-                        )
-
-                    if decision not in (
-                        "BUY",
-                        "SELL",
+                    if not isinstance(
+                        result,
+                        dict,
                     ):
+
                         continue
 
-                    signal_key = (
-                        build_signal_key(
-                            signal
+                    signals = (
+                        extract_signals(
+                            result
                         )
                     )
 
-                    if not signal_key:
-                        continue
+                    for signal in signals:
 
-                    if (
-                        signal_key
-                        in published_signal_keys
-                    ):
-                        continue
-
-                    message = (
-                        format_signal(
-                            signal
-                        )
-                    )
-
-                    sent = await send_to_channel(
-                        application,
-                        message,
-                        parse_mode="Markdown",
-                    )
-
-                    if sent:
-
-                        published_signal_keys.add(
-                            signal_key
-                        )
-
-                        logger.info(
-                            "Signal %s publié.",
-                            display_symbol(
-                                extract_signal_symbol(
-                                    signal
-                                )
+                        decision = find_value(
+                            signal,
+                            (
+                                "decision",
                             ),
                         )
+
+                        if decision is not None:
+
+                            decision = (
+                                str(
+                                    decision
+                                )
+                                .upper()
+                                .strip()
+                            )
+
+                        if decision not in (
+                            "BUY",
+                            "SELL",
+                        ):
+                            continue
+
+                        signal_key = (
+                            build_signal_key(
+                                signal
+                            )
+                        )
+
+                        if not signal_key:
+                            continue
+
+                        if (
+                            signal_key
+                            in published_signal_keys
+                        ):
+                            continue
+
+                        message = (
+                            format_signal(
+                                signal
+                            )
+                        )
+
+                        sent = await send_to_channel(
+                            application,
+                            message,
+                            parse_mode="Markdown",
+                        )
+
+                        if sent:
+
+                            published_signal_keys.add(
+                                signal_key
+                            )
+
+                            logger.info(
+                                "Signal %s publié.",
+                                display_symbol(
+                                    extract_signal_symbol(
+                                        signal
+                                    )
+                                ),
+                            )
 
                 if len(
                     published_signal_keys
@@ -2098,35 +2360,74 @@ async def engine2_signal_monitor(
 
 
 # ============================================================================
-# DÉMARRAGE ENGINE 2
+# DÉMARRAGE D'UN ENGINE 2
 # ============================================================================
 
-async def start_engine2() -> None:
+async def start_engine2(
+    symbol: str,
+) -> None:
 
-    global engine_started
+    normalized = normalize_symbol(
+        symbol
+    )
 
-    if engine_started:
+    if normalized not in SUPPORTED_SYMBOLS:
 
-        logger.warning(
-            "Engine 2 déjà démarré."
+        logger.error(
+            "Impossible de démarrer Engine 2 "
+            "pour symbole non supporté : %s",
+            normalized,
         )
 
         return
 
-    engine_started = True
+    if engine_started.get(
+        normalized,
+        False,
+    ):
+
+        logger.warning(
+            "Engine 2 %s déjà démarré.",
+            normalized,
+        )
+
+        return
+
+    engine_started[
+        normalized
+    ] = True
+
+    engine = moteurs2.get(
+        normalized
+    )
+
+    if engine is None:
+
+        engine_started[
+            normalized
+        ] = False
+
+        logger.error(
+            "Moteur introuvable : %s",
+            normalized,
+        )
+
+        return
 
     logger.info(
-        "Démarrage Engine 2..."
+        "Démarrage Engine 2 %s...",
+        display_symbol(normalized),
     )
 
     try:
 
-        await moteur2.run()
+        await engine.run()
 
     except asyncio.CancelledError:
 
         logger.info(
-            "Engine 2 arrêté."
+            "Engine 2 %s arrêté.",
+            display_symbol(normalized),
         )
 
         raise
@@ -2134,13 +2435,16 @@ async def start_engine2() -> None:
     except Exception as exc:
 
         logger.exception(
-            "Erreur Engine 2 : %s",
+            "Erreur Engine 2 %s : %s",
+            normalized,
             exc,
         )
 
     finally:
 
-        engine_started = False
+        engine_started[
+            normalized
+        ] = False
 
 
 # ============================================================================
@@ -2151,21 +2455,36 @@ def _start_background_tasks(
     application: Application,
 ) -> None:
 
-    global engine_task
     global signal_monitor_task
     global supervisor_task
+    global engine_tasks
 
-    if (
-        engine_task is None
-        or engine_task.done()
-    ):
+    for symbol in SUPPORTED_SYMBOLS:
 
-        engine_task = (
-            application.create_task(
-                start_engine2(),
-                name="nova-engine2",
-            )
+        existing_task = engine_tasks.get(
+            symbol
         )
+
+        if (
+            existing_task is None
+            or existing_task.done()
+        ):
+
+            engine_tasks[
+                symbol
+            ] = application.create_task(
+                start_engine2(
+                    symbol
+                ),
+                name=(
+                    f"nova-engine2-{symbol.lower()}"
+                ),
+            )
+
+            logger.info(
+                "Tâche Engine 2 créée : %s",
+                symbol,
+            )
 
     if (
         signal_monitor_task is None
@@ -2196,7 +2515,7 @@ def _start_background_tasks(
         )
 
     logger.info(
-        "Tâches de fond démarrées."
+        "Tâches de fond multi-actifs démarrées."
     )
 
 
@@ -2225,7 +2544,7 @@ async def post_init(
     )
 
     logger.info(
-        "Tâches Engine 2 programmées."
+        "Tâches Engine 2 multi-actifs programmées."
     )
 
 
@@ -2237,15 +2556,25 @@ async def post_shutdown(
     application: Application,
 ) -> None:
 
-    global engine_task
+    global engine_tasks
     global signal_monitor_task
     global supervisor_task
 
-    tasks = [
-        engine_task,
-        signal_monitor_task,
-        supervisor_task,
-    ]
+    tasks = list(
+        engine_tasks.values()
+    )
+
+    if signal_monitor_task is not None:
+
+        tasks.append(
+            signal_monitor_task
+        )
+
+    if supervisor_task is not None:
+
+        tasks.append(
+            supervisor_task
+        )
 
     for task in tasks:
 
@@ -2269,7 +2598,8 @@ async def post_shutdown(
             return_exceptions=True,
         )
 
-    engine_task = None
+    engine_tasks = {}
+
     signal_monitor_task = None
     supervisor_task = None
 
@@ -2581,7 +2911,8 @@ async def _run_bot_async() -> None:
         )
 
         print(
-            "Marché             : XAU/USD"
+            "Marchés            : "
+            "XAU/USD | BTC/USD | GBP/USD | EUR/USD"
         )
 
         print(
