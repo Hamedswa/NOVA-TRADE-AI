@@ -2,13 +2,7 @@
 NOVA TRADE AI — ENGINE 2
 moteur2.py
 
-ORCHESTRATEUR PRINCIPAL — ENGINE 2
-
-Actif :
-    XAUUSD uniquement
-
-Source marché :
-    BiQuote uniquement
+ORCHESTRATEUR PRINCIPAL
 
 Architecture :
 
@@ -16,56 +10,59 @@ Architecture :
         ↓
     Stream / Cache
         ↓
-    Cartographie marché
+    Market Radar
         ↓
-    Zones importantes
+    Market Cartography
         ↓
-    Contexte
+    Zones
+        ↓
+    Context
         ↓
     Confluences
         ↓
-    Détection des setups
+    Market Intelligence
         ↓
-    Risk Engine
+    Scenarios / Opportunities
         ↓
-    Confirmation M5 / M1
+    Setups
         ↓
-    Score informatif
+    Risk / Safety Plan
         ↓
-    Validation technique
+    Confirmation M5/M1
+        ↓
+    Informative Score
+        ↓
+    Technical Validation
         ↓
     DECISION ENGINE
         ↓
     BUY / SELL / WAIT
         ↓
-    Anti-Spam
+    AntiSpam
         ↓
-    Signal
+    Signal Builder
         ↓
-    Telegram / couche supérieure
+    Telegram
 
-PHILOSOPHIE :
+PRINCIPES :
 
-    Le moteur ne fonctionne PAS comme une checklist rigide.
+    - Decision Engine = autorité stratégique.
+    - Intelligence = observation adaptative.
+    - Radar = surveillance des changements.
+    - Scenarios = possibilités de marché.
+    - Setups = détection d'opportunités.
+    - Risk = construction Entry / SL / TP.
+    - Validation = sécurité technique.
+    - Confirmation M5/M1 = information de timing.
+    - Score = information.
+    - RR = information.
+    - AntiSpam = protection technique.
+    - Signal Builder = assemblage final.
 
-    Le Decision Engine est l'autorité stratégique.
-
-    Le score est informatif.
-    Le RR est informatif.
-    M5/M1 sont informatifs.
-    Les zones sont informatives.
-    Les confluences sont informatives.
-    La validation technique protège contre les impossibilités.
-
-    Aucun quota de signaux.
-    Aucun signal forcé.
-    Aucun minimum de signaux.
-    Plusieurs signaux distincts sont autorisés.
-
-    Le Risk Engine construit Entry / SL / TP.
-    Le Decision Engine décide BUY / SELL / WAIT.
-    L'Anti-Spam protège contre les doublons.
-    Le moteur ne fait pas d'exécution automatique.
+Aucun quota de signaux.
+Aucun signal forcé.
+Plusieurs opportunités possibles.
+Pas d'exécution automatique.
 """
 
 from __future__ import annotations
@@ -76,26 +73,26 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-
-# ============================================================================
-# IMPORTS
-# ============================================================================
-
 from biquote_client import BiQuoteClient
 from biquote_stream import BiQuoteStream
-
 from moteur2_cache import Moteur2Cache
+
+from moteur2_radar import Moteur2Radar
 from moteur2_marche import Moteur2Marche
 from moteur2_zones import Moteur2Zones
 from moteur2_contexte import Moteur2Contexte
 from moteur2_confluences import Moteur2Confluences
+from moteur2_intelligence import Moteur2Intelligence
+from moteur2_scenarios import Moteur2Scenarios
 from moteur2_setups import Moteur2Setups
+
 from moteur2_risk import Moteur2Risk
 from moteur2_confirmation import Moteur2Confirmation
 from moteur2_score import Moteur2Score
 from moteur2_validation import Moteur2Validation
 from moteur2_decision import Moteur2Decision
 from moteur2_antispam import Moteur2AntiSpam
+from moteur2_signal import Moteur2Signal
 
 
 # ============================================================================
@@ -114,14 +111,12 @@ TIMEFRAMES = (
     "M1",
 )
 
-# Timeframes indispensables pour le raisonnement principal.
 PRIMARY_TIMEFRAMES = (
     "H4",
     "H1",
     "M15",
 )
 
-# Timeframes secondaires.
 SECONDARY_TIMEFRAMES = (
     "M5",
     "M1",
@@ -134,24 +129,16 @@ DECISION_BUY = "BUY"
 DECISION_SELL = "SELL"
 DECISION_WAIT = "WAIT"
 
-logger = logging.getLogger("NOVA_ENGINE_2")
+logger = logging.getLogger(
+    "NOVA_ENGINE_2"
+)
 
 
 # ============================================================================
-# CLASSE PRINCIPALE
+# MOTEUR PRINCIPAL
 # ============================================================================
 
 class Moteur2:
-    """
-    Orchestrateur principal du moteur 2.
-
-    Le moteur orchestre les modules mais ne prend pas lui-même
-    la décision stratégique.
-
-    La décision stratégique appartient exclusivement à :
-
-        moteur2_decision.py
-    """
 
     def __init__(
         self,
@@ -163,6 +150,7 @@ class Moteur2:
             .strip()
             .upper()
             .replace("/", "")
+            .replace(" ", "")
         )
 
         if self.symbol != SYMBOL:
@@ -171,7 +159,7 @@ class Moteur2:
             )
 
         # --------------------------------------------------------------------
-        # SOURCE DE DONNÉES
+        # SOURCE
         # --------------------------------------------------------------------
 
         self.biquote = BiQuoteClient()
@@ -187,8 +175,10 @@ class Moteur2:
         )
 
         # --------------------------------------------------------------------
-        # MOTEURS D'ANALYSE
+        # OBSERVATION DU MARCHÉ
         # --------------------------------------------------------------------
+
+        self.radar = Moteur2Radar()
 
         self.marche = Moteur2Marche()
 
@@ -197,6 +187,16 @@ class Moteur2:
         self.contexte = Moteur2Contexte()
 
         self.confluences = Moteur2Confluences()
+
+        self.intelligence = Moteur2Intelligence(
+            reference_score=REFERENCE_SCORE,
+            reference_rr=REFERENCE_RR,
+        )
+
+        self.scenarios = Moteur2Scenarios(
+            reference_score=REFERENCE_SCORE,
+            reference_rr=REFERENCE_RR,
+        )
 
         self.setups = Moteur2Setups()
 
@@ -207,7 +207,7 @@ class Moteur2:
         self.risk = Moteur2Risk()
 
         # --------------------------------------------------------------------
-        # CONFIRMATION
+        # TIMING
         # --------------------------------------------------------------------
 
         self.confirmation = Moteur2Confirmation()
@@ -234,22 +234,29 @@ class Moteur2:
         )
 
         # --------------------------------------------------------------------
-        # PROTECTION ANTI-SPAM
+        # ANTI-SPAM
         # --------------------------------------------------------------------
 
         self.antispam = Moteur2AntiSpam()
+
+        # --------------------------------------------------------------------
+        # CONSTRUCTEUR SIGNAL
+        # --------------------------------------------------------------------
+
+        self.signal_builder = Moteur2Signal()
 
         # --------------------------------------------------------------------
         # ÉTAT
         # --------------------------------------------------------------------
 
         self.running = False
-
         self.initialized = False
 
         self.latest_tick: Optional[Any] = None
 
-        self.last_analysis: Optional[Dict[str, Any]] = None
+        self.last_analysis: Optional[
+            Dict[str, Any]
+        ] = None
 
         self.analysis_lock = asyncio.Lock()
 
@@ -268,7 +275,10 @@ class Moteur2:
             return default
 
         if isinstance(data, dict):
-            return data.get(key, default)
+            return data.get(
+                key,
+                default,
+            )
 
         return getattr(
             data,
@@ -294,15 +304,35 @@ class Moteur2:
         return result
 
     @staticmethod
-    def _normalize_direction(
-        direction: Any,
+    def _float(
+        value: Any,
+        default: Optional[float] = None,
+    ) -> Optional[float]:
+
+        try:
+
+            if value is None:
+                return default
+
+            return float(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            return default
+
+    @staticmethod
+    def _direction(
+        value: Any,
     ) -> Optional[str]:
 
-        if direction is None:
+        if value is None:
             return None
 
         value = (
-            str(direction)
+            str(value)
             .strip()
             .upper()
         )
@@ -326,31 +356,45 @@ class Moteur2:
             value,
         )
 
-        if value in {
-            DECISION_BUY,
-            DECISION_SELL,
-        }:
+        if value in (
+            "BUY",
+            "SELL",
+        ):
             return value
 
         return None
 
     @staticmethod
-    def _float(
+    def _as_dict(
         value: Any,
-        default: Optional[float] = None,
-    ) -> Optional[float]:
+    ) -> Any:
 
-        try:
-            if value is None:
-                return default
+        if value is None:
+            return None
 
-            return float(value)
-
-        except (
-            TypeError,
-            ValueError,
+        if hasattr(
+            value,
+            "to_dict",
         ):
-            return default
+
+            try:
+                return value.to_dict()
+            except Exception:
+                pass
+
+        if isinstance(
+            value,
+            dict,
+        ):
+            return value
+
+        if hasattr(
+            value,
+            "__dict__",
+        ):
+            return value.__dict__
+
+        return value
 
     # ========================================================================
     # TICK LIVE
@@ -478,6 +522,255 @@ class Moteur2:
         ]
 
     # ========================================================================
+    # CONSTRUCTION MARKET DATA
+    # ========================================================================
+
+    def _construire_market_data(
+        self,
+        donnees: Dict[str, Any],
+        current_price: float,
+        cartographie: Any = None,
+    ) -> Dict[str, Any]:
+
+        data: Dict[str, Any] = {
+            "symbol": self.symbol,
+            "price": current_price,
+            "current_price": current_price,
+            "timeframes": {},
+        }
+
+        for timeframe in TIMEFRAMES:
+
+            candles = donnees.get(
+                timeframe
+            )
+
+            if not candles:
+                continue
+
+            item: Dict[str, Any] = {
+                "candles": candles,
+            }
+
+            if isinstance(
+                candles,
+                (list, tuple),
+            ) and candles:
+
+                last = candles[-1]
+
+                close = self._get(
+                    last,
+                    "close",
+                )
+
+                if close is not None:
+                    item["price"] = (
+                        self._float(close)
+                    )
+
+                item["close"] = (
+                    self._float(close)
+                )
+
+                item["direction"] = (
+                    self._infer_candle_direction(
+                        candles
+                    )
+                )
+
+                item["momentum"] = (
+                    self._infer_momentum(
+                        candles
+                    )
+                )
+
+                item["volatility"] = (
+                    self._infer_volatility(
+                        candles
+                    )
+                )
+
+            data["timeframes"][
+                timeframe
+            ] = item
+
+            data[timeframe] = item
+
+        # Informations déjà produites par la cartographie.
+        cartography_data = (
+            self._as_dict(
+                cartographie
+            )
+        )
+
+        if isinstance(
+            cartography_data,
+            dict,
+        ):
+
+            for key in (
+                "direction",
+                "bias",
+                "momentum",
+                "volatility",
+                "pressure",
+                "market_state",
+                "market_regime",
+            ):
+
+                if key in cartography_data:
+                    data[key] = (
+                        cartography_data[key]
+                    )
+
+        return data
+
+    def _infer_candle_direction(
+        self,
+        candles: Any,
+    ) -> str:
+
+        if not isinstance(
+            candles,
+            (list, tuple),
+        ):
+            return "NEUTRAL"
+
+        recent = list(
+            candles[-5:]
+        )
+
+        buy = 0
+        sell = 0
+
+        for candle in recent:
+
+            open_price = self._float(
+                self._get(
+                    candle,
+                    "open",
+                )
+            )
+
+            close_price = self._float(
+                self._get(
+                    candle,
+                    "close",
+                )
+            )
+
+            if (
+                open_price is None
+                or close_price is None
+            ):
+                continue
+
+            if close_price > open_price:
+                buy += 1
+
+            elif close_price < open_price:
+                sell += 1
+
+        if buy > sell:
+            return "BUY"
+
+        if sell > buy:
+            return "SELL"
+
+        return "NEUTRAL"
+
+    def _infer_momentum(
+        self,
+        candles: Any,
+    ) -> float:
+
+        if not isinstance(
+            candles,
+            (list, tuple),
+        ):
+            return 0.0
+
+        if len(candles) < 3:
+            return 0.0
+
+        first = self._float(
+            self._get(
+                candles[-3],
+                "close",
+            )
+        )
+
+        last = self._float(
+            self._get(
+                candles[-1],
+                "close",
+            )
+        )
+
+        if (
+            first is None
+            or last is None
+            or first == 0
+        ):
+            return 0.0
+
+        return (
+            (last - first)
+            / abs(first)
+        ) * 100.0
+
+    def _infer_volatility(
+        self,
+        candles: Any,
+    ) -> float:
+
+        if not isinstance(
+            candles,
+            (list, tuple),
+        ):
+            return 0.0
+
+        ranges: List[float] = []
+
+        for candle in list(
+            candles[-10:]
+        ):
+
+            high = self._float(
+                self._get(
+                    candle,
+                    "high",
+                )
+            )
+
+            low = self._float(
+                self._get(
+                    candle,
+                    "low",
+                )
+            )
+
+            if (
+                high is not None
+                and low is not None
+            ):
+
+                ranges.append(
+                    abs(high - low)
+                )
+
+        if not ranges:
+            return 0.0
+
+        average = (
+            sum(ranges)
+            / len(ranges)
+        )
+
+        return average
+
+    # ========================================================================
     # CARTOGRAPHIE
     # ========================================================================
 
@@ -486,10 +779,20 @@ class Moteur2:
         donnees: Dict[str, Any],
     ) -> Any:
 
-        return await self._call(
-            self.marche.cartographier_marche,
-            donnees,
-        )
+        try:
+
+            return await self._call(
+                self.marche.cartographier_marche,
+                donnees,
+                symbol=self.symbol,
+            )
+
+        except TypeError:
+
+            return await self._call(
+                self.marche.cartographier_marche,
+                donnees,
+            )
 
     # ========================================================================
     # ZONES
@@ -501,11 +804,32 @@ class Moteur2:
         current_price: float,
     ) -> Any:
 
-        return await self._call(
-            self.zones.analyser,
-            cartographie,
-            current_price,
-        )
+        try:
+
+            return await self._call(
+                self.zones.analyser,
+                cartographie,
+                current_price,
+                symbol=self.symbol,
+            )
+
+        except TypeError:
+
+            try:
+
+                return await self._call(
+                    self.zones.analyser,
+                    cartographie,
+                    current_price,
+                )
+
+            except TypeError:
+
+                return await self._call(
+                    self.zones.analyser,
+                    market=cartographie,
+                    current_price=current_price,
+                )
 
     # ========================================================================
     # CONTEXTE
@@ -517,11 +841,22 @@ class Moteur2:
         zones: Any,
     ) -> Any:
 
-        return await self._call(
-            self.contexte.analyser,
-            donnees,
-            zones,
-        )
+        try:
+
+            return await self._call(
+                self.contexte.analyser,
+                donnees,
+                zones,
+                symbol=self.symbol,
+            )
+
+        except TypeError:
+
+            return await self._call(
+                self.contexte.analyser,
+                donnees,
+                zones,
+            )
 
     # ========================================================================
     # CONFLUENCES
@@ -535,12 +870,148 @@ class Moteur2:
         cartographie: Any,
     ) -> Any:
 
+        try:
+
+            return await self._call(
+                self.confluences.analyser,
+                donnees,
+                zones,
+                contexte,
+                cartographie,
+                symbol=self.symbol,
+            )
+
+        except TypeError:
+
+            return await self._call(
+                self.confluences.analyser,
+                donnees,
+                zones,
+                contexte,
+                cartographie,
+            )
+
+    # ========================================================================
+    # MARKET INTELLIGENCE
+    # ========================================================================
+
+    async def analyser_intelligence(
+        self,
+        market_data: Dict[str, Any],
+        contexte: Any,
+        zones: Any,
+        confluences: Any,
+        cartographie: Any,
+    ) -> Any:
+
+        context_data = self._as_dict(
+            contexte
+        )
+
+        structure = {}
+
+        if isinstance(
+            context_data,
+            dict,
+        ):
+
+            structure = (
+                context_data.get(
+                    "structure",
+                    {},
+                )
+                or {}
+            )
+
         return await self._call(
-            self.confluences.analyser,
-            donnees,
-            zones,
-            contexte,
-            cartographie,
+            self.intelligence.analyser,
+            symbol=self.symbol,
+            market_data=market_data,
+            contexte=context_data,
+            zones=zones,
+            structure=structure,
+            confluences=confluences,
+        )
+
+    # ========================================================================
+    # RADAR
+    # ========================================================================
+
+    async def analyser_radar(
+        self,
+        market_data: Dict[str, Any],
+        zones: Any,
+    ) -> Any:
+
+        zones_data = zones
+
+        if not isinstance(
+            zones_data,
+            list,
+        ):
+
+            if isinstance(
+                zones_data,
+                dict,
+            ):
+
+                zones_data = (
+                    zones_data.get(
+                        "zones"
+                    )
+                    or zones_data.get(
+                        "important_zones"
+                    )
+                    or []
+                )
+
+            else:
+
+                zones_data = []
+
+        return await self._call(
+            self.radar.surveiller,
+            self.symbol,
+            market_data,
+            zones_data,
+        )
+
+    # ========================================================================
+    # SCÉNARIOS
+    # ========================================================================
+
+    async def analyser_scenarios(
+        self,
+        intelligence: Any,
+        radar_events: Any,
+        contexte: Any,
+        zones: Any,
+        setups: Any,
+    ) -> Any:
+
+        return await self._call(
+            self.scenarios.analyser,
+            symbol=self.symbol,
+            intelligence=intelligence,
+            radar_events=radar_events,
+            contexte=self._as_dict(
+                contexte
+            ),
+            zones=self._extract_list(
+                zones,
+                (
+                    "zones",
+                    "important_zones",
+                ),
+            ),
+            setups=self._extract_list(
+                setups,
+                (
+                    "setups",
+                    "detected_setups",
+                    "opportunities",
+                ),
+            ),
         )
 
     # ========================================================================
@@ -555,13 +1026,26 @@ class Moteur2:
         donnees: Dict[str, Any],
     ) -> Any:
 
-        return await self._call(
-            self.setups.analyser,
-            zones,
-            confluences,
-            contexte,
-            donnees,
-        )
+        try:
+
+            return await self._call(
+                self.setups.analyser,
+                zones,
+                confluences,
+                contexte,
+                donnees,
+                symbol=self.symbol,
+            )
+
+        except TypeError:
+
+            return await self._call(
+                self.setups.analyser,
+                zones,
+                confluences,
+                contexte,
+                donnees,
+            )
 
     # ========================================================================
     # RISK
@@ -599,6 +1083,7 @@ class Moteur2:
             setup,
             donnees,
             risk_plan,
+            symbol=self.symbol,
         )
 
     # ========================================================================
@@ -626,7 +1111,7 @@ class Moteur2:
         )
 
     # ========================================================================
-    # VALIDATION TECHNIQUE
+    # VALIDATION
     # ========================================================================
 
     async def valider(
@@ -650,105 +1135,76 @@ class Moteur2:
         )
 
     # ========================================================================
-    # EXTRACTION DES SETUPS
+    # EXTRACTION
     # ========================================================================
 
     @staticmethod
+    def _extract_list(
+        value: Any,
+        keys: tuple,
+    ) -> List[Any]:
+
+        if value is None:
+            return []
+
+        if isinstance(
+            value,
+            (list, tuple),
+        ):
+            return list(value)
+
+        if isinstance(
+            value,
+            dict,
+        ):
+
+            for key in keys:
+
+                items = value.get(
+                    key
+                )
+
+                if isinstance(
+                    items,
+                    (list, tuple),
+                ):
+                    return list(items)
+
+                if items is not None:
+                    return [items]
+
+        return [value]
+
+    @classmethod
     def _extraire_setups(
-        setups_result: Any,
+        cls,
+        result: Any,
     ) -> List[Any]:
 
-        if setups_result is None:
-            return []
+        return cls._extract_list(
+            result,
+            (
+                "setups",
+                "detected_setups",
+                "opportunities",
+            ),
+        )
 
-        if isinstance(
-            setups_result,
-            dict,
-        ):
-
-            setups = (
-                setups_result.get("setups")
-                or setups_result.get(
-                    "detected_setups"
-                )
-                or setups_result.get(
-                    "opportunities"
-                )
-                or []
-            )
-
-            if isinstance(
-                setups,
-                (list, tuple),
-            ):
-                return list(setups)
-
-            if setups:
-                return [setups]
-
-            return []
-
-        if isinstance(
-            setups_result,
-            (list, tuple),
-        ):
-            return list(setups_result)
-
-        return [setups_result]
-
-    # ========================================================================
-    # EXTRACTION DES PLANS DE RISQUE
-    # ========================================================================
-
-    @staticmethod
+    @classmethod
     def _extraire_risk_plans(
-        risk_result: Any,
+        cls,
+        result: Any,
     ) -> List[Any]:
 
-        if risk_result is None:
-            return []
-
-        if isinstance(
-            risk_result,
-            dict,
-        ):
-
-            plans = (
-                risk_result.get("plans")
-                or risk_result.get(
-                    "risk_plans"
-                )
-                or risk_result.get(
-                    "valid_plans"
-                )
-                or risk_result.get(
-                    "results"
-                )
-                or []
-            )
-
-            if isinstance(
-                plans,
-                (list, tuple),
-            ):
-                return list(plans)
-
-            if plans:
-                return [plans]
-
-            return []
-
-        if isinstance(
-            risk_result,
-            (list, tuple),
-        ):
-            return list(risk_result)
-
-        return [risk_result]
-
-    # ========================================================================
-    # TROUVER LE PLAN DE RISQUE D'UN SETUP
-    # ========================================================================
+        return cls._extract_list(
+            result,
+            (
+                "plans",
+                "risk_plans",
+                "valid_plans",
+                "results",
+            ),
+        )
 
     def _trouver_risk_plan(
         self,
@@ -756,65 +1212,6 @@ class Moteur2:
         index: int,
         risk_plans: List[Any],
     ) -> Any:
-
-        setup_id = self._get(
-            setup,
-            "setup_id",
-        )
-
-        if setup_id is None:
-
-            setup_id = self._get(
-                setup,
-                "id",
-            )
-
-        if setup_id is not None:
-
-            setup_id = str(
-                setup_id
-            )
-
-            for candidate in risk_plans:
-
-                candidate_id = self._get(
-                    candidate,
-                    "setup_id",
-                )
-
-                if candidate_id is None:
-                    candidate_id = self._get(
-                        candidate,
-                        "id",
-                    )
-
-                if (
-                    candidate_id is not None
-                    and str(candidate_id)
-                    == setup_id
-                ):
-                    return candidate
-
-        if index < len(risk_plans):
-
-            return risk_plans[index]
-
-        return None
-
-    # ========================================================================
-    # CONSTRUCTION DU SIGNAL
-    # ========================================================================
-
-    def _construire_signal(
-        self,
-        setup: Any,
-        risk_plan: Any,
-        confirmation: Any,
-        score_result: Any,
-        validation: Any,
-        decision_result: Any,
-        antispam: Any,
-    ) -> Dict[str, Any]:
 
         setup_id = (
             self._get(
@@ -825,231 +1222,45 @@ class Moteur2:
                 setup,
                 "id",
             )
-            or self._get(
-                antispam,
-                "setup_id",
-            )
-            or "SETUP"
         )
 
-        direction = (
-            self._get(
-                decision_result,
-                "decision",
-            )
-            or self._get(
-                setup,
-                "direction",
-            )
-        )
+        if setup_id is not None:
 
-        direction = self._normalize_direction(
-            direction
-        )
-
-        entry = self._float(
-            self._get(
-                risk_plan,
-                "entry",
-            )
-        )
-
-        sl = self._float(
-            self._get(
-                risk_plan,
-                "sl",
-            )
-        )
-
-        tp1 = self._float(
-            self._get(
-                risk_plan,
-                "tp1",
-            )
-        )
-
-        tp2 = self._float(
-            self._get(
-                risk_plan,
-                "tp2",
-            )
-        )
-
-        tp3 = self._float(
-            self._get(
-                risk_plan,
-                "tp3",
-            )
-        )
-
-        rr = self._float(
-            self._get(
-                risk_plan,
-                "primary_rr",
-            )
-        )
-
-        if rr is None:
-
-            rr = self._float(
-                self._get(
-                    risk_plan,
-                    "rr",
-                )
-            )
-
-        if rr is None:
-
-            rr = self._float(
-                self._get(
-                    risk_plan,
-                    "rr_tp1",
-                )
-            )
-
-        score = self._float(
-            self._get(
-                score_result,
-                "score",
-            )
-        )
-
-        confidence = self._float(
-            self._get(
-                decision_result,
-                "confidence",
-            ),
-            0.0,
-        )
-
-        quality = self._get(
-            decision_result,
-            "quality",
-            "NEUTRAL",
-        )
-
-        priority = self._get(
-            decision_result,
-            "priority",
-            "NORMAL",
-        )
-
-        timestamp = datetime.now(
-            timezone.utc
-        ).isoformat()
-
-        signal_id = (
-            f"{setup_id}-"
-            f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
-        )
-
-        return {
-            "signal_id": signal_id,
-
-            "engine": ENGINE_NAME,
-
-            "symbol": self.symbol,
-
-            "direction": direction,
-
-            "decision": direction,
-
-            "confidence": confidence,
-
-            "priority": priority,
-
-            "quality": quality,
-
-            "setup_id": str(
+            setup_id = str(
                 setup_id
-            ),
+            )
 
-            "setup_type": self._get(
-                setup,
-                "setup_type",
-                "UNKNOWN",
-            ),
+            for plan in risk_plans:
 
-            "entry": entry,
-
-            "sl": sl,
-
-            "tp1": tp1,
-
-            "tp2": tp2,
-
-            "tp3": tp3,
-
-            "rr": rr,
-
-            "score": score,
-
-            "timestamp": timestamp,
-
-            "risk_plan": risk_plan,
-
-            "confirmation": confirmation,
-
-            "validation": validation,
-
-            "decision_result": (
-                decision_result.to_dict()
-                if hasattr(
-                    decision_result,
-                    "to_dict",
+                plan_id = (
+                    self._get(
+                        plan,
+                        "setup_id",
+                    )
+                    or self._get(
+                        plan,
+                        "id",
+                    )
                 )
-                else decision_result
-            ),
 
-            "antispam": antispam,
+                if (
+                    plan_id is not None
+                    and str(plan_id)
+                    == setup_id
+                ):
 
-            "metadata": {
-                "decision_owner":
-                    "moteur2_decision.py",
+                    return plan
 
-                "risk_engine_decides_trade":
-                    False,
+        if index < len(
+            risk_plans
+        ):
 
-                "score_is_blocking":
-                    False,
+            return risk_plans[index]
 
-                "rr_is_blocking":
-                    False,
-
-                "m5_is_blocking":
-                    False,
-
-                "m1_is_blocking":
-                    False,
-
-                "forced_signal":
-                    False,
-
-                "signal_quota":
-                    None,
-
-                "auto_execution":
-                    False,
-
-                "entry_source":
-                    "moteur2_risk.py",
-
-                "sl_source":
-                    "moteur2_risk.py",
-
-                "tp_source":
-                    "moteur2_risk.py",
-
-                "decision_source":
-                    "moteur2_decision.py",
-
-                "signal_builder":
-                    "moteur2.py",
-            },
-        }
+        return None
 
     # ========================================================================
-    # TRAITEMENT D'UN SETUP
+    # TRAITEMENT SETUP
     # ========================================================================
 
     async def traiter_setup(
@@ -1060,11 +1271,12 @@ class Moteur2:
         contexte: Any,
         confluences: Any,
         donnees: Dict[str, Any],
-        market_intelligence: Any = None,
+        intelligence: Any = None,
+        scenarios: Any = None,
     ) -> Dict[str, Any]:
 
         # --------------------------------------------------------------------
-        # 1. CONFIRMATION
+        # CONFIRMATION
         # --------------------------------------------------------------------
 
         try:
@@ -1080,18 +1292,25 @@ class Moteur2:
         except Exception as exc:
 
             logger.exception(
-                "Erreur confirmation setup : %s",
+                "Erreur confirmation : %s",
                 exc,
             )
 
             confirmation = {
-                "status": "UNAVAILABLE",
-                "confirmed": False,
+                "confirmation_status":
+                    "UNAVAILABLE",
+                "m5_confirmed": False,
+                "m1_confirmed": False,
+                "confirmation_valid": True,
                 "error": str(exc),
+                "metadata": {
+                    "m5_is_blocking": False,
+                    "m1_is_blocking": False,
+                },
             }
 
         # --------------------------------------------------------------------
-        # 2. SCORE INFORMATIF
+        # SCORE
         # --------------------------------------------------------------------
 
         try:
@@ -1110,7 +1329,7 @@ class Moteur2:
         except Exception as exc:
 
             logger.exception(
-                "Erreur score setup : %s",
+                "Erreur score : %s",
                 exc,
             )
 
@@ -1121,7 +1340,7 @@ class Moteur2:
             }
 
         # --------------------------------------------------------------------
-        # 3. VALIDATION TECHNIQUE
+        # VALIDATION TECHNIQUE
         # --------------------------------------------------------------------
 
         try:
@@ -1138,25 +1357,20 @@ class Moteur2:
         except Exception as exc:
 
             logger.exception(
-                "Erreur validation setup : %s",
+                "Erreur validation : %s",
                 exc,
             )
 
             validation = {
-                "validated": False,
                 "valid": False,
                 "status": "TECHNICAL_ERROR",
-                "reason": str(exc),
-                "blockers": [
+                "technical_blockers": [
                     str(exc)
                 ],
-                "warnings": [],
             }
 
         # --------------------------------------------------------------------
-        # 4. DECISION ENGINE
-        #
-        # C'est ici que le cerveau stratégique reçoit toutes les informations.
+        # DECISION ENGINE
         # --------------------------------------------------------------------
 
         try:
@@ -1167,7 +1381,9 @@ class Moteur2:
                     contexte=contexte,
                     zones=zones,
                     structure=self._get(
-                        contexte,
+                        self._as_dict(
+                            contexte
+                        ),
                         "structure",
                     ),
                     confluences=confluences,
@@ -1176,10 +1392,7 @@ class Moteur2:
                     validation_result=validation,
                     confirmation_result=confirmation,
                     market_intelligence=(
-                        market_intelligence
-                        if market_intelligence
-                        is not None
-                        else None
+                        intelligence
                     ),
                 )
             )
@@ -1224,7 +1437,7 @@ class Moteur2:
         )
 
         # --------------------------------------------------------------------
-        # 5. WAIT
+        # WAIT
         # --------------------------------------------------------------------
 
         if decision == DECISION_WAIT:
@@ -1239,82 +1452,54 @@ class Moteur2:
                 "decision": decision,
                 "decision_confidence": confidence,
                 "decision_result": decision_result,
+                "intelligence": intelligence,
+                "scenarios": scenarios,
                 "signal": None,
             }
 
-        # --------------------------------------------------------------------
-        # 6. PROTECTION : SEULEMENT BUY / SELL
-        # --------------------------------------------------------------------
-
-        if decision not in {
+        if decision not in (
             DECISION_BUY,
             DECISION_SELL,
-        }:
+        ):
 
             return {
                 "status": "WAIT",
                 "setup": setup,
                 "risk": risk_plan,
-                "confirmation": confirmation,
-                "score": score_result,
-                "validation": validation,
                 "decision": DECISION_WAIT,
-                "decision_confidence": confidence,
                 "decision_result": decision_result,
                 "signal": None,
             }
 
         # --------------------------------------------------------------------
-        # 7. ANTI-SPAM
-        #
-        # L'Anti-Spam ne décide pas.
-        # Il vérifie seulement si le signal peut être publié.
+        # ANTI-SPAM
         # --------------------------------------------------------------------
 
         try:
 
-            antispam = self.antispam.verifier(
-                setup=setup,
-                risk_plan=risk_plan,
-                validation=validation,
-                decision=decision,
+            antispam = (
+                self.antispam.verifier(
+                    setup=setup,
+                    risk_plan=risk_plan,
+                    validation=validation,
+                    decision=decision,
+                )
             )
 
         except TypeError:
 
-            # Compatibilité avec une ancienne signature.
-            try:
-
-                antispam = self.antispam.verifier(
+            antispam = (
+                self.antispam.verifier(
                     setup=setup,
                     risk_plan=risk_plan,
                     validation=validation,
                 )
-
-            except Exception as exc:
-
-                logger.exception(
-                    "Erreur Anti-Spam : %s",
-                    exc,
-                )
-
-                return {
-                    "status": "ANTISPAM_ERROR",
-                    "setup": setup,
-                    "risk": risk_plan,
-                    "confirmation": confirmation,
-                    "score": score_result,
-                    "validation": validation,
-                    "decision": decision,
-                    "decision_result": decision_result,
-                    "error": str(exc),
-                    "signal": None,
-                }
+            )
 
         except Exception as exc:
 
             logger.exception(
-                "Erreur Anti-Spam : %s",
+                "Erreur AntiSpam : %s",
                 exc,
             )
 
@@ -1322,11 +1507,7 @@ class Moteur2:
                 "status": "ANTISPAM_ERROR",
                 "setup": setup,
                 "risk": risk_plan,
-                "confirmation": confirmation,
-                "score": score_result,
-                "validation": validation,
                 "decision": decision,
-                "decision_result": decision_result,
                 "error": str(exc),
                 "signal": None,
             }
@@ -1342,7 +1523,77 @@ class Moteur2:
         if not allowed:
 
             return {
-                "status": "ANTISPAM_BLOCKED",
+                "status":
+                    "ANTISPAM_BLOCKED",
+
+                "setup":
+                    setup,
+
+                "risk":
+                    risk_plan,
+
+                "confirmation":
+                    confirmation,
+
+                "score":
+                    score_result,
+
+                "validation":
+                    validation,
+
+                "decision":
+                    decision,
+
+                "decision_result":
+                    decision_result,
+
+                "antispam":
+                    antispam,
+
+                "signal":
+                    None,
+            }
+
+        # --------------------------------------------------------------------
+        # SIGNAL BUILDER
+        # --------------------------------------------------------------------
+
+        try:
+
+            signal = (
+                self.signal_builder.construire_signal(
+                    setup=setup,
+                    risk_plan=risk_plan,
+                    confirmation=confirmation,
+                    score_result=score_result,
+                    validation=validation,
+                    antispam_result=antispam,
+                    decision_result=decision_result,
+                    intelligence=intelligence,
+                    scenarios=scenarios,
+                )
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur Signal Builder : %s",
+                exc,
+            )
+
+            return {
+                "status": "SIGNAL_BUILD_ERROR",
+                "setup": setup,
+                "risk": risk_plan,
+                "decision": decision,
+                "error": str(exc),
+                "signal": None,
+            }
+
+        if signal is None:
+
+            return {
+                "status": "SIGNAL_NOT_BUILDABLE",
                 "setup": setup,
                 "risk": risk_plan,
                 "confirmation": confirmation,
@@ -1355,24 +1606,22 @@ class Moteur2:
             }
 
         # --------------------------------------------------------------------
-        # 8. CONSTRUCTION DU SIGNAL
-        # --------------------------------------------------------------------
-
-        signal = self._construire_signal(
-            setup=setup,
-            risk_plan=risk_plan,
-            confirmation=confirmation,
-            score_result=score_result,
-            validation=validation,
-            decision_result=decision_result,
-            antispam=antispam,
-        )
-
-        # --------------------------------------------------------------------
-        # 9. ENREGISTREMENT
+        # ENREGISTREMENT ANTISPAM
         # --------------------------------------------------------------------
 
         try:
+
+            self.antispam.enregistrer_signal(
+                setup=setup,
+                risk_plan=risk_plan,
+                setup_id=self._get(
+                    antispam,
+                    "setup_id",
+                ),
+                decision=decision,
+            )
+
+        except TypeError:
 
             try:
 
@@ -1383,55 +1632,49 @@ class Moteur2:
                         antispam,
                         "setup_id",
                     ),
-                    decision=decision,
                 )
 
-            except TypeError:
+            except Exception as exc:
 
-                # Compatibilité ancienne signature.
-                self.antispam.enregistrer_signal(
-                    setup=setup,
-                    risk_plan=risk_plan,
-                    setup_id=self._get(
-                        antispam,
-                        "setup_id",
-                    ),
+                logger.warning(
+                    "Enregistrement AntiSpam impossible : %s",
+                    exc,
                 )
 
         except Exception as exc:
 
             logger.warning(
-                "Signal construit mais enregistrement "
-                "Anti-Spam impossible : %s",
+                "Enregistrement AntiSpam impossible : %s",
                 exc,
             )
-
-        # --------------------------------------------------------------------
-        # 10. SIGNAL PRÊT
-        # --------------------------------------------------------------------
 
         return {
             "status": "SIGNAL_READY",
 
             "setup": setup,
-
             "risk": risk_plan,
 
             "confirmation": confirmation,
-
             "score": score_result,
-
             "validation": validation,
 
             "decision": decision,
-
             "decision_confidence": confidence,
 
-            "decision_result": decision_result,
+            "decision_result":
+                decision_result,
 
-            "antispam": antispam,
+            "intelligence":
+                intelligence,
 
-            "signal": signal,
+            "scenarios":
+                scenarios,
+
+            "antispam":
+                antispam,
+
+            "signal":
+                signal,
         }
 
     # ========================================================================
@@ -1447,13 +1690,13 @@ class Moteur2:
             try:
 
                 # ------------------------------------------------------------
-                # RAFRAÎCHISSEMENT
+                # REFRESH
                 # ------------------------------------------------------------
 
                 await self.rafraichir_cache()
 
                 # ------------------------------------------------------------
-                # PRIX LIVE
+                # PRIX
                 # ------------------------------------------------------------
 
                 current_price = (
@@ -1464,9 +1707,7 @@ class Moteur2:
 
                     return {
                         "status": "NO_PRICE",
-
                         "symbol": self.symbol,
-
                         "reason":
                             "Aucun prix live BiQuote disponible.",
                     }
@@ -1498,7 +1739,6 @@ class Moteur2:
                             missing_primary,
                     }
 
-                # M5/M1 ne sont PAS bloquants.
                 missing_secondary = [
                     tf
                     for tf in SECONDARY_TIMEFRAMES
@@ -1506,12 +1746,37 @@ class Moteur2:
                 ]
 
                 # ------------------------------------------------------------
-                # CARTOGRAPHIE
+                # MARKET CARTOGRAPHY
                 # ------------------------------------------------------------
 
                 cartographie = (
                     await self.analyser_marche(
                         donnees
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # MARKET DATA ENRICHI
+                # ------------------------------------------------------------
+
+                market_data = (
+                    self._construire_market_data(
+                        donnees,
+                        current_price,
+                        cartographie,
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # RADAR
+                #
+                # Le radar observe avant la construction des scénarios.
+                # ------------------------------------------------------------
+
+                radar_events = (
+                    await self.analyser_radar(
+                        market_data,
+                        [],
                     )
                 )
 
@@ -1523,6 +1788,20 @@ class Moteur2:
                     await self.analyser_zones(
                         cartographie,
                         current_price,
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # RADAR AVEC ZONES
+                #
+                # Deuxième lecture pour intégrer les interactions avec
+                # les zones détectées.
+                # ------------------------------------------------------------
+
+                radar_events = (
+                    await self.analyser_radar(
+                        market_data,
+                        zones,
                     )
                 )
 
@@ -1551,6 +1830,20 @@ class Moteur2:
                 )
 
                 # ------------------------------------------------------------
+                # MARKET INTELLIGENCE
+                # ------------------------------------------------------------
+
+                intelligence = (
+                    await self.analyser_intelligence(
+                        market_data=market_data,
+                        contexte=contexte,
+                        zones=zones,
+                        confluences=confluences,
+                        cartographie=cartographie,
+                    )
+                )
+
+                # ------------------------------------------------------------
                 # SETUPS
                 # ------------------------------------------------------------
 
@@ -1569,15 +1862,50 @@ class Moteur2:
                     )
                 )
 
+                # ------------------------------------------------------------
+                # SCÉNARIOS
+                #
+                # Les scénarios utilisent à la fois :
+                # Intelligence + Radar + Zones + Setups.
+                # ------------------------------------------------------------
+
+                scenarios = (
+                    await self.analyser_scenarios(
+                        intelligence=intelligence,
+                        radar_events=radar_events,
+                        contexte=contexte,
+                        zones=zones,
+                        setups=setups,
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # AUCUN SETUP
+                # ------------------------------------------------------------
+
                 if not setups:
 
                     result = {
-                        "status": "NO_SETUP",
+                        "status":
+                            "NO_SETUP",
 
-                        "symbol": self.symbol,
+                        "engine":
+                            ENGINE_NAME,
+
+                        "symbol":
+                            self.symbol,
+
+                        "source":
+                            "BiQuote",
 
                         "current_price":
                             current_price,
+
+                        "market_data":
+                            market_data,
+
+                        "radar":
+                            radar_events,
 
                         "cartographie":
                             cartographie,
@@ -1591,14 +1919,59 @@ class Moteur2:
                         "confluences":
                             confluences,
 
-                        "setups": [],
+                        "intelligence":
+                            intelligence,
 
-                        "results": [],
+                        "scenarios":
+                            scenarios,
 
-                        "signals": [],
+                        "setups":
+                            [],
+
+                        "results":
+                            [],
+
+                        "signals":
+                            [],
+
+                        "signal_count":
+                            0,
 
                         "missing_secondary_timeframes":
                             missing_secondary,
+
+                        "reference_score":
+                            REFERENCE_SCORE,
+
+                        "reference_rr":
+                            REFERENCE_RR,
+
+                        "score_is_blocking":
+                            False,
+
+                        "rr_is_blocking":
+                            False,
+
+                        "m5_is_blocking":
+                            False,
+
+                        "m1_is_blocking":
+                            False,
+
+                        "multiple_signals_allowed":
+                            True,
+
+                        "signal_quota":
+                            None,
+
+                        "forced_signal":
+                            False,
+
+                        "decision_owner":
+                            "moteur2_decision.py",
+
+                        "auto_execution":
+                            False,
                     }
 
                     self.last_analysis = result
@@ -1625,10 +1998,7 @@ class Moteur2:
                 )
 
                 # ------------------------------------------------------------
-                # TRAITEMENT DE TOUS LES SETUPS
-                #
-                # IMPORTANT :
-                # aucun break après le premier signal.
+                # TOUS LES SETUPS
                 # ------------------------------------------------------------
 
                 results: List[
@@ -1675,9 +2045,8 @@ class Moteur2:
                                 contexte=contexte,
                                 confluences=confluences,
                                 donnees=donnees,
-                                market_intelligence=(
-                                    cartographie
-                                ),
+                                intelligence=intelligence,
+                                scenarios=scenarios,
                             )
                         )
 
@@ -1710,7 +2079,7 @@ class Moteur2:
                         })
 
                 # ------------------------------------------------------------
-                # EXTRACTION DES RÉSULTATS
+                # RÉSULTATS
                 # ------------------------------------------------------------
 
                 ready = [
@@ -1740,11 +2109,13 @@ class Moteur2:
                         "SETUP_ERROR",
                         "ANTISPAM_ERROR",
                         "DECISION_ERROR",
+                        "SIGNAL_BUILD_ERROR",
+                        "SIGNAL_NOT_BUILDABLE",
                     }
                 ]
 
                 # ------------------------------------------------------------
-                # TRI PAR CONFIANCE
+                # TRI PAR CONVICTION
                 # ------------------------------------------------------------
 
                 ready.sort(
@@ -1760,12 +2131,10 @@ class Moteur2:
                     reverse=True,
                 )
 
-                # ------------------------------------------------------------
-                # SIGNALS
-                # ------------------------------------------------------------
-
                 signals = [
-                    item.get("signal")
+                    item.get(
+                        "signal"
+                    )
                     for item in ready
                     if item.get(
                         "signal"
@@ -1784,7 +2153,9 @@ class Moteur2:
 
                 elif waiting:
 
-                    overall_status = "WAIT"
+                    overall_status = (
+                        "WAIT"
+                    )
 
                 else:
 
@@ -1793,7 +2164,7 @@ class Moteur2:
                     )
 
                 # ------------------------------------------------------------
-                # RÉSULTAT FINAL
+                # RESULTAT FINAL
                 # ------------------------------------------------------------
 
                 result = {
@@ -1813,6 +2184,12 @@ class Moteur2:
                     "current_price":
                         current_price,
 
+                    "market_data":
+                        market_data,
+
+                    "radar":
+                        radar_events,
+
                     "cartographie":
                         cartographie,
 
@@ -1824,6 +2201,12 @@ class Moteur2:
 
                     "confluences":
                         confluences,
+
+                    "intelligence":
+                        intelligence,
+
+                    "scenarios":
+                        scenarios,
 
                     "setups":
                         setups,
@@ -1881,6 +2264,33 @@ class Moteur2:
 
                     "auto_execution":
                         False,
+
+                    "architecture":
+                        {
+                            "radar":
+                                "moteur2_radar.py",
+
+                            "intelligence":
+                                "moteur2_intelligence.py",
+
+                            "scenarios":
+                                "moteur2_scenarios.py",
+
+                            "decision":
+                                "moteur2_decision.py",
+
+                            "risk":
+                                "moteur2_risk.py",
+
+                            "validation":
+                                "moteur2_validation.py",
+
+                            "confirmation":
+                                "moteur2_confirmation.py",
+
+                            "signal":
+                                "moteur2_signal.py",
+                        },
                 }
 
                 self.last_analysis = result
@@ -2068,6 +2478,46 @@ class Moteur2:
 
             decision_status = {}
 
+        try:
+
+            radar_status = (
+                self.radar.get_status()
+            )
+
+        except Exception:
+
+            radar_status = {}
+
+        try:
+
+            intelligence_status = {
+                "module":
+                    "MARKET_INTELLIGENCE",
+                "adaptive":
+                    True,
+                "decision_owner":
+                    "moteur2_decision.py",
+            }
+
+        except Exception:
+
+            intelligence_status = {}
+
+        try:
+
+            scenarios_status = {
+                "module":
+                    "SCENARIO_ENGINE",
+                "adaptive":
+                    True,
+                "decision_owner":
+                    "moteur2_decision.py",
+            }
+
+        except Exception:
+
+            scenarios_status = {}
+
         return {
 
             "engine":
@@ -2133,14 +2583,23 @@ class Moteur2:
             "decision_owner":
                 "moteur2_decision.py",
 
-            "cache":
-                cache_status,
+            "radar":
+                radar_status,
+
+            "intelligence":
+                intelligence_status,
+
+            "scenarios":
+                scenarios_status,
 
             "decision":
                 decision_status,
 
             "antispam":
                 antispam_status,
+
+            "cache":
+                cache_status,
 
             "last_analysis":
                 self.last_analysis,
@@ -2200,6 +2659,15 @@ async def main() -> None:
             "SYMBOL : XAUUSD"
         )
         print(
+            "RADAR : moteur2_radar.py"
+        )
+        print(
+            "INTELLIGENCE : moteur2_intelligence.py"
+        )
+        print(
+            "SCENARIOS : moteur2_scenarios.py"
+        )
+        print(
             "DECISION : moteur2_decision.py"
         )
         print("=" * 70)
@@ -2218,7 +2686,9 @@ async def main() -> None:
         )
 
         print()
-        print("RESULTAT :")
+        print(
+            "RESULTAT :"
+        )
         print(result)
 
     finally:
