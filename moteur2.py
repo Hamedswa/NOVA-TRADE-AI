@@ -1,8 +1,14 @@
 """
-NOVA TRADE AI - ENGINE 2
+NOVA TRADE AI — ENGINE 2
 moteur2.py
 
-ORCHESTRATEUR PRINCIPAL DU MOTEUR 2
+ORCHESTRATEUR PRINCIPAL — ENGINE 2
+
+Actif :
+    XAUUSD uniquement
+
+Source marché :
+    BiQuote uniquement
 
 Architecture :
 
@@ -18,7 +24,7 @@ Architecture :
         ↓
     Confluences
         ↓
-    Setups / opportunités
+    Détection des setups
         ↓
     Risk Engine
         ↓
@@ -32,42 +38,34 @@ Architecture :
         ↓
     BUY / SELL / WAIT
         ↓
-    Anti-spam
+    Anti-Spam
         ↓
-    Publication Telegram
+    Signal
         ↓
-    Enregistrement du signal publié
-
+    Telegram / couche supérieure
 
 PHILOSOPHIE :
 
     Le moteur ne fonctionne PAS comme une checklist rigide.
 
-    Le marché est observé en continu.
+    Le Decision Engine est l'autorité stratégique.
 
-    Les informations disponibles sont combinées afin de permettre
-    au Decision Engine de déterminer si une opportunité est exploitable.
+    Le score est informatif.
+    Le RR est informatif.
+    M5/M1 sont informatifs.
+    Les zones sont informatives.
+    Les confluences sont informatives.
+    La validation technique protège contre les impossibilités.
 
-    Le score n'est PAS un veto.
-    Le RR n'est PAS un veto.
-    M5 n'est PAS un veto.
-    M1 n'est PAS un veto.
-
-    La validation technique vérifie uniquement que le dossier
-    est techniquement exploitable.
+    Aucun quota de signaux.
+    Aucun signal forcé.
+    Aucun minimum de signaux.
+    Plusieurs signaux distincts sont autorisés.
 
     Le Risk Engine construit Entry / SL / TP.
-
-    Le Decision Engine est le seul propriétaire de la décision
-    stratégique BUY / SELL / WAIT.
-
-    Plusieurs opportunités peuvent être retenues sur un même scan.
-
-    Aucun quota de signal.
-
-    Aucun signal forcé.
-
-    Auto-exécution désactivée.
+    Le Decision Engine décide BUY / SELL / WAIT.
+    L'Anti-Spam protège contre les doublons.
+    Le moteur ne fait pas d'exécution automatique.
 """
 
 from __future__ import annotations
@@ -75,8 +73,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
 
 from biquote_client import BiQuoteClient
 from biquote_stream import BiQuoteStream
@@ -95,19 +98,13 @@ from moteur2_decision import Moteur2Decision
 from moteur2_antispam import Moteur2AntiSpam
 
 
-logger = logging.getLogger("NOVA_ENGINE_2")
-
-
 # ============================================================================
-# CONFIGURATION
+# CONSTANTES
 # ============================================================================
 
-SUPPORTED_SYMBOLS = (
-    "XAUUSD",
-    "BTCUSD",
-    "EURUSD",
-    "GBPUSD",
-)
+ENGINE_NAME = "NOVA TRADE AI - ENGINE 2"
+
+SYMBOL = "XAUUSD"
 
 TIMEFRAMES = (
     "H4",
@@ -117,168 +114,81 @@ TIMEFRAMES = (
     "M1",
 )
 
-# Timeframes réellement nécessaires pour construire le contexte principal.
+# Timeframes indispensables pour le raisonnement principal.
 PRIMARY_TIMEFRAMES = (
     "H4",
     "H1",
     "M15",
 )
 
-# Timeframes supplémentaires.
-# Leur absence ne doit PAS empêcher la recherche d'opportunités.
-CONFIRMATION_TIMEFRAMES = (
+# Timeframes secondaires.
+SECONDARY_TIMEFRAMES = (
     "M5",
     "M1",
 )
 
-ENGINE_NAME = "NOVA TRADE AI - ENGINE 2"
-
-CANDLE_LIMIT = 300
-
-SCAN_INTERVAL_SECONDS = 60
-
-
-# ============================================================================
-# RÉFÉRENCES UNIQUEMENT
-# ============================================================================
-
-# Ces valeurs ne constituent PAS des conditions de rejet.
-
-REFERENCE_RR = 3.0
 REFERENCE_SCORE = 60.0
-
-# Compatibilité avec les anciens modules.
-MINIMUM_RR = REFERENCE_RR
-MINIMUM_SCORE = REFERENCE_SCORE
-
-READY_FOR_SIGNAL = "READY_FOR_SIGNAL"
+REFERENCE_RR = 3.0
 
 DECISION_BUY = "BUY"
 DECISION_SELL = "SELL"
 DECISION_WAIT = "WAIT"
 
-
-# ============================================================================
-# NORMALISATION SYMBOLE
-# ============================================================================
-
-def _normalize_symbol(symbol: Any) -> str:
-    """
-    Normalise un symbole sans fallback automatique.
-    """
-
-    value = (
-        str(symbol or "")
-        .strip()
-        .upper()
-        .replace("/", "")
-        .replace("-", "")
-        .replace("_", "")
-        .replace(" ", "")
-    )
-
-    aliases = {
-        "GOLD": "XAUUSD",
-        "XAU": "XAUUSD",
-        "BTC": "BTCUSD",
-        "EUR": "EURUSD",
-        "GBP": "GBPUSD",
-    }
-
-    return aliases.get(value, value)
+logger = logging.getLogger("NOVA_ENGINE_2")
 
 
 # ============================================================================
-# MOTEUR 2
+# CLASSE PRINCIPALE
 # ============================================================================
 
 class Moteur2:
     """
     Orchestrateur principal du moteur 2.
 
-    Responsabilités :
+    Le moteur orchestre les modules mais ne prend pas lui-même
+    la décision stratégique.
 
-        - récupération des données
-        - orchestration des modules
-        - analyse des opportunités
-        - transmission des informations au Decision Engine
-        - conservation des résultats
-        - préparation des signaux pour Telegram
+    La décision stratégique appartient exclusivement à :
 
-    Le moteur2.py ne prend pas lui-même la décision stratégique.
-
-    Le Decision Engine est propriétaire de :
-
-        BUY
-        SELL
-        WAIT
+        moteur2_decision.py
     """
 
     def __init__(
         self,
-        symbols: Optional[
-            List[str] | tuple[str, ...]
-        ] = None,
+        symbol: str = SYMBOL,
     ) -> None:
 
-        raw_symbols = (
-            symbols
-            if symbols is not None
-            else SUPPORTED_SYMBOLS
+        self.symbol = (
+            str(symbol)
+            .strip()
+            .upper()
+            .replace("/", "")
         )
 
-        normalized_symbols = tuple(
-            _normalize_symbol(symbol)
-            for symbol in raw_symbols
-        )
-
-        invalid_symbols = [
-            symbol
-            for symbol in normalized_symbols
-            if symbol not in SUPPORTED_SYMBOLS
-        ]
-
-        if invalid_symbols:
+        if self.symbol != SYMBOL:
             raise ValueError(
-                f"Symboles non supportés : {invalid_symbols}"
+                "Engine 2 fonctionne uniquement sur XAUUSD."
             )
 
-        self.symbols = tuple(
-            dict.fromkeys(normalized_symbols)
-        )
-
-        if not self.symbols:
-            raise ValueError(
-                "Le moteur 2 doit avoir au moins un symbole."
-            )
-
-        # ====================================================================
-        # DATA PROVIDER
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # SOURCE DE DONNÉES
+        # --------------------------------------------------------------------
 
         self.biquote = BiQuoteClient()
 
-        # ====================================================================
-        # CACHE
-        # ====================================================================
+        self.stream = BiQuoteStream(
+            symbol=self.symbol,
+            on_tick=self._on_tick,
+        )
 
         self.cache = Moteur2Cache(
             client=self.biquote,
-            symbols=self.symbols,
+            symbol=self.symbol,
         )
 
-        # ====================================================================
-        # STREAM TEMPS RÉEL
-        # ====================================================================
-
-        self.stream = BiQuoteStream(
-            symbols=self.symbols,
-            on_tick=self._handle_tick,
-        )
-
-        # ====================================================================
-        # MODULES D'ANALYSE
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # MOTEURS D'ANALYSE
+        # --------------------------------------------------------------------
 
         self.marche = Moteur2Marche()
 
@@ -290,79 +200,61 @@ class Moteur2:
 
         self.setups = Moteur2Setups()
 
-        # ====================================================================
-        # RISK ENGINE
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # PLAN DE RISQUE
+        # --------------------------------------------------------------------
 
-        self.risk = Moteur2Risk(
-            min_rr=REFERENCE_RR,
-        )
+        self.risk = Moteur2Risk()
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # CONFIRMATION
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         self.confirmation = Moteur2Confirmation()
 
-        # ====================================================================
-        # SCORE
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # SCORE INFORMATIF
+        # --------------------------------------------------------------------
 
-        self.score = Moteur2Score(
-            minimum_rr=REFERENCE_RR,
-        )
+        self.score = Moteur2Score()
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # VALIDATION TECHNIQUE
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         self.validation = Moteur2Validation()
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # CERVEAU STRATÉGIQUE
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         self.decision = Moteur2Decision(
             reference_score=REFERENCE_SCORE,
             reference_rr=REFERENCE_RR,
         )
 
-        # ====================================================================
-        # ANTI-SPAM
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # PROTECTION ANTI-SPAM
+        # --------------------------------------------------------------------
 
         self.antispam = Moteur2AntiSpam()
 
-        # ====================================================================
+        # --------------------------------------------------------------------
         # ÉTAT
-        # ====================================================================
+        # --------------------------------------------------------------------
 
         self.running = False
 
-        self.current_prices: Dict[
-            str,
-            float,
-        ] = {}
+        self.initialized = False
 
-        self.last_analysis: Dict[
-            str,
-            Dict[str, Any],
-        ] = {}
+        self.latest_tick: Optional[Any] = None
 
-        self.last_signal: Dict[
-            str,
-            Dict[str, Any],
-        ] = {}
+        self.last_analysis: Optional[Dict[str, Any]] = None
 
-        self._stream_task: Optional[
-            asyncio.Task
-        ] = None
-
-        # Une seule analyse technique simultanée.
         self.analysis_lock = asyncio.Lock()
 
     # ========================================================================
-    # UTILITAIRE GÉNÉRIQUE
+    # UTILITAIRES
     # ========================================================================
 
     @staticmethod
@@ -378,7 +270,11 @@ class Moteur2:
         if isinstance(data, dict):
             return data.get(key, default)
 
-        return getattr(data, key, default)
+        return getattr(
+            data,
+            key,
+            default,
+        )
 
     @staticmethod
     async def _call(
@@ -398,223 +294,359 @@ class Moteur2:
         return result
 
     @staticmethod
-    def _extract_price(
-        tick: Any,
-    ) -> Optional[float]:
+    def _normalize_direction(
+        direction: Any,
+    ) -> Optional[str]:
 
-        if tick is None:
+        if direction is None:
             return None
 
-        for key in (
-            "mid",
-            "price",
-            "last",
-            "bid",
-            "ask",
-        ):
+        value = (
+            str(direction)
+            .strip()
+            .upper()
+        )
 
-            value = Moteur2._get(
-                tick,
-                key,
-            )
+        aliases = {
+            "LONG": "BUY",
+            "HAUSSIER": "BUY",
+            "HAUSSIERE": "BUY",
+            "BULLISH": "BUY",
+            "UP": "BUY",
 
-            if value is None:
-                continue
+            "SHORT": "SELL",
+            "BAISSIER": "SELL",
+            "BAISSIERE": "SELL",
+            "BEARISH": "SELL",
+            "DOWN": "SELL",
+        }
 
-            try:
+        value = aliases.get(
+            value,
+            value,
+        )
 
-                price = float(value)
-
-                if price > 0:
-                    return price
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-                continue
+        if value in {
+            DECISION_BUY,
+            DECISION_SELL,
+        }:
+            return value
 
         return None
 
+    @staticmethod
+    def _float(
+        value: Any,
+        default: Optional[float] = None,
+    ) -> Optional[float]:
+
+        try:
+            if value is None:
+                return default
+
+            return float(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return default
+
     # ========================================================================
-    # TICK TEMPS RÉEL
+    # TICK LIVE
     # ========================================================================
 
-    async def _handle_tick(
+    async def _on_tick(
         self,
         tick: Any,
     ) -> None:
 
-        symbol = _normalize_symbol(
-            self._get(
-                tick,
-                "symbol",
-            )
-        )
-
-        if symbol not in self.symbols:
-            return
-
-        price = self._extract_price(tick)
-
-        if price is not None:
-            self.current_prices[symbol] = price
+        self.latest_tick = tick
 
         try:
 
-            result = self.cache.update_tick(
-                tick
+            await self._call(
+                self.cache.update_tick,
+                tick,
             )
-
-            if inspect.isawaitable(result):
-                await result
 
         except Exception as exc:
 
-            logger.warning(
-                "Erreur mise à jour tick cache %s : %s",
-                symbol,
+            logger.exception(
+                "Erreur mise à jour tick BiQuote : %s",
                 exc,
             )
 
     # ========================================================================
-    # PRIX COURANT
+    # INITIALISATION
     # ========================================================================
 
-    def _get_current_price(
+    async def initialiser(
         self,
-        symbol: str,
-    ) -> Optional[float]:
-
-        normalized = _normalize_symbol(symbol)
-
-        # --------------------------------------------------------------------
-        # 1. STREAM
-        # --------------------------------------------------------------------
-
-        try:
-
-            tick = self.stream.get_latest_tick(
-                normalized
-            )
-
-            price = self._extract_price(tick)
-
-            if price is not None:
-                return price
-
-        except Exception:
-            pass
-
-        # --------------------------------------------------------------------
-        # 2. CACHE
-        # --------------------------------------------------------------------
-
-        try:
-
-            price = self.cache.get_current_price(
-                normalized
-            )
-
-            if price is not None:
-                return float(price)
-
-        except Exception:
-            pass
-
-        # --------------------------------------------------------------------
-        # 3. DERNIER PRIX CONNU
-        # --------------------------------------------------------------------
-
-        return self.current_prices.get(normalized)
-
-    # ========================================================================
-    # RAFRAÎCHISSEMENT CACHE
-    # ========================================================================
-
-    async def _refresh_symbol_cache(
-        self,
-        symbol: str,
     ) -> Dict[str, Any]:
 
-        normalized = _normalize_symbol(symbol)
+        try:
 
-        result = await self.cache.refresh_symbol(
-            normalized,
-            force=False,
+            await self._call(
+                self.cache.refresh_all
+            )
+
+            self.initialized = True
+
+            return {
+                "success": True,
+                "engine": ENGINE_NAME,
+                "symbol": self.symbol,
+                "source": "BiQuote",
+                "timeframes": list(
+                    TIMEFRAMES
+                ),
+            }
+
+        except Exception as exc:
+
+            self.initialized = False
+
+            logger.exception(
+                "Échec initialisation Engine 2."
+            )
+
+            return {
+                "success": False,
+                "engine": ENGINE_NAME,
+                "symbol": self.symbol,
+                "error": str(exc),
+            }
+
+    async def rafraichir_cache(
+        self,
+    ) -> Any:
+
+        return await self._call(
+            self.cache.refresh_all
         )
 
-        return result or {}
-
     # ========================================================================
-    # LECTURE CACHE
+    # DONNÉES
     # ========================================================================
 
-    def _get_cached_candles(
+    def obtenir_donnees(
         self,
-        symbol: str,
     ) -> Dict[str, Any]:
 
-        normalized = _normalize_symbol(symbol)
-
-        candles_by_timeframe: Dict[
-            str,
-            Any,
-        ] = {}
+        donnees: Dict[str, Any] = {}
 
         for timeframe in TIMEFRAMES:
 
             try:
 
-                candles = (
+                donnees[timeframe] = (
                     self.cache.get_closed_candles(
-                        normalized,
-                        timeframe,
+                        timeframe
                     )
                 )
 
             except TypeError:
 
-                candles = (
-                    self.cache.get_candles(
-                        normalized,
-                        timeframe,
+                donnees[timeframe] = (
+                    self.cache.get_closed_candles(
+                        timeframe=timeframe
                     )
                 )
 
             except Exception as exc:
 
                 logger.warning(
-                    "Erreur lecture cache %s %s : %s",
-                    normalized,
+                    "Données indisponibles %s : %s",
                     timeframe,
                     exc,
                 )
 
-                candles = None
+                donnees[timeframe] = None
 
-            if candles:
-                candles_by_timeframe[timeframe] = candles
+        return donnees
 
-        return candles_by_timeframe
-
-    # ========================================================================
-    # CHANDELIERS
-    # ========================================================================
-
-    async def _get_candles(
+    def verifier_donnees_principales(
         self,
-        symbol: str,
-    ) -> Dict[str, Any]:
+        donnees: Dict[str, Any],
+    ) -> List[str]:
 
-        normalized = _normalize_symbol(symbol)
+        return [
+            timeframe
+            for timeframe in PRIMARY_TIMEFRAMES
+            if not donnees.get(timeframe)
+        ]
 
-        await self._refresh_symbol_cache(
-            normalized
+    # ========================================================================
+    # CARTOGRAPHIE
+    # ========================================================================
+
+    async def analyser_marche(
+        self,
+        donnees: Dict[str, Any],
+    ) -> Any:
+
+        return await self._call(
+            self.marche.cartographier_marche,
+            donnees,
         )
 
-        return self._get_cached_candles(
-            normalized
+    # ========================================================================
+    # ZONES
+    # ========================================================================
+
+    async def analyser_zones(
+        self,
+        cartographie: Any,
+        current_price: float,
+    ) -> Any:
+
+        return await self._call(
+            self.zones.analyser,
+            cartographie,
+            current_price,
+        )
+
+    # ========================================================================
+    # CONTEXTE
+    # ========================================================================
+
+    async def analyser_contexte(
+        self,
+        donnees: Dict[str, Any],
+        zones: Any,
+    ) -> Any:
+
+        return await self._call(
+            self.contexte.analyser,
+            donnees,
+            zones,
+        )
+
+    # ========================================================================
+    # CONFLUENCES
+    # ========================================================================
+
+    async def analyser_confluences(
+        self,
+        donnees: Dict[str, Any],
+        zones: Any,
+        contexte: Any,
+        cartographie: Any,
+    ) -> Any:
+
+        return await self._call(
+            self.confluences.analyser,
+            donnees,
+            zones,
+            contexte,
+            cartographie,
+        )
+
+    # ========================================================================
+    # SETUPS
+    # ========================================================================
+
+    async def analyser_setups(
+        self,
+        zones: Any,
+        confluences: Any,
+        contexte: Any,
+        donnees: Dict[str, Any],
+    ) -> Any:
+
+        return await self._call(
+            self.setups.analyser,
+            zones,
+            confluences,
+            contexte,
+            donnees,
+        )
+
+    # ========================================================================
+    # RISK
+    # ========================================================================
+
+    async def analyser_risque(
+        self,
+        setups: Any,
+        zones: Any,
+        donnees: Dict[str, Any],
+        current_price: float,
+    ) -> Any:
+
+        return await self._call(
+            self.risk.analyser_setups,
+            setups,
+            zones,
+            donnees,
+            current_price,
+        )
+
+    # ========================================================================
+    # CONFIRMATION
+    # ========================================================================
+
+    async def analyser_confirmation(
+        self,
+        setup: Any,
+        donnees: Dict[str, Any],
+        risk_plan: Any,
+    ) -> Any:
+
+        return await self._call(
+            self.confirmation.analyser,
+            setup,
+            donnees,
+            risk_plan,
+        )
+
+    # ========================================================================
+    # SCORE
+    # ========================================================================
+
+    async def calculer_score(
+        self,
+        setup: Any,
+        zones: Any,
+        contexte: Any,
+        confluences: Any,
+        confirmation: Any,
+        risk_plan: Any,
+    ) -> Any:
+
+        return await self._call(
+            self.score.analyser,
+            setup=setup,
+            zones=zones,
+            context=contexte,
+            confluences=confluences,
+            confirmation=confirmation,
+            risk_plan=risk_plan,
+        )
+
+    # ========================================================================
+    # VALIDATION TECHNIQUE
+    # ========================================================================
+
+    async def valider(
+        self,
+        setup: Any,
+        risk_plan: Any,
+        confirmation: Any,
+        score_result: Any,
+        contexte: Any,
+        confluences: Any,
+    ) -> Any:
+
+        return await self._call(
+            self.validation.valider,
+            setup=setup,
+            risk_plan=risk_plan,
+            confirmation=confirmation,
+            score_result=score_result,
+            contexte=contexte,
+            confluences=confluences,
         )
 
     # ========================================================================
@@ -622,7 +654,7 @@ class Moteur2:
     # ========================================================================
 
     @staticmethod
-    def _extract_setups(
+    def _extraire_setups(
         setups_result: Any,
     ) -> List[Any]:
 
@@ -634,69 +666,387 @@ class Moteur2:
             dict,
         ):
 
-            for key in (
-                "setups",
-                "results",
-                "candidates",
-                "items",
+            setups = (
+                setups_result.get("setups")
+                or setups_result.get(
+                    "detected_setups"
+                )
+                or setups_result.get(
+                    "opportunities"
+                )
+                or []
+            )
+
+            if isinstance(
+                setups,
+                (list, tuple),
             ):
+                return list(setups)
 
-                value = setups_result.get(key)
+            if setups:
+                return [setups]
 
-                if isinstance(value, list):
-                    return value
-
-            return [setups_result]
+            return []
 
         if isinstance(
             setups_result,
-            (
-                list,
-                tuple,
-            ),
+            (list, tuple),
         ):
-
             return list(setups_result)
 
         return [setups_result]
 
     # ========================================================================
-    # CONSTRUCTION D'UN RESULTAT WAIT
+    # EXTRACTION DES PLANS DE RISQUE
     # ========================================================================
 
     @staticmethod
-    def _build_wait_result(
-        *,
-        symbol: str,
+    def _extraire_risk_plans(
+        risk_result: Any,
+    ) -> List[Any]:
+
+        if risk_result is None:
+            return []
+
+        if isinstance(
+            risk_result,
+            dict,
+        ):
+
+            plans = (
+                risk_result.get("plans")
+                or risk_result.get(
+                    "risk_plans"
+                )
+                or risk_result.get(
+                    "valid_plans"
+                )
+                or risk_result.get(
+                    "results"
+                )
+                or []
+            )
+
+            if isinstance(
+                plans,
+                (list, tuple),
+            ):
+                return list(plans)
+
+            if plans:
+                return [plans]
+
+            return []
+
+        if isinstance(
+            risk_result,
+            (list, tuple),
+        ):
+            return list(risk_result)
+
+        return [risk_result]
+
+    # ========================================================================
+    # TROUVER LE PLAN DE RISQUE D'UN SETUP
+    # ========================================================================
+
+    def _trouver_risk_plan(
+        self,
+        setup: Any,
+        index: int,
+        risk_plans: List[Any],
+    ) -> Any:
+
+        setup_id = self._get(
+            setup,
+            "setup_id",
+        )
+
+        if setup_id is None:
+
+            setup_id = self._get(
+                setup,
+                "id",
+            )
+
+        if setup_id is not None:
+
+            setup_id = str(
+                setup_id
+            )
+
+            for candidate in risk_plans:
+
+                candidate_id = self._get(
+                    candidate,
+                    "setup_id",
+                )
+
+                if candidate_id is None:
+                    candidate_id = self._get(
+                        candidate,
+                        "id",
+                    )
+
+                if (
+                    candidate_id is not None
+                    and str(candidate_id)
+                    == setup_id
+                ):
+                    return candidate
+
+        if index < len(risk_plans):
+
+            return risk_plans[index]
+
+        return None
+
+    # ========================================================================
+    # CONSTRUCTION DU SIGNAL
+    # ========================================================================
+
+    def _construire_signal(
+        self,
         setup: Any,
         risk_plan: Any,
-        confirmation_result: Any,
+        confirmation: Any,
         score_result: Any,
-        validation_result: Any,
+        validation: Any,
         decision_result: Any,
-        confidence: float,
-        reason: Optional[str] = None,
+        antispam: Any,
     ) -> Dict[str, Any]:
 
-        result = {
-            "status": DECISION_WAIT,
-            "symbol": symbol,
-            "setup": setup,
-            "risk": risk_plan,
-            "confirmation": confirmation_result,
-            "score": score_result,
-            "validation": validation_result,
-            "decision": decision_result,
-            "decision_confidence": confidence,
-            "registered": False,
-            "published": False,
-            "auto_execution": False,
+        setup_id = (
+            self._get(
+                setup,
+                "setup_id",
+            )
+            or self._get(
+                setup,
+                "id",
+            )
+            or self._get(
+                antispam,
+                "setup_id",
+            )
+            or "SETUP"
+        )
+
+        direction = (
+            self._get(
+                decision_result,
+                "decision",
+            )
+            or self._get(
+                setup,
+                "direction",
+            )
+        )
+
+        direction = self._normalize_direction(
+            direction
+        )
+
+        entry = self._float(
+            self._get(
+                risk_plan,
+                "entry",
+            )
+        )
+
+        sl = self._float(
+            self._get(
+                risk_plan,
+                "sl",
+            )
+        )
+
+        tp1 = self._float(
+            self._get(
+                risk_plan,
+                "tp1",
+            )
+        )
+
+        tp2 = self._float(
+            self._get(
+                risk_plan,
+                "tp2",
+            )
+        )
+
+        tp3 = self._float(
+            self._get(
+                risk_plan,
+                "tp3",
+            )
+        )
+
+        rr = self._float(
+            self._get(
+                risk_plan,
+                "primary_rr",
+            )
+        )
+
+        if rr is None:
+
+            rr = self._float(
+                self._get(
+                    risk_plan,
+                    "rr",
+                )
+            )
+
+        if rr is None:
+
+            rr = self._float(
+                self._get(
+                    risk_plan,
+                    "rr_tp1",
+                )
+            )
+
+        score = self._float(
+            self._get(
+                score_result,
+                "score",
+            )
+        )
+
+        confidence = self._float(
+            self._get(
+                decision_result,
+                "confidence",
+            ),
+            0.0,
+        )
+
+        quality = self._get(
+            decision_result,
+            "quality",
+            "NEUTRAL",
+        )
+
+        priority = self._get(
+            decision_result,
+            "priority",
+            "NORMAL",
+        )
+
+        timestamp = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        signal_id = (
+            f"{setup_id}-"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        )
+
+        return {
+            "signal_id": signal_id,
+
+            "engine": ENGINE_NAME,
+
+            "symbol": self.symbol,
+
+            "direction": direction,
+
+            "decision": direction,
+
+            "confidence": confidence,
+
+            "priority": priority,
+
+            "quality": quality,
+
+            "setup_id": str(
+                setup_id
+            ),
+
+            "setup_type": self._get(
+                setup,
+                "setup_type",
+                "UNKNOWN",
+            ),
+
+            "entry": entry,
+
+            "sl": sl,
+
+            "tp1": tp1,
+
+            "tp2": tp2,
+
+            "tp3": tp3,
+
+            "rr": rr,
+
+            "score": score,
+
+            "timestamp": timestamp,
+
+            "risk_plan": risk_plan,
+
+            "confirmation": confirmation,
+
+            "validation": validation,
+
+            "decision_result": (
+                decision_result.to_dict()
+                if hasattr(
+                    decision_result,
+                    "to_dict",
+                )
+                else decision_result
+            ),
+
+            "antispam": antispam,
+
+            "metadata": {
+                "decision_owner":
+                    "moteur2_decision.py",
+
+                "risk_engine_decides_trade":
+                    False,
+
+                "score_is_blocking":
+                    False,
+
+                "rr_is_blocking":
+                    False,
+
+                "m5_is_blocking":
+                    False,
+
+                "m1_is_blocking":
+                    False,
+
+                "forced_signal":
+                    False,
+
+                "signal_quota":
+                    None,
+
+                "auto_execution":
+                    False,
+
+                "entry_source":
+                    "moteur2_risk.py",
+
+                "sl_source":
+                    "moteur2_risk.py",
+
+                "tp_source":
+                    "moteur2_risk.py",
+
+                "decision_source":
+                    "moteur2_decision.py",
+
+                "signal_builder":
+                    "moteur2.py",
+            },
         }
-
-        if reason:
-            result["reason"] = reason
-
-        return result
 
     # ========================================================================
     # TRAITEMENT D'UN SETUP
@@ -705,151 +1055,157 @@ class Moteur2:
     async def traiter_setup(
         self,
         setup: Any,
-        *,
-        symbol: str,
-        candles: Dict[str, Any],
-        zones_result: Any,
-        context_result: Any,
-        confluences_result: Any,
-        cartographie_result: Any,
-        current_price: Optional[float],
-    ) -> Optional[Dict[str, Any]]:
+        risk_plan: Any,
+        zones: Any,
+        contexte: Any,
+        confluences: Any,
+        donnees: Dict[str, Any],
+        market_intelligence: Any = None,
+    ) -> Dict[str, Any]:
 
-        normalized = _normalize_symbol(symbol)
+        # --------------------------------------------------------------------
+        # 1. CONFIRMATION
+        # --------------------------------------------------------------------
 
-        # ====================================================================
-        # 1. RISK ENGINE
-        # ====================================================================
-        #
-        # Le Risk Engine construit le plan.
-        #
-        # Il ne décide PAS si le trade doit être pris.
-        #
+        try:
 
-        risk_plan = self.risk.analyser_setup(
-            setup=setup,
-            zones=zones_result,
-            candles=candles,
-            current_price=current_price,
-            symbol=normalized,
-        )
-
-        # ====================================================================
-        # 2. CONFIRMATION M5 / M1
-        # ====================================================================
-        #
-        # M5 et M1 sont informatifs.
-        #
-        # Leur absence ou leur non-confirmation ne constitue pas
-        # automatiquement un veto stratégique.
-        #
-
-        confirmation_result = (
-            self.confirmation.analyser(
-                setup=setup,
-                candles=candles,
-                risk_plan=risk_plan,
-                symbol=normalized,
+            confirmation = (
+                await self.analyser_confirmation(
+                    setup,
+                    donnees,
+                    risk_plan,
+                )
             )
-        )
 
-        # ====================================================================
-        # 3. SCORE
-        # ====================================================================
-        #
-        # Le score décrit la qualité du dossier.
-        #
-        # Aucun seuil de rejet ici.
-        #
+        except Exception as exc:
 
-        score_result = self.score.analyser(
-            setup=setup,
-            zones=zones_result,
-            context=context_result,
-            confluences=confluences_result,
-            confirmation=confirmation_result,
-            risk_plan=risk_plan,
-            symbol=normalized,
-        )
+            logger.exception(
+                "Erreur confirmation setup : %s",
+                exc,
+            )
 
-        # ====================================================================
-        # 4. VALIDATION TECHNIQUE
-        # ====================================================================
-        #
-        # Cette étape ne choisit PAS BUY ou SELL.
-        #
-        # Elle vérifie que le dossier est techniquement exploitable.
-        #
+            confirmation = {
+                "status": "UNAVAILABLE",
+                "confirmed": False,
+                "error": str(exc),
+            }
 
-        validation_result = (
-            self.validation.analyser(
+        # --------------------------------------------------------------------
+        # 2. SCORE INFORMATIF
+        # --------------------------------------------------------------------
+
+        try:
+
+            score_result = (
+                await self.calculer_score(
+                    setup=setup,
+                    zones=zones,
+                    contexte=contexte,
+                    confluences=confluences,
+                    confirmation=confirmation,
+                    risk_plan=risk_plan,
+                )
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur score setup : %s",
+                exc,
+            )
+
+            score_result = {
+                "score": None,
+                "quality": "UNAVAILABLE",
+                "error": str(exc),
+            }
+
+        # --------------------------------------------------------------------
+        # 3. VALIDATION TECHNIQUE
+        # --------------------------------------------------------------------
+
+        try:
+
+            validation = await self.valider(
                 setup=setup,
                 risk_plan=risk_plan,
-                confirmation=confirmation_result,
+                confirmation=confirmation,
                 score_result=score_result,
-                context=context_result,
-                confluences=confluences_result,
+                contexte=contexte,
+                confluences=confluences,
             )
-        )
 
-        validation_status = str(
-            self._get(
-                validation_result,
-                "status",
-                "",
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur validation setup : %s",
+                exc,
             )
-        ).strip().upper()
 
-        validation_valid = bool(
-            self._get(
-                validation_result,
-                "valid",
-                self._get(
-                    validation_result,
-                    "validated",
-                    False,
-                ),
+            validation = {
+                "validated": False,
+                "valid": False,
+                "status": "TECHNICAL_ERROR",
+                "reason": str(exc),
+                "blockers": [
+                    str(exc)
+                ],
+                "warnings": [],
+            }
+
+        # --------------------------------------------------------------------
+        # 4. DECISION ENGINE
+        #
+        # C'est ici que le cerveau stratégique reçoit toutes les informations.
+        # --------------------------------------------------------------------
+
+        try:
+
+            decision_result = (
+                self.decision.analyser(
+                    setup=setup,
+                    contexte=contexte,
+                    zones=zones,
+                    structure=self._get(
+                        contexte,
+                        "structure",
+                    ),
+                    confluences=confluences,
+                    risk_plan=risk_plan,
+                    score_result=score_result,
+                    validation_result=validation,
+                    confirmation_result=confirmation,
+                    market_intelligence=(
+                        market_intelligence
+                        if market_intelligence
+                        is not None
+                        else None
+                    ),
+                )
             )
-        )
 
-        # ====================================================================
-        # 5. DECISION ENGINE
-        # ====================================================================
-        #
-        # Le Decision Engine reçoit le dossier complet.
-        #
-        # Il peut considérer :
-        #
-        #   - contexte
-        #   - zones
-        #   - structure
-        #   - confluences
-        #   - setup
-        #   - risk
-        #   - score
-        #   - validation
-        #   - confirmation
-        #   - intelligence marché
-        #
-        # Il produit :
-        #
-        #   BUY
-        #   SELL
-        #   WAIT
-        #
+        except Exception as exc:
 
-        decision_result = self.decision.analyser(
-            setup=setup,
-            contexte=context_result,
-            zones=zones_result,
-            structure=cartographie_result,
-            confluences=confluences_result,
-            risk_plan=risk_plan,
-            score_result=score_result,
-            validation_result=validation_result,
-            confirmation_result=confirmation_result,
-            market_intelligence=cartographie_result,
-        )
+            logger.exception(
+                "Erreur Decision Engine : %s",
+                exc,
+            )
+
+            return {
+                "status": "DECISION_ERROR",
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation,
+                "score": score_result,
+                "validation": validation,
+                "decision": DECISION_WAIT,
+                "decision_result": {
+                    "decision": DECISION_WAIT,
+                    "confidence": 0.0,
+                    "error": str(exc),
+                },
+                "signal": None,
+            }
 
         decision = str(
             self._get(
@@ -857,893 +1213,727 @@ class Moteur2:
                 "decision",
                 DECISION_WAIT,
             )
-        ).strip().upper()
+        ).upper()
 
-        confidence = self._get(
-            decision_result,
-            "confidence",
+        confidence = self._float(
+            self._get(
+                decision_result,
+                "confidence",
+            ),
             0.0,
         )
 
-        try:
-            confidence = float(confidence)
-        except (
-            TypeError,
-            ValueError,
-        ):
-            confidence = 0.0
-
-        # ====================================================================
-        # 6. SAFETY GUARD TECHNIQUE
-        # ====================================================================
-        #
-        # IMPORTANT :
-        #
-        # Une validation techniquement invalide ne peut jamais devenir
-        # un signal réel simplement parce que le Decision Engine a renvoyé
-        # BUY ou SELL.
-        #
-        # Cela ne constitue PAS une règle stratégique.
-        #
-        # C'est une protection contre :
-        #
-        #   - Entry invalide
-        #   - SL invalide
-        #   - TP invalide
-        #   - données incohérentes
-        #   - géométrie impossible
-        #   - dossier techniquement inutilisable
-        #
-        # Le Safety Guard ne choisit jamais BUY/SELL.
-        #
-
-        if not validation_valid:
-
-            logger.warning(
-                "Dossier techniquement invalide pour %s : "
-                "Decision=%s | validation_status=%s",
-                normalized,
-                decision,
-                validation_status,
-            )
-
-            return self._build_wait_result(
-                symbol=normalized,
-                setup=setup,
-                risk_plan=risk_plan,
-                confirmation_result=confirmation_result,
-                score_result=score_result,
-                validation_result=validation_result,
-                decision_result=decision_result,
-                confidence=confidence,
-                reason=(
-                    "SAFETY_GUARD_TECHNICAL_VALIDATION"
-                ),
-            )
-
-        # ====================================================================
-        # 7. WAIT
-        # ====================================================================
-        #
-        # WAIT est une vraie décision.
-        #
-        # Aucun signal n'est forcé.
-        #
+        # --------------------------------------------------------------------
+        # 5. WAIT
+        # --------------------------------------------------------------------
 
         if decision == DECISION_WAIT:
 
-            return self._build_wait_result(
-                symbol=normalized,
-                setup=setup,
-                risk_plan=risk_plan,
-                confirmation_result=confirmation_result,
-                score_result=score_result,
-                validation_result=validation_result,
-                decision_result=decision_result,
-                confidence=confidence,
-                reason="DECISION_ENGINE_WAIT",
-            )
+            return {
+                "status": "WAIT",
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation,
+                "score": score_result,
+                "validation": validation,
+                "decision": decision,
+                "decision_confidence": confidence,
+                "decision_result": decision_result,
+                "signal": None,
+            }
 
-        # ====================================================================
-        # 8. DECISION INCONNUE
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # 6. PROTECTION : SEULEMENT BUY / SELL
+        # --------------------------------------------------------------------
 
-        if decision not in (
+        if decision not in {
             DECISION_BUY,
             DECISION_SELL,
-        ):
+        }:
 
-            logger.warning(
-                "Decision inconnue %s pour %s",
-                decision,
-                normalized,
-            )
+            return {
+                "status": "WAIT",
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation,
+                "score": score_result,
+                "validation": validation,
+                "decision": DECISION_WAIT,
+                "decision_confidence": confidence,
+                "decision_result": decision_result,
+                "signal": None,
+            }
 
-            return self._build_wait_result(
-                symbol=normalized,
+        # --------------------------------------------------------------------
+        # 7. ANTI-SPAM
+        #
+        # L'Anti-Spam ne décide pas.
+        # Il vérifie seulement si le signal peut être publié.
+        # --------------------------------------------------------------------
+
+        try:
+
+            antispam = self.antispam.verifier(
                 setup=setup,
                 risk_plan=risk_plan,
-                confirmation_result=confirmation_result,
-                score_result=score_result,
-                validation_result=validation_result,
-                decision_result=decision_result,
-                confidence=confidence,
-                reason="UNKNOWN_DECISION",
-            )
-
-        # ====================================================================
-        # 9. ANTI-SPAM
-        # ====================================================================
-        #
-        # L'AntiSpam ne juge PAS le marché.
-        #
-        # Il vérifie seulement :
-        #
-        #   - doublon
-        #   - cooldown
-        #   - répétition du même setup
-        #   - cohérence technique minimale
-        #
-        # La décision BUY/SELL vient déjà du Decision Engine.
-        #
-
-        antispam_result = (
-            self.antispam.verifier(
-                setup=setup,
-                risk_plan=risk_plan,
-                validation=validation_result,
+                validation=validation,
                 decision=decision,
             )
-        )
 
-        antispam_allowed = bool(
+        except TypeError:
+
+            # Compatibilité avec une ancienne signature.
+            try:
+
+                antispam = self.antispam.verifier(
+                    setup=setup,
+                    risk_plan=risk_plan,
+                    validation=validation,
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Erreur Anti-Spam : %s",
+                    exc,
+                )
+
+                return {
+                    "status": "ANTISPAM_ERROR",
+                    "setup": setup,
+                    "risk": risk_plan,
+                    "confirmation": confirmation,
+                    "score": score_result,
+                    "validation": validation,
+                    "decision": decision,
+                    "decision_result": decision_result,
+                    "error": str(exc),
+                    "signal": None,
+                }
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur Anti-Spam : %s",
+                exc,
+            )
+
+            return {
+                "status": "ANTISPAM_ERROR",
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation,
+                "score": score_result,
+                "validation": validation,
+                "decision": decision,
+                "decision_result": decision_result,
+                "error": str(exc),
+                "signal": None,
+            }
+
+        allowed = bool(
             self._get(
-                antispam_result,
+                antispam,
                 "allowed",
                 False,
             )
         )
 
-        if not antispam_allowed:
+        if not allowed:
 
             return {
-                "status": "ANTISPAM_REJECTED",
-                "symbol": normalized,
+                "status": "ANTISPAM_BLOCKED",
                 "setup": setup,
                 "risk": risk_plan,
-                "confirmation": confirmation_result,
+                "confirmation": confirmation,
                 "score": score_result,
-                "validation": validation_result,
-                "decision": decision_result,
-                "antispam": antispam_result,
-                "decision_confidence": confidence,
-                "registered": False,
-                "published": False,
-                "auto_execution": False,
+                "validation": validation,
+                "decision": decision,
+                "decision_result": decision_result,
+                "antispam": antispam,
+                "signal": None,
             }
 
-        # ====================================================================
-        # 10. IDENTIFIANT SETUP
-        # ====================================================================
+        # --------------------------------------------------------------------
+        # 8. CONSTRUCTION DU SIGNAL
+        # --------------------------------------------------------------------
 
-        setup_id = self._get(
-            antispam_result,
-            "setup_id",
-            None,
+        signal = self._construire_signal(
+            setup=setup,
+            risk_plan=risk_plan,
+            confirmation=confirmation,
+            score_result=score_result,
+            validation=validation,
+            decision_result=decision_result,
+            antispam=antispam,
         )
 
-        if not setup_id:
+        # --------------------------------------------------------------------
+        # 9. ENREGISTREMENT
+        # --------------------------------------------------------------------
+
+        try:
 
             try:
 
-                setup_id = (
-                    self.antispam.generer_setup_id(
-                        setup,
-                        risk_plan,
-                    )
+                self.antispam.enregistrer_signal(
+                    setup=setup,
+                    risk_plan=risk_plan,
+                    setup_id=self._get(
+                        antispam,
+                        "setup_id",
+                    ),
+                    decision=decision,
                 )
 
-            except Exception:
+            except TypeError:
 
-                setup_id = self._get(
-                    setup,
-                    "setup_id",
-                    None,
+                # Compatibilité ancienne signature.
+                self.antispam.enregistrer_signal(
+                    setup=setup,
+                    risk_plan=risk_plan,
+                    setup_id=self._get(
+                        antispam,
+                        "setup_id",
+                    ),
                 )
 
-        # ====================================================================
-        # 11. SIGNAL PRÊT POUR TELEGRAM
-        # ====================================================================
+        except Exception as exc:
 
-        signal = {
-            "status": READY_FOR_SIGNAL,
+            logger.warning(
+                "Signal construit mais enregistrement "
+                "Anti-Spam impossible : %s",
+                exc,
+            )
 
-            "decision": decision,
+        # --------------------------------------------------------------------
+        # 10. SIGNAL PRÊT
+        # --------------------------------------------------------------------
 
-            "decision_result": decision_result,
-
-            "decision_confidence": confidence,
-
-            "symbol": normalized,
-
-            "setup_id": setup_id,
+        return {
+            "status": "SIGNAL_READY",
 
             "setup": setup,
 
             "risk": risk_plan,
 
-            "confirmation": confirmation_result,
+            "confirmation": confirmation,
 
             "score": score_result,
 
-            "validation": validation_result,
+            "validation": validation,
 
-            "antispam": antispam_result,
+            "decision": decision,
 
-            "registered": False,
+            "decision_confidence": confidence,
 
-            "published": False,
+            "decision_result": decision_result,
 
-            "auto_execution": False,
+            "antispam": antispam,
+
+            "signal": signal,
         }
 
-        # Conservation du dernier signal actionnable.
-        self.last_signal[normalized] = signal
-
-        return signal
-
     # ========================================================================
-    # ENREGISTREMENT APRÈS PUBLICATION
+    # ANALYSE COMPLÈTE
     # ========================================================================
 
-    def enregistrer_signal_publie(
+    async def analyser(
         self,
-        signal: Any,
-    ) -> Optional[str]:
-
-        """
-        Enregistre un signal uniquement après publication réussie.
-
-        Cette méthode :
-
-            - ne crée pas de nouveau signal
-            - ne modifie pas Entry
-            - ne modifie pas SL
-            - ne modifie pas TP
-            - ne prend aucune décision stratégique
-        """
-
-        if signal is None:
-            return None
-
-        status = str(
-            self._get(
-                signal,
-                "status",
-                "",
-            )
-        ).strip().upper()
-
-        if status != READY_FOR_SIGNAL:
-
-            logger.warning(
-                "Tentative d'enregistrement d'un signal non READY."
-            )
-
-            return None
-
-        decision = str(
-            self._get(
-                signal,
-                "decision",
-                "",
-            )
-        ).strip().upper()
-
-        if decision not in (
-            DECISION_BUY,
-            DECISION_SELL,
-        ):
-
-            logger.warning(
-                "Tentative d'enregistrement d'un signal "
-                "sans décision BUY/SELL."
-            )
-
-            return None
-
-        setup = self._get(
-            signal,
-            "setup",
-            None,
-        )
-
-        risk_plan = self._get(
-            signal,
-            "risk",
-            None,
-        )
-
-        validation = self._get(
-            signal,
-            "validation",
-            None,
-        )
-
-        antispam_result = self._get(
-            signal,
-            "antispam",
-            None,
-        )
-
-        setup_id = self._get(
-            antispam_result,
-            "setup_id",
-            None,
-        )
-
-        if not setup_id:
-
-            setup_id = self._get(
-                signal,
-                "setup_id",
-                None,
-            )
-
-        try:
-
-            registered_id = (
-                self.antispam.enregistrer_signal(
-                    setup=setup,
-                    risk_plan=risk_plan,
-                    setup_id=setup_id,
-                    validation=validation,
-                    decision=decision,
-                )
-            )
-
-        except TypeError:
-            # Compatibilité avec une ancienne signature.
-            try:
-
-                registered_id = (
-                    self.antispam.enregistrer_signal(
-                        setup=setup,
-                        risk_plan=risk_plan,
-                        setup_id=setup_id,
-                        validation=validation,
-                    )
-                )
-
-            except Exception as exc:
-
-                logger.exception(
-                    "Erreur enregistrement signal publié : %s",
-                    exc,
-                )
-
-                return None
-
-        except Exception as exc:
-
-            logger.exception(
-                "Erreur enregistrement signal publié : %s",
-                exc,
-            )
-
-            return None
-
-        if registered_id:
-
-            symbol = _normalize_symbol(
-                self._get(
-                    signal,
-                    "symbol",
-                    "",
-                )
-            )
-
-            if symbol:
-
-                stored_signal = self.last_signal.get(
-                    symbol
-                )
-
-                if stored_signal is not None:
-
-                    stored_signal["registered"] = True
-
-                    stored_signal["published"] = True
-
-                    stored_signal["setup_id"] = registered_id
-
-            return registered_id
-
-        return None
-
-    # ========================================================================
-    # ANALYSE D'UN SYMBOLE
-    # ========================================================================
-
-    async def analyser_symbole(
-        self,
-        symbol: str,
     ) -> Dict[str, Any]:
-
-        normalized = _normalize_symbol(symbol)
-
-        if normalized not in self.symbols:
-
-            raise ValueError(
-                f"Symbole non configuré : {normalized}"
-            )
 
         async with self.analysis_lock:
 
-            logger.info(
-                "Analyse Engine 2 : %s",
-                normalized,
-            )
+            try:
 
-            # =================================================================
-            # DONNÉES
-            # =================================================================
+                # ------------------------------------------------------------
+                # RAFRAÎCHISSEMENT
+                # ------------------------------------------------------------
 
-            candles = await self._get_candles(
-                normalized
-            )
+                await self.rafraichir_cache()
 
-            # =================================================================
-            # DONNÉES PRINCIPALES
-            # =================================================================
-            #
-            # H4 / H1 / M15 sont nécessaires pour que le moteur possède
-            # son contexte principal.
-            #
-            # M5 / M1 ne bloquent PAS l'analyse.
-            #
+                # ------------------------------------------------------------
+                # PRIX LIVE
+                # ------------------------------------------------------------
 
-            missing_primary_timeframes = [
-                timeframe
-                for timeframe in PRIMARY_TIMEFRAMES
-                if not candles.get(timeframe)
-            ]
-
-            missing_confirmation_timeframes = [
-                timeframe
-                for timeframe in CONFIRMATION_TIMEFRAMES
-                if not candles.get(timeframe)
-            ]
-
-            if missing_primary_timeframes:
-
-                result = {
-                    "status": "INSUFFICIENT_PRIMARY_DATA",
-                    "symbol": normalized,
-                    "missing_timeframes": (
-                        missing_primary_timeframes
-                    ),
-                    "missing_primary_timeframes": (
-                        missing_primary_timeframes
-                    ),
-                    "missing_confirmation_timeframes": (
-                        missing_confirmation_timeframes
-                    ),
-                    "candles": candles,
-                    "auto_execution": False,
-                }
-
-                self.last_analysis[
-                    normalized
-                ] = result
-
-                return result
-
-            # =================================================================
-            # AVERTISSEMENT M5/M1
-            # =================================================================
-
-            if missing_confirmation_timeframes:
-
-                logger.warning(
-                    "%s : M5/M1 indisponible(s) : %s. "
-                    "Analyse principale maintenue.",
-                    normalized,
-                    missing_confirmation_timeframes,
+                current_price = (
+                    self.cache.get_current_price()
                 )
 
-            # =================================================================
-            # PRIX COURANT
-            # =================================================================
+                if current_price is None:
 
-            current_price = (
-                self._get_current_price(
-                    normalized
-                )
-            )
+                    return {
+                        "status": "NO_PRICE",
 
-            if current_price is None:
+                        "symbol": self.symbol,
 
-                result = {
-                    "status": "NO_CURRENT_PRICE",
-                    "symbol": normalized,
-                    "candles": candles,
-                    "missing_primary_timeframes": [],
-                    "missing_confirmation_timeframes": (
-                        missing_confirmation_timeframes
-                    ),
-                    "auto_execution": False,
-                }
-
-                self.last_analysis[
-                    normalized
-                ] = result
-
-                return result
-
-            # =================================================================
-            # CARTOGRAPHIE
-            # =================================================================
-
-            cartographie = self.marche.analyser(
-                candles,
-                symbol=normalized,
-            )
-
-            # =================================================================
-            # ZONES
-            # =================================================================
-
-            zones_result = self.zones.analyser(
-                cartographie,
-                current_price=current_price,
-            )
-
-            # =================================================================
-            # CONTEXTE
-            # =================================================================
-
-            context_result = self.contexte.analyser(
-                cartographie,
-                zones_result,
-                symbol=normalized,
-            )
-
-            # =================================================================
-            # CONFLUENCES
-            # =================================================================
-
-            confluences_result = (
-                self.confluences.analyser(
-                    candles_by_timeframe=candles,
-                    zones_result=zones_result,
-                    context_result=context_result,
-                    market_map=cartographie,
-                    symbol=normalized,
-                )
-            )
-
-            # =================================================================
-            # SETUPS / OPPORTUNITÉS
-            # =================================================================
-
-            setups_result = self.setups.analyser(
-                candles_by_timeframe=candles,
-                zones_result=zones_result,
-                context_result=context_result,
-                confluences_result=confluences_result,
-                symbol=normalized,
-            )
-
-            setups = self._extract_setups(
-                setups_result
-            )
-
-            # =================================================================
-            # TRAITEMENT DE TOUTES LES OPPORTUNITÉS
-            # =================================================================
-
-            results: List[
-                Dict[str, Any]
-            ] = []
-
-            ready_signals: List[
-                Dict[str, Any]
-            ] = []
-
-            wait_setups: List[
-                Dict[str, Any]
-            ] = []
-
-            rejected_setups: List[
-                Dict[str, Any]
-            ] = []
-
-            # Aucun break.
-            #
-            # Toutes les opportunités sont examinées.
-            #
-            # Il peut y avoir :
-            #
-            #   0 signal
-            #   1 signal
-            #   2 signaux
-            #   plusieurs signaux
-            #
-            # selon ce que le marché présente réellement.
-
-            for setup in setups:
-
-                try:
-
-                    processed = await self.traiter_setup(
-                        setup,
-                        symbol=normalized,
-                        candles=candles,
-                        zones_result=zones_result,
-                        context_result=context_result,
-                        confluences_result=confluences_result,
-                        cartographie_result=cartographie,
-                        current_price=current_price,
-                    )
-
-                except asyncio.CancelledError:
-                    raise
-
-                except Exception as exc:
-
-                    logger.exception(
-                        "Erreur traitement setup %s : %s",
-                        normalized,
-                        exc,
-                    )
-
-                    processed = {
-                        "status": "SETUP_ERROR",
-                        "symbol": normalized,
-                        "setup": setup,
-                        "error": str(exc),
-                        "auto_execution": False,
+                        "reason":
+                            "Aucun prix live BiQuote disponible.",
                     }
 
-                if processed is None:
-                    continue
+                # ------------------------------------------------------------
+                # DONNÉES
+                # ------------------------------------------------------------
 
-                results.append(processed)
+                donnees = (
+                    self.obtenir_donnees()
+                )
 
-                processed_status = str(
-                    processed.get(
-                        "status",
-                        "",
+                missing_primary = (
+                    self.verifier_donnees_principales(
+                        donnees
                     )
-                ).upper()
+                )
 
-                # -------------------------------------------------------------
-                # SIGNAL ACTIONNABLE
-                # -------------------------------------------------------------
+                if missing_primary:
 
-                if processed_status == READY_FOR_SIGNAL:
+                    return {
+                        "status":
+                            "INSUFFICIENT_PRIMARY_DATA",
 
-                    ready_signals.append(
-                        processed
+                        "symbol":
+                            self.symbol,
+
+                        "missing_timeframes":
+                            missing_primary,
+                    }
+
+                # M5/M1 ne sont PAS bloquants.
+                missing_secondary = [
+                    tf
+                    for tf in SECONDARY_TIMEFRAMES
+                    if not donnees.get(tf)
+                ]
+
+                # ------------------------------------------------------------
+                # CARTOGRAPHIE
+                # ------------------------------------------------------------
+
+                cartographie = (
+                    await self.analyser_marche(
+                        donnees
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # ZONES
+                # ------------------------------------------------------------
+
+                zones = (
+                    await self.analyser_zones(
+                        cartographie,
+                        current_price,
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # CONTEXTE
+                # ------------------------------------------------------------
+
+                contexte = (
+                    await self.analyser_contexte(
+                        donnees,
+                        zones,
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # CONFLUENCES
+                # ------------------------------------------------------------
+
+                confluences = (
+                    await self.analyser_confluences(
+                        donnees,
+                        zones,
+                        contexte,
+                        cartographie,
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # SETUPS
+                # ------------------------------------------------------------
+
+                setups_result = (
+                    await self.analyser_setups(
+                        zones,
+                        confluences,
+                        contexte,
+                        donnees,
+                    )
+                )
+
+                setups = (
+                    self._extraire_setups(
+                        setups_result
+                    )
+                )
+
+                if not setups:
+
+                    result = {
+                        "status": "NO_SETUP",
+
+                        "symbol": self.symbol,
+
+                        "current_price":
+                            current_price,
+
+                        "cartographie":
+                            cartographie,
+
+                        "zones":
+                            zones,
+
+                        "contexte":
+                            contexte,
+
+                        "confluences":
+                            confluences,
+
+                        "setups": [],
+
+                        "results": [],
+
+                        "signals": [],
+
+                        "missing_secondary_timeframes":
+                            missing_secondary,
+                    }
+
+                    self.last_analysis = result
+
+                    return result
+
+                # ------------------------------------------------------------
+                # RISK PLANS
+                # ------------------------------------------------------------
+
+                risk_result = (
+                    await self.analyser_risque(
+                        setups,
+                        zones,
+                        donnees,
+                        current_price,
+                    )
+                )
+
+                risk_plans = (
+                    self._extraire_risk_plans(
+                        risk_result
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # TRAITEMENT DE TOUS LES SETUPS
+                #
+                # IMPORTANT :
+                # aucun break après le premier signal.
+                # ------------------------------------------------------------
+
+                results: List[
+                    Dict[str, Any]
+                ] = []
+
+                for index, setup in enumerate(
+                    setups
+                ):
+
+                    risk_plan = (
+                        self._trouver_risk_plan(
+                            setup,
+                            index,
+                            risk_plans,
+                        )
                     )
 
-                # -------------------------------------------------------------
-                # WAIT
-                # -------------------------------------------------------------
+                    if risk_plan is None:
 
-                elif processed_status == DECISION_WAIT:
+                        results.append({
+                            "status":
+                                "NO_RISK_PLAN",
 
-                    wait_setups.append(
-                        processed
+                            "setup":
+                                setup,
+
+                            "decision":
+                                DECISION_WAIT,
+
+                            "signal":
+                                None,
+                        })
+
+                        continue
+
+                    try:
+
+                        processed = (
+                            await self.traiter_setup(
+                                setup=setup,
+                                risk_plan=risk_plan,
+                                zones=zones,
+                                contexte=contexte,
+                                confluences=confluences,
+                                donnees=donnees,
+                                market_intelligence=(
+                                    cartographie
+                                ),
+                            )
+                        )
+
+                        results.append(
+                            processed
+                        )
+
+                    except Exception as exc:
+
+                        logger.exception(
+                            "Erreur traitement setup : %s",
+                            exc,
+                        )
+
+                        results.append({
+                            "status":
+                                "SETUP_ERROR",
+
+                            "setup":
+                                setup,
+
+                            "error":
+                                str(exc),
+
+                            "decision":
+                                DECISION_WAIT,
+
+                            "signal":
+                                None,
+                        })
+
+                # ------------------------------------------------------------
+                # EXTRACTION DES RÉSULTATS
+                # ------------------------------------------------------------
+
+                ready = [
+                    item
+                    for item in results
+                    if item.get(
+                        "status"
+                    ) == "SIGNAL_READY"
+                ]
+
+                waiting = [
+                    item
+                    for item in results
+                    if item.get(
+                        "status"
+                    ) == "WAIT"
+                ]
+
+                blocked = [
+                    item
+                    for item in results
+                    if item.get(
+                        "status"
+                    ) in {
+                        "ANTISPAM_BLOCKED",
+                        "NO_RISK_PLAN",
+                        "SETUP_ERROR",
+                        "ANTISPAM_ERROR",
+                        "DECISION_ERROR",
+                    }
+                ]
+
+                # ------------------------------------------------------------
+                # TRI PAR CONFIANCE
+                # ------------------------------------------------------------
+
+                ready.sort(
+                    key=lambda item: (
+                        self._float(
+                            item.get(
+                                "decision_confidence"
+                            ),
+                            0.0,
+                        )
+                        or 0.0
+                    ),
+                    reverse=True,
+                )
+
+                # ------------------------------------------------------------
+                # SIGNALS
+                # ------------------------------------------------------------
+
+                signals = [
+                    item.get("signal")
+                    for item in ready
+                    if item.get(
+                        "signal"
+                    ) is not None
+                ]
+
+                # ------------------------------------------------------------
+                # STATUT GLOBAL
+                # ------------------------------------------------------------
+
+                if ready:
+
+                    overall_status = (
+                        "SIGNAL_READY"
                     )
 
-                # -------------------------------------------------------------
-                # AUTRES REJETS TECHNIQUES / ANTI-SPAM
-                # -------------------------------------------------------------
+                elif waiting:
+
+                    overall_status = "WAIT"
 
                 else:
 
-                    rejected_setups.append(
-                        processed
+                    overall_status = (
+                        "ANALYZED"
                     )
 
-            # =================================================================
-            # TRI DES SIGNAUX
-            # =================================================================
+                # ------------------------------------------------------------
+                # RÉSULTAT FINAL
+                # ------------------------------------------------------------
 
-            ready_signals.sort(
-                key=lambda item: float(
-                    item.get(
-                        "decision_confidence",
-                        0.0,
-                    )
-                    or 0.0
-                ),
-                reverse=True,
-            )
+                result = {
 
-            # =================================================================
-            # STATUT GLOBAL
-            # =================================================================
+                    "status":
+                        overall_status,
 
-            if ready_signals:
+                    "engine":
+                        ENGINE_NAME,
 
-                overall_status = READY_FOR_SIGNAL
+                    "symbol":
+                        self.symbol,
 
-            elif wait_setups:
+                    "source":
+                        "BiQuote",
 
-                overall_status = DECISION_WAIT
+                    "current_price":
+                        current_price,
 
-            else:
+                    "cartographie":
+                        cartographie,
 
-                overall_status = "NO_SIGNAL"
+                    "zones":
+                        zones,
 
-            # =================================================================
-            # RÉSULTAT FINAL
-            # =================================================================
+                    "contexte":
+                        contexte,
 
-            result = {
-                "status": overall_status,
+                    "confluences":
+                        confluences,
 
-                "symbol": normalized,
+                    "setups":
+                        setups,
 
-                "current_price": current_price,
+                    "risk":
+                        risk_result,
 
-                "cartographie": cartographie,
+                    "results":
+                        results,
 
-                "zones": zones_result,
+                    "signals":
+                        signals,
 
-                "contexte": context_result,
+                    "signal_count":
+                        len(signals),
 
-                "confluences": confluences_result,
+                    "waiting_count":
+                        len(waiting),
 
-                "setups": setups,
+                    "blocked_count":
+                        len(blocked),
 
-                "results": results,
+                    "missing_secondary_timeframes":
+                        missing_secondary,
 
-                "signals": ready_signals,
+                    "reference_score":
+                        REFERENCE_SCORE,
 
-                "ready_signals_count": len(
-                    ready_signals
-                ),
+                    "reference_rr":
+                        REFERENCE_RR,
 
-                "wait_count": len(
-                    wait_setups
-                ),
+                    "score_is_blocking":
+                        False,
 
-                "rejected_count": len(
-                    rejected_setups
-                ),
+                    "rr_is_blocking":
+                        False,
 
-                "missing_primary_timeframes": (
-                    missing_primary_timeframes
-                ),
+                    "m5_is_blocking":
+                        False,
 
-                "missing_confirmation_timeframes": (
-                    missing_confirmation_timeframes
-                ),
+                    "m1_is_blocking":
+                        False,
 
-                "auto_execution": False,
+                    "multiple_signals_allowed":
+                        True,
 
-                "decision_engine": {
-                    "owner": "moteur2_decision.py",
-                    "score_blocking": False,
-                    "rr_blocking": False,
-                    "m5_blocking": False,
-                    "m1_blocking": False,
-                    "signal_quota": None,
-                    "forced_signal": False,
-                },
+                    "signal_quota":
+                        None,
 
-                "safety_guard": {
-                    "enabled": True,
-                    "purpose": (
-                        "technical_safety_only"
-                    ),
-                    "strategic_decision": False,
-                    "score_decides": False,
-                    "rr_decides": False,
-                    "m5_decides": False,
-                    "m1_decides": False,
-                },
-            }
+                    "forced_signal":
+                        False,
 
-            self.last_analysis[
-                normalized
-            ] = result
+                    "decision_owner":
+                        "moteur2_decision.py",
 
-            logger.info(
-                "Analyse Engine 2 terminée : %s -> %s | "
-                "setups=%d | signals=%d | wait=%d",
-                normalized,
-                overall_status,
-                len(setups),
-                len(ready_signals),
-                len(wait_setups),
-            )
+                    "auto_execution":
+                        False,
+                }
 
-            return result
+                self.last_analysis = result
 
-    # ========================================================================
-    # ANALYSE TOUS LES MARCHÉS
-    # ========================================================================
-
-    async def analyser_tous(
-        self,
-    ) -> Dict[str, Any]:
-
-        results: Dict[
-            str,
-            Any,
-        ] = {}
-
-        for symbol in self.symbols:
-
-            try:
-
-                results[symbol] = (
-                    await self.analyser_symbole(
-                        symbol
-                    )
+                logger.info(
+                    "Engine 2 terminé : "
+                    "status=%s signals=%s waits=%s",
+                    overall_status,
+                    len(signals),
+                    len(waiting),
                 )
 
-            except asyncio.CancelledError:
-                raise
+                return result
 
             except Exception as exc:
 
                 logger.exception(
-                    "Erreur analyse %s : %s",
-                    symbol,
+                    "Erreur générale Engine 2 : %s",
                     exc,
                 )
 
-                results[symbol] = {
-                    "status": "ERROR",
-                    "symbol": symbol,
-                    "error": str(exc),
-                    "auto_execution": False,
+                result = {
+                    "status":
+                        "ENGINE_ERROR",
+
+                    "engine":
+                        ENGINE_NAME,
+
+                    "symbol":
+                        self.symbol,
+
+                    "error":
+                        str(exc),
+
+                    "signals":
+                        [],
                 }
 
-        return results
+                self.last_analysis = result
+
+                return result
 
     # ========================================================================
     # STREAM
     # ========================================================================
 
-    async def start_stream(
+    async def demarrer_stream(
         self,
     ) -> None:
 
-        logger.info(
-            "Démarrage du stream BiQuote..."
+        await self._call(
+            self.stream.start
         )
-
-        try:
-
-            await self.stream.run()
-
-        except asyncio.CancelledError:
-
-            logger.info(
-                "Stream BiQuote annulé proprement."
-            )
-
-            raise
-
-        except Exception as exc:
-
-            logger.exception(
-                "Erreur non bloquante du stream BiQuote : %s",
-                exc,
-            )
-
-        finally:
-
-            logger.info(
-                "Tâche stream BiQuote terminée."
-            )
 
     # ========================================================================
     # RUN
@@ -1751,20 +1941,29 @@ class Moteur2:
 
     async def run(
         self,
+        analyse_interval_seconds: int = 10,
     ) -> None:
 
-        if self.running:
-            return
+        if not self.initialized:
+
+            init = (
+                await self.initialiser()
+            )
+
+            if not init.get(
+                "success",
+                False,
+            ):
+
+                raise RuntimeError(
+                    "Impossible d'initialiser Engine 2."
+                )
 
         self.running = True
 
-        self._stream_task = (
-            asyncio.create_task(
-                self.start_stream()
-            )
+        stream_task = asyncio.create_task(
+            self.demarrer_stream()
         )
-
-        await asyncio.sleep(1)
 
         try:
 
@@ -1772,15 +1971,12 @@ class Moteur2:
 
                 try:
 
-                    await self.analyser_tous()
-
-                except asyncio.CancelledError:
-                    raise
+                    await self.analyser()
 
                 except Exception as exc:
 
                     logger.exception(
-                        "Erreur analyse globale : %s",
+                        "Erreur analyse Engine 2 : %s",
                         exc,
                     )
 
@@ -1788,7 +1984,7 @@ class Moteur2:
                     max(
                         1,
                         int(
-                            SCAN_INTERVAL_SECONDS
+                            analyse_interval_seconds
                         ),
                     )
                 )
@@ -1797,21 +1993,15 @@ class Moteur2:
 
             self.running = False
 
-            if self._stream_task is not None:
+            stream_task.cancel()
 
-                self._stream_task.cancel()
+            try:
 
-                try:
+                await stream_task
 
-                    await self._stream_task
+            except asyncio.CancelledError:
 
-                except asyncio.CancelledError:
-                    pass
-
-                except Exception:
-                    pass
-
-                self._stream_task = None
+                pass
 
     # ========================================================================
     # STOP
@@ -1823,75 +2013,20 @@ class Moteur2:
 
         self.running = False
 
-        # --------------------------------------------------------------------
-        # ARRÊT STREAM
-        # --------------------------------------------------------------------
-
         try:
 
-            stop_method = getattr(
-                self.stream,
-                "stop",
-                None,
-            )
+            result = self.stream.stop()
 
-            if stop_method is not None:
+            if inspect.isawaitable(
+                result
+            ):
 
-                result = stop_method()
-
-                if inspect.isawaitable(result):
-                    await result
+                await result
 
         except Exception as exc:
 
             logger.warning(
                 "Erreur arrêt stream : %s",
-                exc,
-            )
-
-        # --------------------------------------------------------------------
-        # ANNULATION TÂCHE STREAM
-        # --------------------------------------------------------------------
-
-        if self._stream_task is not None:
-
-            self._stream_task.cancel()
-
-            try:
-
-                await self._stream_task
-
-            except asyncio.CancelledError:
-                pass
-
-            except Exception:
-                pass
-
-            self._stream_task = None
-
-        # --------------------------------------------------------------------
-        # FERMETURE BIQUOTE
-        # --------------------------------------------------------------------
-
-        try:
-
-            close_method = getattr(
-                self.biquote,
-                "close",
-                None,
-            )
-
-            if close_method is not None:
-
-                result = close_method()
-
-                if inspect.isawaitable(result):
-                    await result
-
-        except Exception as exc:
-
-            logger.warning(
-                "Erreur fermeture BiQuote : %s",
                 exc,
             )
 
@@ -1931,113 +2066,109 @@ class Moteur2:
 
         except Exception:
 
-            decision_status = {
-                "engine": "moteur2_decision.py",
-            }
+            decision_status = {}
 
         return {
-            "engine": ENGINE_NAME,
 
-            "symbols": list(
-                self.symbols
-            ),
+            "engine":
+                ENGINE_NAME,
 
-            "source": "BiQuote",
+            "module":
+                "moteur2",
 
-            "running": self.running,
+            "symbol":
+                self.symbol,
 
-            "timeframes": list(
-                TIMEFRAMES
-            ),
+            "source":
+                "BiQuote",
 
-            "primary_timeframes": list(
-                PRIMARY_TIMEFRAMES
-            ),
+            "running":
+                self.running,
 
-            "confirmation_timeframes": list(
-                CONFIRMATION_TIMEFRAMES
-            ),
+            "initialized":
+                self.initialized,
 
-            # Références uniquement.
-            "reference_rr": REFERENCE_RR,
+            "current_price":
+                self.cache.get_current_price(),
 
-            "reference_score": REFERENCE_SCORE,
+            "timeframes":
+                list(TIMEFRAMES),
 
-            # Anciennes clés conservées pour compatibilité.
-            "minimum_rr": REFERENCE_RR,
+            "primary_timeframes":
+                list(PRIMARY_TIMEFRAMES),
 
-            "minimum_score": REFERENCE_SCORE,
+            "secondary_timeframes":
+                list(SECONDARY_TIMEFRAMES),
 
-            # Nouveaux comportements.
-            "rr_blocking": False,
+            "reference_score":
+                REFERENCE_SCORE,
 
-            "score_blocking": False,
+            "reference_rr":
+                REFERENCE_RR,
 
-            "m5_blocking": False,
+            "score_blocking":
+                False,
 
-            "m1_blocking": False,
+            "rr_blocking":
+                False,
 
-            "validation_decides_trade": False,
+            "m5_blocking":
+                False,
 
-            "risk_decides_trade": False,
+            "m1_blocking":
+                False,
 
-            "decision_owner": (
-                "moteur2_decision.py"
-            ),
+            "multiple_signals_allowed":
+                True,
 
-            "signal_quota": None,
+            "signal_quota":
+                None,
 
-            "forced_signals": False,
+            "forced_signals":
+                False,
 
-            "multiple_signals_per_scan": True,
+            "auto_execution":
+                False,
 
-            "auto_execution": False,
+            "decision_owner":
+                "moteur2_decision.py",
 
-            "final_validation_owner": (
-                "moteur2_validation.py"
-            ),
+            "cache":
+                cache_status,
 
-            "safety_guard_enabled": True,
+            "decision":
+                decision_status,
 
-            "antispam_after_decision": True,
+            "antispam":
+                antispam_status,
 
-            "registration_after_publication": True,
-
-            "decision_engine": decision_status,
-
-            "cache": cache_status,
-
-            "antispam": antispam_status,
-
-            "current_prices": dict(
-                self.current_prices
-            ),
-
-            "last_analysis": dict(
-                self.last_analysis
-            ),
-
-            "last_signal": dict(
-                self.last_signal
-            ),
+            "last_analysis":
+                self.last_analysis,
         }
 
 
 # ============================================================================
-# COMPATIBILITÉ
+# RACCOURCI XAUUSD
 # ============================================================================
 
 async def analyser_xauusd() -> Dict[str, Any]:
 
-    moteur = Moteur2(
-        symbols=("XAUUSD",)
-    )
+    moteur = Moteur2()
 
     try:
 
-        return await moteur.analyser_symbole(
-            "XAUUSD"
+        init = (
+            await moteur.initialiser()
         )
+
+        if not init.get(
+            "success",
+            False,
+        ):
+
+            return init
+
+        return await moteur.analyser()
 
     finally:
 
@@ -2045,7 +2176,7 @@ async def analyser_xauusd() -> Dict[str, Any]:
 
 
 # ============================================================================
-# MAIN LOCAL
+# MAIN
 # ============================================================================
 
 async def main() -> None:
@@ -2054,8 +2185,40 @@ async def main() -> None:
 
     try:
 
-        result = await moteur.analyser_tous()
+        init = (
+            await moteur.initialiser()
+        )
 
+        print("=" * 70)
+        print(
+            "NOVA TRADE AI - ENGINE 2"
+        )
+        print(
+            "SOURCE : BiQuote"
+        )
+        print(
+            "SYMBOL : XAUUSD"
+        )
+        print(
+            "DECISION : moteur2_decision.py"
+        )
+        print("=" * 70)
+
+        print(init)
+
+        if not init.get(
+            "success",
+            False,
+        ):
+
+            return
+
+        result = (
+            await moteur.analyser()
+        )
+
+        print()
+        print("RESULTAT :")
         print(result)
 
     finally:
@@ -2064,11 +2227,9 @@ async def main() -> None:
 
 
 # ============================================================================
-# EXÉCUTION DIRECTE
+# ENTRY POINT
 # ============================================================================
 
 if __name__ == "__main__":
 
-    asyncio.run(
-        main()
-    )
+    asyncio.run(main())
