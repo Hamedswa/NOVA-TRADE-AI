@@ -1060,7 +1060,6 @@ class Moteur2:
                 zones_result=zones_result,
                 context_result=context_result,
                 confluences_result=confluences_result,
-                current_price=current_price,
                 symbol=normalized,
             )
 
