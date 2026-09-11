@@ -5,7 +5,8 @@ Orchestrateur principal du moteur 2.
 Pipeline :
 BiQuote → Stream/Cache → Cartographie → Zones → Contexte →
 Confluences → Setups → Risk → Confirmation M5/M1 →
-Score → Validation → Anti-spam → Signal.
+Score → Validation → Anti-spam → Publication Telegram →
+Enregistrement du signal publié.
 Règles :
 - XAUUSD / BTCUSD / EURUSD / GBPUSD
 - H4 → H1 → M15 → M5 → M1
@@ -36,6 +37,9 @@ from moteur2_score import Moteur2Score
 from moteur2_validation import Moteur2Validation
 from moteur2_antispam import Moteur2AntiSpam
 logger = logging.getLogger("NOVA_ENGINE_2")
+# =====================================================================
+# CONFIGURATION LOCALE
+# =====================================================================
 SUPPORTED_SYMBOLS = (
     "XAUUSD",
     "BTCUSD",
@@ -63,29 +67,60 @@ CANDLE_LIMIT = 300
 SCAN_INTERVAL_SECONDS = 60
 MINIMUM_RR = 3.0
 MINIMUM_SCORE = 60.0
+READY_FOR_SIGNAL = "READY_FOR_SIGNAL"
+# =====================================================================
+# NORMALISATION SYMBOLE
+# =====================================================================
 def _normalize_symbol(symbol: Any) -> str:
     """
-    Normalise un symbole sans jamais appliquer de fallback
-    automatique vers XAUUSD.
+    Normalise un symbole sans aucun fallback automatique.
+    Un symbole inconnu reste inconnu et sera rejeté.
     """
-    value = str(symbol or "").strip().upper().replace("/", "")
+    value = (
+        str(symbol or "")
+        .strip()
+        .upper()
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
     aliases = {
         "GOLD": "XAUUSD",
-        "XAU/USD": "XAUUSD",
-        "BTC/USD": "BTCUSD",
-        "EUR/USD": "EURUSD",
-        "GBP/USD": "GBPUSD",
+        "XAU": "XAUUSD",
+        "BTC": "BTCUSD",
+        "EUR": "EURUSD",
+        "GBP": "GBPUSD",
     }
-    return aliases.get(value, value)
+    return aliases.get(
+        value,
+        value,
+    )
+# =====================================================================
+# MOTEUR 2
+# =====================================================================
 class Moteur2:
     """
     Orchestrateur principal du moteur 2.
+    Le moteur coordonne les différents modules.
+    Il ne remplace pas leurs responsabilités :
+    - validation finale → moteur2_validation.py
+    - anti-spam → moteur2_antispam.py
+    - publication → couche Telegram
+    - suivi → tracker/runtime
+    - exécution automatique → désactivée
     """
     def __init__(
         self,
-        symbols: Optional[List[str] | tuple[str, ...]] = None,
+        symbols: Optional[
+            List[str] | tuple[str, ...]
+        ] = None,
     ) -> None:
-        raw_symbols = symbols or SUPPORTED_SYMBOLS
+        raw_symbols = (
+            symbols
+            if symbols is not None
+            else SUPPORTED_SYMBOLS
+        )
         normalized_symbols = tuple(
             _normalize_symbol(symbol)
             for symbol in raw_symbols
@@ -99,34 +134,38 @@ class Moteur2:
             raise ValueError(
                 f"Symboles non supportés : {invalid_symbols}"
             )
-        self.symbols = tuple(dict.fromkeys(normalized_symbols))
+        self.symbols = tuple(
+            dict.fromkeys(
+                normalized_symbols
+            )
+        )
         if not self.symbols:
             raise ValueError(
                 "Le moteur 2 doit avoir au moins un symbole."
             )
-        # ============================================================
+        # =============================================================
         # DATA PROVIDER
-        # ============================================================
-        # UN SEUL client REST partagé par le moteur et le cache.
+        # =============================================================
+        # Un seul client BiQuote partagé.
         self.biquote = BiQuoteClient()
-        # ============================================================
+        # =============================================================
         # CACHE
-        # ============================================================
-        # Le cache reçoit exactement le même client BiQuote.
+        # =============================================================
+        # Le cache utilise exactement le même client.
         self.cache = Moteur2Cache(
             client=self.biquote,
             symbols=self.symbols,
         )
-        # ============================================================
+        # =============================================================
         # STREAM TEMPS RÉEL
-        # ============================================================
+        # =============================================================
         self.stream = BiQuoteStream(
             symbols=self.symbols,
             on_tick=self._handle_tick,
         )
-        # ============================================================
-        # MODULES MOTEUR 2
-        # ============================================================
+        # =============================================================
+        # MODULES
+        # =============================================================
         self.marche = Moteur2Marche()
         self.zones = Moteur2Zones()
         self.contexte = Moteur2Contexte()
@@ -143,19 +182,30 @@ class Moteur2:
             min_rr=MINIMUM_RR,
         )
         self.antispam = Moteur2AntiSpam()
-        # ============================================================
+        # =============================================================
         # ÉTAT
-        # ============================================================
+        # =============================================================
         self.running = False
-        self.current_prices: Dict[str, float] = {}
-        self.last_analysis: Dict[str, Dict[str, Any]] = {}
-        self.last_signal: Dict[str, Dict[str, Any]] = {}
-        self._stream_task: Optional[asyncio.Task] = None
-        # Évite deux analyses simultanées du même moteur.
+        self.current_prices: Dict[
+            str,
+            float,
+        ] = {}
+        self.last_analysis: Dict[
+            str,
+            Dict[str, Any],
+        ] = {}
+        self.last_signal: Dict[
+            str,
+            Dict[str, Any],
+        ] = {}
+        self._stream_task: Optional[
+            asyncio.Task
+        ] = None
+        # Une seule analyse à la fois.
         self.analysis_lock = asyncio.Lock()
-    # ================================================================
-    # OUTILS
-    # ================================================================
+    # =================================================================
+    # UTILITAIRE GENERIQUE
+    # =================================================================
     @staticmethod
     def _get(
         data: Any,
@@ -165,8 +215,15 @@ class Moteur2:
         if data is None:
             return default
         if isinstance(data, dict):
-            return data.get(key, default)
-        return getattr(data, key, default)
+            return data.get(
+                key,
+                default,
+            )
+        return getattr(
+            data,
+            key,
+            default,
+        )
     @staticmethod
     async def _call(
         function: Any,
@@ -174,14 +231,20 @@ class Moteur2:
         **kwargs: Any,
     ) -> Any:
         """
-        Appelle une fonction sync ou async.
+        Appelle correctement une fonction synchrone
+        ou asynchrone.
         """
-        result = function(*args, **kwargs)
+        result = function(
+            *args,
+            **kwargs,
+        )
         if inspect.isawaitable(result):
             return await result
         return result
     @staticmethod
-    def _extract_price(tick: Any) -> Optional[float]:
+    def _extract_price(
+        tick: Any,
+    ) -> Optional[float]:
         if tick is None:
             return None
         for key in (
@@ -191,38 +254,52 @@ class Moteur2:
             "bid",
             "ask",
         ):
-            value = Moteur2._get(tick, key)
+            value = Moteur2._get(
+                tick,
+                key,
+            )
             if value is None:
                 continue
             try:
                 price = float(value)
                 if price > 0:
                     return price
-            except (TypeError, ValueError):
+            except (
+                TypeError,
+                ValueError,
+            ):
                 continue
         return None
-    # ================================================================
+    # =================================================================
     # TICK TEMPS RÉEL
-    # ================================================================
+    # =================================================================
     async def _handle_tick(
         self,
         tick: Any,
     ) -> None:
         """
-        Réception d'un tick BiQuote.
-        Aucun calcul de signal n'est effectué ici.
-        Le tick est simplement transmis au cache et à l'état courant.
+        Reçoit un tick BiQuote.
+        Aucun calcul de setup ou de signal n'est effectué ici.
         """
         symbol = _normalize_symbol(
-            self._get(tick, "symbol")
+            self._get(
+                tick,
+                "symbol",
+            )
         )
         if symbol not in self.symbols:
             return
-        price = self._extract_price(tick)
+        price = self._extract_price(
+            tick
+        )
         if price is not None:
-            self.current_prices[symbol] = price
+            self.current_prices[
+                symbol
+            ] = price
         try:
-            result = self.cache.update_tick(tick)
+            result = self.cache.update_tick(
+                tick
+            )
             if inspect.isawaitable(result):
                 await result
         except Exception as exc:
@@ -231,67 +308,98 @@ class Moteur2:
                 symbol,
                 exc,
             )
-    # ================================================================
+    # =================================================================
     # PRIX COURANT
-    # ================================================================
+    # =================================================================
     def _get_current_price(
         self,
         symbol: str,
     ) -> Optional[float]:
-        normalized = _normalize_symbol(symbol)
+        normalized = _normalize_symbol(
+            symbol
+        )
+        # -------------------------------------------------------------
         # 1. Stream temps réel
+        # -------------------------------------------------------------
         try:
-            tick = self.stream.get_latest_tick(normalized)
-            price = self._extract_price(tick)
+            tick = self.stream.get_latest_tick(
+                normalized
+            )
+            price = self._extract_price(
+                tick
+            )
             if price is not None:
                 return price
         except Exception:
             pass
+        # -------------------------------------------------------------
         # 2. Cache
+        # -------------------------------------------------------------
         try:
-            price = self.cache.get_current_price(normalized)
+            price = self.cache.get_current_price(
+                normalized
+            )
             if price is not None:
                 return float(price)
         except Exception:
             pass
+        # -------------------------------------------------------------
         # 3. Dernier prix connu
-        return self.current_prices.get(normalized)
-    # ================================================================
-    # CHANDELIERS
-    # ================================================================
+        # -------------------------------------------------------------
+        return self.current_prices.get(
+            normalized
+        )
+    # =================================================================
+    # RAFRAICHISSEMENT CACHE
+    # =================================================================
     async def _refresh_symbol_cache(
         self,
         symbol: str,
     ) -> Dict[str, Any]:
         """
-        Rafraîchit les cinq timeframes via le cache centralisé.
-        Aucun appel direct à BiQuoteClient.get_candles() ici.
+        Rafraîchit les cinq timeframes via le cache.
+        IMPORTANT :
+        refresh_symbol() est une coroutine.
+        Elle ne doit PAS être placée dans asyncio.to_thread().
         """
-        normalized = _normalize_symbol(symbol)
-        result = await asyncio.to_thread(
-            self.cache.refresh_symbol,
+        normalized = _normalize_symbol(
+            symbol
+        )
+        result = await self.cache.refresh_symbol(
             normalized,
-            False,
+            force=False,
         )
         return result or {}
+    # =================================================================
+    # LECTURE CACHE
+    # =================================================================
     def _get_cached_candles(
         self,
         symbol: str,
     ) -> Dict[str, Any]:
-        normalized = _normalize_symbol(symbol)
-        candles_by_timeframe: Dict[str, Any] = {}
+        normalized = _normalize_symbol(
+            symbol
+        )
+        candles_by_timeframe: Dict[
+            str,
+            Any,
+        ] = {}
         for timeframe in TIMEFRAMES:
             try:
-                candles = self.cache.get_closed_candles(
-                    normalized,
-                    timeframe,
+                candles = (
+                    self.cache.get_closed_candles(
+                        normalized,
+                        timeframe,
+                    )
                 )
             except TypeError:
-                # Compatibilité avec une éventuelle implémentation
-                # exposant uniquement get_candles().
-                candles = self.cache.get_candles(
-                    normalized,
-                    timeframe,
+                # Compatibilité éventuelle
+                # avec une implémentation plus ancienne.
+                candles = (
+                    self.cache.get_candles(
+                        normalized,
+                        timeframe,
+                    )
                 )
             except Exception as exc:
                 logger.warning(
@@ -302,42 +410,72 @@ class Moteur2:
                 )
                 candles = None
             if candles:
-                candles_by_timeframe[timeframe] = candles
+                candles_by_timeframe[
+                    timeframe
+                ] = candles
         return candles_by_timeframe
+    # =================================================================
+    # CHANDELIERS
+    # =================================================================
     async def _get_candles(
         self,
         symbol: str,
     ) -> Dict[str, Any]:
-        normalized = _normalize_symbol(symbol)
-        await self._refresh_symbol_cache(normalized)
-        candles = self._get_cached_candles(normalized)
-        return candles
-    # ================================================================
-    # SETUPS
-    # ================================================================
+        normalized = _normalize_symbol(
+            symbol
+        )
+        await self._refresh_symbol_cache(
+            normalized
+        )
+        return self._get_cached_candles(
+            normalized
+        )
+    # =================================================================
+    # EXTRACTION SETUPS
+    # =================================================================
     @staticmethod
     def _extract_setups(
         setups_result: Any,
     ) -> List[Any]:
         if setups_result is None:
             return []
-        if isinstance(setups_result, dict):
+        if isinstance(
+            setups_result,
+            dict,
+        ):
             for key in (
                 "setups",
                 "results",
                 "candidates",
                 "items",
             ):
-                value = setups_result.get(key)
-                if isinstance(value, list):
+                value = setups_result.get(
+                    key
+                )
+                if isinstance(
+                    value,
+                    list,
+                ):
                     return value
-            return [setups_result]
-        if isinstance(setups_result, (list, tuple)):
-            return list(setups_result)
-        return [setups_result]
-    # ================================================================
+            return [
+                setups_result
+            ]
+        if isinstance(
+            setups_result,
+            (
+                list,
+                tuple,
+            ),
+        ):
+            return list(
+                setups_result
+            )
+        return [
+            setups_result
+        ]
+    # =================================================================
     # TRAITEMENT D'UN SETUP
-    # ================================================================
+    # =================================================================
     async def traiter_setup(
         self,
         setup: Any,
@@ -349,10 +487,12 @@ class Moteur2:
         confluences_result: Any,
         current_price: Optional[float],
     ) -> Optional[Dict[str, Any]]:
-        normalized = _normalize_symbol(symbol)
-        # ------------------------------------------------------------
+        normalized = _normalize_symbol(
+            symbol
+        )
+        # =============================================================
         # RISK
-        # ------------------------------------------------------------
+        # =============================================================
         risk_plan = self.risk.analyser_setup(
             setup=setup,
             zones=zones_result,
@@ -360,18 +500,20 @@ class Moteur2:
             current_price=current_price,
             symbol=normalized,
         )
-        # ------------------------------------------------------------
+        # =============================================================
         # CONFIRMATION M5 / M1
-        # ------------------------------------------------------------
-        confirmation_result = self.confirmation.analyser(
-            setup=setup,
-            candles=candles,
-            risk_plan=risk_plan,
-            symbol=normalized,
+        # =============================================================
+        confirmation_result = (
+            self.confirmation.analyser(
+                setup=setup,
+                candles=candles,
+                risk_plan=risk_plan,
+                symbol=normalized,
+            )
         )
-        # ------------------------------------------------------------
+        # =============================================================
         # SCORE
-        # ------------------------------------------------------------
+        # =============================================================
         score_result = self.score.analyser(
             setup=setup,
             zones=zones_result,
@@ -381,16 +523,21 @@ class Moteur2:
             risk_plan=risk_plan,
             symbol=normalized,
         )
-        # ------------------------------------------------------------
+        # =============================================================
         # VALIDATION FINALE
-        # ------------------------------------------------------------
-        validation_result = self.validation.valider(
-            setup=setup,
-            risk_plan=risk_plan,
-            confirmation=confirmation_result,
-            score_result=score_result,
-            contexte=context_result,
-            confluences=confluences_result,
+        # =============================================================
+        # IMPORTANT :
+        # READY_FOR_SIGNAL appartient exclusivement
+        # à moteur2_validation.py.
+        validation_result = (
+            self.validation.analyser(
+                setup=setup,
+                risk_plan=risk_plan,
+                confirmation=confirmation_result,
+                score_result=score_result,
+                context=context_result,
+                confluences=confluences_result,
+            )
         )
         validation_status = str(
             self._get(
@@ -398,7 +545,7 @@ class Moteur2:
                 "status",
                 "",
             )
-        ).upper()
+        ).strip().upper()
         validation_valid = bool(
             self._get(
                 validation_result,
@@ -410,18 +557,26 @@ class Moteur2:
                 ),
             )
         )
-        # ------------------------------------------------------------
-        # SCORE FINAL
-        # ------------------------------------------------------------
+        # =============================================================
+        # SCORE
+        # =============================================================
         score_value = self._get(
             score_result,
             "score",
             0.0,
         )
         try:
-            score_value = float(score_value or 0.0)
-        except (TypeError, ValueError):
+            score_value = float(
+                score_value or 0.0
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
             score_value = 0.0
+        # =============================================================
+        # SCORE INSUFFISANT
+        # =============================================================
         if score_value < MINIMUM_SCORE:
             return {
                 "status": "REJECTED_SCORE",
@@ -431,50 +586,47 @@ class Moteur2:
                 "confirmation": confirmation_result,
                 "score": score_result,
                 "validation": validation_result,
+                "auto_execution": False,
             }
-        # ------------------------------------------------------------
-        # SEUL READY_FOR_SIGNAL PEUT PASSER À L'ANTI-SPAM
-        # ------------------------------------------------------------
+        # =============================================================
+        # VALIDATION NON READY
+        # =============================================================
         if (
-            validation_status != "READY_FOR_SIGNAL"
+            validation_status
+            != READY_FOR_SIGNAL
             or not validation_valid
         ):
             return {
-                "status": validation_status or "NOT_READY",
+                "status": (
+                    validation_status
+                    or "NOT_READY"
+                ),
                 "symbol": normalized,
                 "setup": setup,
                 "risk": risk_plan,
                 "confirmation": confirmation_result,
                 "score": score_result,
                 "validation": validation_result,
+                "auto_execution": False,
             }
-        # ------------------------------------------------------------
+        # =============================================================
         # ANTI-SPAM
-        # ------------------------------------------------------------
-        setup_id = str(
-            self._get(
-                setup,
-                "setup_id",
-                self._get(
-                    setup,
-                    "id",
-                    "",
-                ),
+        # =============================================================
+        # L'anti-spam reçoit exactement son API officielle :
+        #
+        # verifier(
+        #     setup=...,
+        #     risk_plan=...,
+        #     validation=...
+        # )
+        #
+        # Aucun symbol= ou setup_id= séparé.
+        antispam_result = (
+            self.antispam.verifier(
+                setup=setup,
+                risk_plan=risk_plan,
+                validation=validation_result,
             )
-            or ""
-        )
-        direction = str(
-            self._get(
-                setup,
-                "direction",
-                "",
-            )
-        ).upper()
-        antispam_result = self.antispam.verifier(
-            symbol=normalized,
-            direction=direction,
-            setup=setup,
-            setup_id=setup_id or None,
         )
         antispam_allowed = bool(
             self._get(
@@ -493,42 +645,167 @@ class Moteur2:
                 "score": score_result,
                 "validation": validation_result,
                 "antispam": antispam_result,
+                "auto_execution": False,
             }
-        # ------------------------------------------------------------
-        # ENREGISTREMENT DU SIGNAL DÉJÀ VALIDÉ
-        # ------------------------------------------------------------
-        registered = self.antispam.enregistrer_signal(
-            symbol=normalized,
-            direction=direction,
-            setup=setup,
-            setup_id=setup_id or None,
+        # =============================================================
+        # READY FOR TELEGRAM
+        # =============================================================
+        # IMPORTANT :
+        #
+        # Aucun enregistrement ici.
+        #
+        # Pourquoi ?
+        #
+        # Parce que le signal n'a pas encore été publié.
+        #
+        # Le flux correct est :
+        #
+        # Validation
+        #      ↓
+        # Anti-spam
+        #      ↓
+        # Telegram
+        #      ↓
+        # Enregistrement
+        #
+        # L'enregistrement est donc effectué uniquement
+        # après confirmation de publication.
+        setup_id = self._get(
+            antispam_result,
+            "setup_id",
+            None,
         )
-        # ------------------------------------------------------------
-        # CONSTRUCTION DU SIGNAL FINAL
-        # ------------------------------------------------------------
+        if not setup_id:
+            setup_id = self.antispam.generer_setup_id(
+                setup,
+                risk_plan,
+            )
         signal = {
-            "status": "READY_FOR_SIGNAL",
+            "status": READY_FOR_SIGNAL,
             "symbol": normalized,
-            "direction": direction,
+            "setup_id": setup_id,
             "setup": setup,
             "risk": risk_plan,
             "confirmation": confirmation_result,
             "score": score_result,
             "validation": validation_result,
             "antispam": antispam_result,
-            "registered": registered,
+            "registered": False,
+            "published": False,
             "auto_execution": False,
         }
-        self.last_signal[normalized] = signal
+        self.last_signal[
+            normalized
+        ] = signal
         return signal
-    # ================================================================
+    # =================================================================
+    # ENREGISTREMENT APRÈS PUBLICATION
+    # =================================================================
+    def enregistrer_signal_publie(
+        self,
+        signal: Any,
+    ) -> Optional[str]:
+        """
+        Enregistre un signal UNIQUEMENT après sa publication réussie.
+        Cette méthode doit être appelée par la couche Telegram
+        après l'envoi réel du message.
+        Elle ne crée pas de nouveau signal.
+        Elle ne modifie pas Entry / SL / TP.
+        """
+        if signal is None:
+            return None
+        status = str(
+            self._get(
+                signal,
+                "status",
+                "",
+            )
+        ).strip().upper()
+        if status != READY_FOR_SIGNAL:
+            logger.warning(
+                "Tentative d'enregistrement d'un signal non READY."
+            )
+            return None
+        setup = self._get(
+            signal,
+            "setup",
+            None,
+        )
+        risk_plan = self._get(
+            signal,
+            "risk",
+            None,
+        )
+        validation = self._get(
+            signal,
+            "validation",
+            None,
+        )
+        antispam_result = self._get(
+            signal,
+            "antispam",
+            None,
+        )
+        setup_id = self._get(
+            antispam_result,
+            "setup_id",
+            None,
+        )
+        if not setup_id:
+            setup_id = self._get(
+                signal,
+                "setup_id",
+                None,
+            )
+        try:
+            registered_id = (
+                self.antispam.enregistrer_signal(
+                    setup=setup,
+                    risk_plan=risk_plan,
+                    setup_id=setup_id,
+                    validation=validation,
+                )
+            )
+        except Exception as exc:
+            logger.exception(
+                "Erreur enregistrement signal publié : %s",
+                exc,
+            )
+            return None
+        if registered_id:
+            symbol = _normalize_symbol(
+                self._get(
+                    signal,
+                    "symbol",
+                    "",
+                )
+            )
+            if symbol:
+                stored_signal = self.last_signal.get(
+                    symbol
+                )
+                if stored_signal is not None:
+                    stored_signal[
+                        "registered"
+                    ] = True
+                    stored_signal[
+                        "published"
+                    ] = True
+                    stored_signal[
+                        "setup_id"
+                    ] = registered_id
+            return registered_id
+        return None
+    # =================================================================
     # ANALYSE D'UN SYMBOLE
-    # ================================================================
+    # =================================================================
     async def analyser_symbole(
         self,
         symbol: str,
     ) -> Dict[str, Any]:
-        normalized = _normalize_symbol(symbol)
+        normalized = _normalize_symbol(
+            symbol
+        )
         if normalized not in self.symbols:
             raise ValueError(
                 f"Symbole non configuré : {normalized}"
@@ -538,75 +815,89 @@ class Moteur2:
                 "Analyse Engine 2 : %s",
                 normalized,
             )
-            # --------------------------------------------------------
+            # =========================================================
             # DONNÉES
-            # --------------------------------------------------------
+            # =========================================================
             candles = await self._get_candles(
-                normalized,
+                normalized
             )
             missing_timeframes = [
                 timeframe
                 for timeframe in TIMEFRAMES
-                if not candles.get(timeframe)
+                if not candles.get(
+                    timeframe
+                )
             ]
             if missing_timeframes:
                 result = {
                     "status": "INSUFFICIENT_DATA",
                     "symbol": normalized,
-                    "missing_timeframes": missing_timeframes,
+                    "missing_timeframes": (
+                        missing_timeframes
+                    ),
                     "candles": candles,
+                    "auto_execution": False,
                 }
-                self.last_analysis[normalized] = result
+                self.last_analysis[
+                    normalized
+                ] = result
                 return result
-            # --------------------------------------------------------
-            # PRIX
-            # --------------------------------------------------------
-            current_price = self._get_current_price(
-                normalized,
+            # =========================================================
+            # PRIX COURANT
+            # =========================================================
+            current_price = (
+                self._get_current_price(
+                    normalized
+                )
             )
             if current_price is None:
                 result = {
                     "status": "NO_CURRENT_PRICE",
                     "symbol": normalized,
                     "candles": candles,
+                    "auto_execution": False,
                 }
-                self.last_analysis[normalized] = result
+                self.last_analysis[
+                    normalized
+                ] = result
                 return result
-            # --------------------------------------------------------
+            # =========================================================
             # CARTOGRAPHIE
-            # --------------------------------------------------------
+            # =========================================================
             cartographie = self.marche.analyser(
                 candles,
                 symbol=normalized,
             )
-            # --------------------------------------------------------
+            # =========================================================
             # ZONES
-            # --------------------------------------------------------
+            # =========================================================
             zones_result = self.zones.analyser(
                 cartographie,
                 current_price=current_price,
             )
-            # --------------------------------------------------------
+            # =========================================================
             # CONTEXTE
-            # --------------------------------------------------------
+            # =========================================================
             context_result = self.contexte.analyser(
                 cartographie,
                 zones_result,
                 symbol=normalized,
             )
-            # --------------------------------------------------------
+            # =========================================================
             # CONFLUENCES
-            # --------------------------------------------------------
-            confluences_result = self.confluences.analyser(
-                candles_by_timeframe=candles,
-                zones_result=zones_result,
-                context_result=context_result,
-                market_map=cartographie,
-                symbol=normalized,
+            # =========================================================
+            confluences_result = (
+                self.confluences.analyser(
+                    candles_by_timeframe=candles,
+                    zones_result=zones_result,
+                    context_result=context_result,
+                    market_map=cartographie,
+                    symbol=normalized,
+                )
             )
-            # --------------------------------------------------------
+            # =========================================================
             # SETUPS
-            # --------------------------------------------------------
+            # =========================================================
             setups_result = self.setups.analyser(
                 candles_by_timeframe=candles,
                 zones_result=zones_result,
@@ -616,13 +907,17 @@ class Moteur2:
                 symbol=normalized,
             )
             setups = self._extract_setups(
-                setups_result,
+                setups_result
             )
-            # --------------------------------------------------------
+            # =========================================================
             # TRAITEMENT
-            # --------------------------------------------------------
-            results: List[Dict[str, Any]] = []
-            ready_signals: List[Dict[str, Any]] = []
+            # =========================================================
+            results: List[
+                Dict[str, Any]
+            ] = []
+            ready_signals: List[
+                Dict[str, Any]
+            ] = []
             for setup in setups:
                 processed = await self.traiter_setup(
                     setup,
@@ -635,21 +930,26 @@ class Moteur2:
                 )
                 if processed is None:
                     continue
-                results.append(processed)
+                results.append(
+                    processed
+                )
                 if (
-                    processed.get("status")
-                    == "READY_FOR_SIGNAL"
+                    processed.get(
+                        "status"
+                    )
+                    == READY_FOR_SIGNAL
                 ):
                     ready_signals.append(
                         processed
                     )
-                    # Un seul signal READY par scan/symbole.
+                    # Un seul signal READY
+                    # par scan et par symbole.
                     break
-            # --------------------------------------------------------
+            # =========================================================
             # RÉSULTAT FINAL
-            # --------------------------------------------------------
+            # =========================================================
             overall_status = (
-                "READY_FOR_SIGNAL"
+                READY_FOR_SIGNAL
                 if ready_signals
                 else "NO_SIGNAL"
             )
@@ -666,39 +966,55 @@ class Moteur2:
                 "signals": ready_signals,
                 "auto_execution": False,
             }
-            self.last_analysis[normalized] = result
+            self.last_analysis[
+                normalized
+            ] = result
             logger.info(
                 "Analyse Engine 2 terminée : %s → %s",
                 normalized,
                 overall_status,
             )
             return result
-    # ================================================================
-    # ANALYSE DE TOUS LES MARCHÉS
-    # ================================================================
-    async def analyser_tous(self) -> Dict[str, Any]:
-        results: Dict[str, Any] = {}
+    # =================================================================
+    # ANALYSE TOUS LES MARCHÉS
+    # =================================================================
+    async def analyser_tous(
+        self,
+    ) -> Dict[str, Any]:
+        results: Dict[
+            str,
+            Any,
+        ] = {}
         for symbol in self.symbols:
             try:
-                results[symbol] = (
-                    await self.analyser_symbole(symbol)
+                results[
+                    symbol
+                ] = await self.analyser_symbole(
+                    symbol
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.exception(
                     "Erreur analyse %s : %s",
                     symbol,
                     exc,
                 )
-                results[symbol] = {
+                results[
+                    symbol
+                ] = {
                     "status": "ERROR",
                     "symbol": symbol,
                     "error": str(exc),
+                    "auto_execution": False,
                 }
         return results
-    # ================================================================
+    # =================================================================
     # STREAM
-    # ================================================================
-    async def start_stream(self) -> None:
+    # =================================================================
+    async def start_stream(
+        self,
+    ) -> None:
         try:
             await self._call(
                 self.stream.start,
@@ -710,18 +1026,22 @@ class Moteur2:
                 "Erreur stream BiQuote : %s",
                 exc,
             )
-    # ================================================================
+    # =================================================================
     # RUN
-    # ================================================================
-    async def run(self) -> None:
+    # =================================================================
+    async def run(
+        self,
+    ) -> None:
         if self.running:
             return
         self.running = True
-        self._stream_task = asyncio.create_task(
-            self.start_stream()
+        self._stream_task = (
+            asyncio.create_task(
+                self.start_stream()
+            )
         )
-        # Laisser le temps au flux temps réel
-        # de s'établir avant le premier scan.
+        # Laisse le temps au stream
+        # de commencer à recevoir les ticks.
         await asyncio.sleep(1)
         try:
             while self.running:
@@ -737,7 +1057,9 @@ class Moteur2:
                 await asyncio.sleep(
                     max(
                         1,
-                        int(SCAN_INTERVAL_SECONDS),
+                        int(
+                            SCAN_INTERVAL_SECONDS
+                        ),
                     )
                 )
         finally:
@@ -751,12 +1073,16 @@ class Moteur2:
                 except Exception:
                     pass
                 self._stream_task = None
-    # ================================================================
+    # =================================================================
     # STOP
-    # ================================================================
-    async def stop(self) -> None:
+    # =================================================================
+    async def stop(
+        self,
+    ) -> None:
         self.running = False
+        # -------------------------------------------------------------
         # Arrêt du stream
+        # -------------------------------------------------------------
         try:
             stop_method = getattr(
                 self.stream,
@@ -765,14 +1091,18 @@ class Moteur2:
             )
             if stop_method is not None:
                 result = stop_method()
-                if inspect.isawaitable(result):
+                if inspect.isawaitable(
+                    result
+                ):
                     await result
         except Exception as exc:
             logger.warning(
                 "Erreur arrêt stream : %s",
                 exc,
             )
-        # Annulation éventuelle de la tâche
+        # -------------------------------------------------------------
+        # Annulation tâche stream
+        # -------------------------------------------------------------
         if self._stream_task is not None:
             self._stream_task.cancel()
             try:
@@ -782,8 +1112,9 @@ class Moteur2:
             except Exception:
                 pass
             self._stream_task = None
-        # Fermeture du client partagé.
-        # Le cache utilise le même client, donc une seule fermeture suffit.
+        # -------------------------------------------------------------
+        # Fermeture du client BiQuote partagé
+        # -------------------------------------------------------------
         try:
             close_method = getattr(
                 self.biquote,
@@ -792,19 +1123,25 @@ class Moteur2:
             )
             if close_method is not None:
                 result = close_method()
-                if inspect.isawaitable(result):
+                if inspect.isawaitable(
+                    result
+                ):
                     await result
         except Exception as exc:
             logger.warning(
                 "Erreur fermeture BiQuote : %s",
                 exc,
             )
-    # ================================================================
+    # =================================================================
     # STATUS
-    # ================================================================
-    def get_status(self) -> Dict[str, Any]:
+    # =================================================================
+    def get_status(
+        self,
+    ) -> Dict[str, Any]:
         try:
-            cache_status = self.cache.get_status()
+            cache_status = (
+                self.cache.get_status()
+            )
         except Exception:
             cache_status = {}
         try:
@@ -815,10 +1152,14 @@ class Moteur2:
             antispam_status = {}
         return {
             "engine": ENGINE_NAME,
-            "symbols": list(self.symbols),
+            "symbols": list(
+                self.symbols
+            ),
             "source": "BiQuote",
             "running": self.running,
-            "timeframes": list(TIMEFRAMES),
+            "timeframes": list(
+                TIMEFRAMES
+            ),
             "primary_timeframes": list(
                 PRIMARY_TIMEFRAMES
             ),
@@ -830,6 +1171,11 @@ class Moteur2:
             "m5_primary_confirmation": True,
             "m1_secondary_confirmation": True,
             "auto_execution": False,
+            "final_validation_owner": (
+                "moteur2_validation.py"
+            ),
+            "antispam_after_validation": True,
+            "registration_after_publication": True,
             "cache": cache_status,
             "antispam": antispam_status,
             "current_prices": dict(
@@ -842,9 +1188,9 @@ class Moteur2:
                 self.last_signal
             ),
         }
-# ====================================================================
+# =====================================================================
 # COMPATIBILITÉ
-# ====================================================================
+# =====================================================================
 async def analyser_xauusd() -> Dict[str, Any]:
     moteur = Moteur2(
         symbols=("XAUUSD",)
@@ -855,6 +1201,9 @@ async def analyser_xauusd() -> Dict[str, Any]:
         )
     finally:
         await moteur.stop()
+# =====================================================================
+# MAIN LOCAL
+# =====================================================================
 async def main() -> None:
     moteur = Moteur2()
     try:
@@ -862,5 +1211,10 @@ async def main() -> None:
         print(result)
     finally:
         await moteur.stop()
+# =====================================================================
+# EXECUTION DIRECTE
+# =====================================================================
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(
+        main()
+    )
