@@ -5,11 +5,14 @@ biquote_stream.py
 Flux temps réel BiQuote via SignalR.
 
 ENGINE 2 :
-    XAUUSD uniquement.
+    XAUUSD
+    BTCUSD
+    GBPUSD
+    EURUSD
 
 Rôle de ce module :
     - connexion SignalR BiQuote
-    - abonnement XAUUSD
+    - abonnement aux symboles supportés
     - réception des ticks
     - normalisation
     - transmission au moteur
@@ -43,8 +46,12 @@ BIQUOTE_HUB_URL = (
     "https://biquote.io/hubs/tick"
 )
 
+
 SUPPORTED_SYMBOLS = (
     "XAUUSD",
+    "BTCUSD",
+    "GBPUSD",
+    "EURUSD",
 )
 
 
@@ -62,6 +69,7 @@ def normalize_symbol(
         XAU/USD -> XAUUSD
         XAU-USD -> XAUUSD
         xauusd  -> XAUUSD
+        BTC/USD -> BTCUSD
     """
 
     if not isinstance(
@@ -102,8 +110,6 @@ def is_supported_symbol(
 class BiQuoteStream:
     """
     Flux temps réel BiQuote via SignalR.
-
-    IMPORTANT :
 
     Le constructeur accepte volontairement
     les deux formes :
@@ -146,7 +152,6 @@ class BiQuoteStream:
         requested_symbols: list[str] = []
 
         if symbol is not None:
-
             requested_symbols.append(
                 symbol
             )
@@ -157,21 +162,18 @@ class BiQuoteStream:
                 symbols,
                 str,
             ):
-
                 requested_symbols.append(
                     symbols
                 )
 
             else:
-
                 requested_symbols.extend(
                     list(symbols)
                 )
 
         # Si aucun symbole n'est fourni,
-        # Engine 2 utilise XAUUSD.
+        # Engine 2 utilise XAUUSD par défaut.
         if not requested_symbols:
-
             requested_symbols = [
                 "XAUUSD"
             ]
@@ -189,36 +191,32 @@ class BiQuoteStream:
             )
 
             if not normalized:
-
                 continue
 
             if (
                 normalized
                 not in SUPPORTED_SYMBOLS
             ):
-
                 logger.warning(
                     "Symbole BiQuote ignoré "
                     "car non supporté : %s",
                     requested,
                 )
-
                 continue
 
             if (
                 normalized
                 not in normalized_symbols
             ):
-
                 normalized_symbols.append(
                     normalized
                 )
 
         if not normalized_symbols:
-
             raise ValueError(
                 "Aucun symbole BiQuote valide. "
-                "Engine 2 utilise XAUUSD."
+                "Symboles supportés : "
+                f"{', '.join(SUPPORTED_SYMBOLS)}"
             )
 
         # --------------------------------------------------------------------
@@ -289,7 +287,6 @@ class BiQuoteStream:
             )
 
         except Exception:
-
             logger.exception(
                 "Erreur lors de "
                 "l'abonnement BiQuote."
@@ -377,7 +374,6 @@ class BiQuoteStream:
             # ----------------------------------------------------------------
 
             if symbol not in self.symbols:
-
                 return
 
             bid = self._to_float(
@@ -638,6 +634,22 @@ class BiQuoteStream:
         ):
 
             return None
+
+    # =========================================================================
+    # START — COMPATIBILITÉ MOTEUR 2
+    # =========================================================================
+
+    async def start(
+        self,
+    ) -> None:
+        """
+        Alias de compatibilité avec moteur2.py.
+
+        Le moteur appelle start().
+        Le flux réel est exécuté par run().
+        """
+
+        await self.run()
 
     # =========================================================================
     # RUN
