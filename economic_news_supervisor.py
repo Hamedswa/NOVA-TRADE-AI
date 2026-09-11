@@ -1,40 +1,61 @@
 """
 NOVA TRADE AI
-ECONOMIC NEWS SUPERVISOR
+economic_news_supervisor.py
+
+SUPERVISEUR DES ACTUALITÉS ÉCONOMIQUES
 
 Rôle :
-- Récupérer les annonces économiques publiques.
-- Identifier les annonces à impact HIGH.
-- Fournir une explication simple via Groq.
-- Informer l'utilisateur uniquement.
+    - récupérer les annonces économiques publiques ;
+    - conserver les annonces HIGH ;
+    - identifier les annonces pertinentes ;
+    - fournir une explication pédagogique via Groq ;
+    - informer Telegram / dashboard / utilisateur.
 
-IMPORTANT :
-Ce module est totalement indépendant du moteur de trading.
-Il ne doit jamais :
-- analyser techniquement le marché ;
-- générer BUY/SELL ;
-- calculer un score ;
-- calculer un RR ;
-- définir Entry / SL / TP ;
-- valider ou rejeter un signal ;
-- modifier ou bloquer un signal.
+IMPORTANT
+---------
+Ce module est STRICTEMENT INFORMATIF.
+
+Il ne doit JAMAIS :
+    - analyser techniquement le marché ;
+    - générer BUY ;
+    - générer SELL ;
+    - calculer un score ;
+    - calculer un RR ;
+    - définir Entry ;
+    - définir SL ;
+    - définir TP ;
+    - valider un setup ;
+    - rejeter un setup ;
+    - bloquer un signal ;
+    - modifier un signal ;
+    - modifier le score ;
+    - modifier le RR ;
+    - intervenir dans moteur2_validation.py.
+
+La décision finale appartient exclusivement
+au Moteur 2 et à moteur2_validation.py.
 
 Source calendrier :
-Forex Factory (page publique)
+    Forex Factory (page publique)
 
-IA :
-Groq, via GROQ_API_KEY.
+IA pédagogique :
+    Groq via GROQ_API_KEY
 
-Aucune clé Finnhub n'est nécessaire.
+En cas d'indisponibilité de la source ou de Groq :
+    NOVA TRADE AI continue normalement.
 """
 
-import os
+from __future__ import annotations
+
 import logging
+import os
+
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
 from bs4 import BeautifulSoup
+
 
 try:
     from groq import Groq
@@ -48,16 +69,58 @@ except ImportError:
 
 LOGGER = logging.getLogger(__name__)
 
-FOREX_FACTORY_URL = "https://www.forexfactory.com/calendar"
 
-REQUEST_TIMEOUT = 15
+FOREX_FACTORY_URL = (
+    "https://www.forexfactory.com/calendar"
+)
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+REQUEST_TIMEOUT = int(
+    os.getenv(
+        "ECONOMIC_NEWS_TIMEOUT",
+        "15",
+    )
+)
+
+
+GROQ_API_KEY = os.getenv(
+    "GROQ_API_KEY",
+    "",
+).strip()
+
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
     "llama-3.3-70b-versatile",
-)
+).strip()
+
+
+# ============================================================
+# MARCHÉS DU MOTEUR 2
+# ============================================================
+
+SUPPORTED_SYMBOLS = {
+    "XAUUSD",
+    "BTCUSD",
+    "EURUSD",
+    "GBPUSD",
+}
+
+
+DISPLAY_SYMBOLS = {
+    "XAUUSD": "XAU/USD",
+    "BTCUSD": "BTC/USD",
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+}
+
+
+SYMBOL_CURRENCIES = {
+    "XAUUSD": ["USD"],
+    "BTCUSD": ["USD"],
+    "EURUSD": ["EUR", "USD"],
+    "GBPUSD": ["GBP", "USD"],
+}
 
 
 # ============================================================
@@ -73,27 +136,120 @@ HEADERS = {
     ),
     "Accept": (
         "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        "application/xml;q=0.9,image/avif,image/webp,"
+        "*/*;q=0.8"
     ),
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": (
+        "en-US,en;q=0.9"
+    ),
 }
 
 
 # ============================================================
-# UTILITAIRES
+# OUTILS
 # ============================================================
 
-def _clean_text(value: Optional[str]) -> str:
-    """Nettoie un texte HTML."""
+def normalize_symbol(
+    symbol: str,
+) -> str:
+    """
+    Normalise un symbole.
+
+    Exemples :
+        XAU/USD -> XAUUSD
+        BTC/USD -> BTCUSD
+        EUR/USD -> EURUSD
+        GBP/USD -> GBPUSD
+    """
+
+    if symbol is None:
+        return ""
+
+    return (
+        str(symbol)
+        .upper()
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+
+def display_symbol(
+    symbol: str,
+) -> str:
+    """
+    Retourne le symbole sous forme lisible.
+    """
+
+    normalized = normalize_symbol(
+        symbol
+    )
+
+    return DISPLAY_SYMBOLS.get(
+        normalized,
+        normalized,
+    )
+
+
+def get_symbol_currencies(
+    symbol: str,
+) -> List[str]:
+    """
+    Retourne les devises pertinentes
+    pour un marché du Moteur 2.
+    """
+
+    normalized = normalize_symbol(
+        symbol
+    )
+
+    return list(
+        SYMBOL_CURRENCIES.get(
+            normalized,
+            [],
+        )
+    )
+
+
+def is_supported_symbol(
+    symbol: str,
+) -> bool:
+    """
+    Vérifie si le marché est supporté.
+    """
+
+    return (
+        normalize_symbol(symbol)
+        in SUPPORTED_SYMBOLS
+    )
+
+
+def _clean_text(
+    value: Optional[str],
+) -> str:
+    """
+    Nettoie un texte.
+    """
+
     if not value:
         return ""
 
-    return " ".join(value.split()).strip()
+    return " ".join(
+        str(value).split()
+    ).strip()
 
 
-def _normalize_impact(value: str) -> str:
-    """Normalise le niveau d'impact."""
-    value = _clean_text(value).upper()
+def _normalize_impact(
+    value: Any,
+) -> str:
+    """
+    Normalise le niveau d'impact.
+    """
+
+    value = _clean_text(
+        value
+    ).upper()
 
     if "HIGH" in value:
         return "HIGH"
@@ -107,20 +263,30 @@ def _normalize_impact(value: str) -> str:
     return "UNKNOWN"
 
 
-def _extract_impact(row) -> str:
+def _extract_impact(
+    row,
+) -> str:
     """
-    Détecte l'impact à partir des classes HTML / attributs
-    utilisés par Forex Factory.
+    Détecte l'impact à partir des classes
+    et attributs HTML.
     """
 
-    # Recherche classique dans les éléments de la ligne.
     for element in row.find_all(True):
-        classes = element.get("class", [])
 
-        if isinstance(classes, str):
+        classes = element.get(
+            "class",
+            [],
+        )
+
+        if isinstance(
+            classes,
+            str,
+        ):
             classes = [classes]
 
-        class_text = " ".join(classes).lower()
+        class_text = " ".join(
+            classes
+        ).lower()
 
         if "high" in class_text:
             return "HIGH"
@@ -131,7 +297,12 @@ def _extract_impact(row) -> str:
         if "low" in class_text:
             return "LOW"
 
-        title = _clean_text(element.get("title", "")).lower()
+        title = _clean_text(
+            element.get(
+                "title",
+                "",
+            )
+        ).lower()
 
         if "high impact" in title:
             return "HIGH"
@@ -142,8 +313,12 @@ def _extract_impact(row) -> str:
         if "low impact" in title:
             return "LOW"
 
-    # Dernière tentative à partir du texte.
-    text = _clean_text(row.get_text(" ", strip=True)).lower()
+    text = _clean_text(
+        row.get_text(
+            " ",
+            strip=True,
+        )
+    ).lower()
 
     if "high impact" in text:
         return "HIGH"
@@ -161,14 +336,23 @@ def _extract_impact(row) -> str:
 # RÉCUPÉRATION DU CALENDRIER
 # ============================================================
 
-def fetch_economic_calendar() -> List[Dict[str, Any]]:
+def fetch_economic_calendar(
+    high_only: bool = True,
+) -> List[Dict[str, Any]]:
     """
-    Récupère les événements économiques depuis Forex Factory.
+    Récupère le calendrier économique public.
 
-    Retourne une liste de dictionnaires.
+    Par défaut, seuls les événements HIGH sont conservés.
+
+    En cas d'erreur :
+        retourne une liste vide.
+
+    Aucune erreur de cette fonction ne doit
+    arrêter le moteur de trading.
     """
 
     try:
+
         response = requests.get(
             FOREX_FACTORY_URL,
             headers=HEADERS,
@@ -178,46 +362,70 @@ def fetch_economic_calendar() -> List[Dict[str, Any]]:
         response.raise_for_status()
 
     except requests.RequestException as exc:
-        LOGGER.error(
-            "Erreur récupération calendrier économique : %s",
+
+        LOGGER.warning(
+            "Calendrier économique indisponible : %s",
             exc,
         )
+
         return []
 
     try:
+
         soup = BeautifulSoup(
             response.text,
             "html.parser",
         )
 
     except Exception as exc:
-        LOGGER.error(
-            "Erreur parsing Forex Factory : %s",
+
+        LOGGER.warning(
+            "Erreur parsing calendrier économique : %s",
             exc,
         )
+
         return []
 
-    events: List[Dict[str, Any]] = []
+    events: List[
+        Dict[str, Any]
+    ] = []
 
-    # Forex Factory utilise généralement des lignes
-    # contenant la classe calendar__row.
-    rows = soup.select("tr.calendar__row")
+    rows = soup.select(
+        "tr.calendar__row"
+    )
 
     if not rows:
-        # Fallback si la structure HTML évolue.
-        rows = soup.select("tr")
+
+        rows = soup.select(
+            "tr"
+        )
 
     for row in rows:
 
         try:
-            event = _parse_calendar_row(row)
 
-            if event:
-                events.append(event)
+            event = _parse_calendar_row(
+                row
+            )
+
+            if event is None:
+                continue
+
+            if (
+                high_only
+                and event.get("impact")
+                != "HIGH"
+            ):
+                continue
+
+            events.append(
+                event
+            )
 
         except Exception as exc:
+
             LOGGER.debug(
-                "Ligne calendrier ignorée : %s",
+                "Ligne économique ignorée : %s",
                 exc,
             )
 
@@ -225,11 +433,17 @@ def fetch_economic_calendar() -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# PARSING D'UNE ANNONCE
+# PARSING
 # ============================================================
 
-def _parse_calendar_row(row) -> Optional[Dict[str, Any]]:
-    """Parse une ligne du calendrier."""
+def _parse_calendar_row(
+    row,
+) -> Optional[
+    Dict[str, Any]
+]:
+    """
+    Parse une ligne du calendrier.
+    """
 
     currency = ""
     event_name = ""
@@ -238,100 +452,70 @@ def _parse_calendar_row(row) -> Optional[Dict[str, Any]]:
     forecast = ""
     previous = ""
 
-    # --------------------------------------------------------
-    # Currency
-    # --------------------------------------------------------
-
     currency_element = row.select_one(
         ".calendar__currency"
     )
 
     if currency_element:
+
         currency = _clean_text(
             currency_element.get_text()
-        )
-
-    # --------------------------------------------------------
-    # Event
-    # --------------------------------------------------------
+        ).upper()
 
     event_element = row.select_one(
         ".calendar__event"
     )
 
     if event_element:
+
         event_name = _clean_text(
             event_element.get_text()
         )
-
-    # --------------------------------------------------------
-    # Time
-    # --------------------------------------------------------
 
     time_element = row.select_one(
         ".calendar__time"
     )
 
     if time_element:
+
         time_value = _clean_text(
             time_element.get_text()
         )
-
-    # --------------------------------------------------------
-    # Actual
-    # --------------------------------------------------------
 
     actual_element = row.select_one(
         ".calendar__actual"
     )
 
     if actual_element:
+
         actual = _clean_text(
             actual_element.get_text()
         )
-
-    # --------------------------------------------------------
-    # Forecast
-    # --------------------------------------------------------
 
     forecast_element = row.select_one(
         ".calendar__forecast"
     )
 
     if forecast_element:
+
         forecast = _clean_text(
             forecast_element.get_text()
         )
-
-    # --------------------------------------------------------
-    # Previous
-    # --------------------------------------------------------
 
     previous_element = row.select_one(
         ".calendar__previous"
     )
 
     if previous_element:
+
         previous = _clean_text(
             previous_element.get_text()
         )
-
-    # --------------------------------------------------------
-    # Impact
-    # --------------------------------------------------------
 
     impact = _normalize_impact(
         _extract_impact(row)
     )
 
-    # --------------------------------------------------------
-    # Validation
-    # --------------------------------------------------------
-
-    if not event_name and not currency:
-        return None
-
-    # Évite de récupérer des lignes inutiles.
     if not event_name:
         return None
 
@@ -344,24 +528,34 @@ def _parse_calendar_row(row) -> Optional[Dict[str, Any]]:
         "forecast": forecast,
         "previous": previous,
         "source": "Forex Factory",
+        "informational_only": True,
     }
 
 
 # ============================================================
-# ANNONCES HIGH IMPACT
+# HIGH IMPACT
 # ============================================================
 
-def get_high_impact_events() -> List[Dict[str, Any]]:
+def get_high_impact_events(
+    events: Optional[
+        List[Dict[str, Any]]
+    ] = None,
+) -> List[Dict[str, Any]]:
     """
-    Retourne uniquement les annonces HIGH impact.
+    Retourne uniquement les annonces HIGH.
     """
 
-    events = fetch_economic_calendar()
+    if events is None:
+
+        events = fetch_economic_calendar(
+            high_only=True
+        )
 
     return [
         event
         for event in events
-        if event.get("impact") == "HIGH"
+        if event.get("impact")
+        == "HIGH"
     ]
 
 
@@ -373,15 +567,14 @@ def get_high_impact_events_for_currencies(
     currencies: List[str],
 ) -> List[Dict[str, Any]]:
     """
-    Retourne les annonces HIGH concernant les devises
-    demandées.
-
-    Exemple :
-        ["USD", "EUR", "GBP"]
+    Retourne les annonces HIGH concernant
+    les devises demandées.
     """
 
     normalized = {
-        currency.upper()
+        str(currency)
+        .upper()
+        .strip()
         for currency in currencies
     }
 
@@ -390,145 +583,215 @@ def get_high_impact_events_for_currencies(
     return [
         event
         for event in events
-        if event.get("currency", "").upper()
+        if str(
+            event.get(
+                "currency",
+                "",
+            )
+        ).upper()
         in normalized
     ]
 
 
 # ============================================================
-# FILTRE XAU / BTC
+# ÉVÉNEMENTS PERTINENTS POUR LE MOTEUR 2
 # ============================================================
 
-def get_relevant_high_impact_events() -> List[Dict[str, Any]]:
+def get_relevant_high_impact_events(
+    symbol: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
-    Retourne les annonces particulièrement pertinentes
-    pour les marchés surveillés par NOVA TRADE AI.
+    Retourne les annonces HIGH pertinentes.
 
-    XAU/USD et BTC/USD sont notamment sensibles aux annonces
-    USD et aux événements macroéconomiques majeurs.
+    Si aucun symbole n'est fourni :
+        USD, EUR et GBP sont surveillés.
+
+    XAUUSD :
+        USD
+
+    BTCUSD :
+        USD
+
+    EURUSD :
+        EUR + USD
+
+    GBPUSD :
+        GBP + USD
+
+    Cette fonction est informative uniquement.
     """
 
-    return get_high_impact_events_for_currencies(
-        [
+    if symbol is not None:
+
+        currencies = get_symbol_currencies(
+            symbol
+        )
+
+    else:
+
+        currencies = [
             "USD",
             "EUR",
             "GBP",
-            "JPY",
-            "CAD",
-            "AUD",
-            "NZD",
-            "CHF",
         ]
+
+    if not currencies:
+        return []
+
+    return (
+        get_high_impact_events_for_currencies(
+            currencies
+        )
     )
 
 
 # ============================================================
-# GROQ — EXPLICATION SIMPLE
+# GROQ — EXPLICATION PÉDAGOGIQUE
 # ============================================================
 
 def explain_economic_event(
     event: Dict[str, Any],
 ) -> Optional[str]:
     """
-    Demande à Groq d'expliquer une annonce économique
-    en langage simple.
+    Explique une annonce économique
+    avec Groq.
 
-    IMPORTANT :
-    Groq ne doit fournir aucune analyse technique
-    ni direction BUY/SELL.
+    Groq reste uniquement pédagogique.
+
+    Il n'a aucune autorité sur le Moteur 2.
     """
 
     if not GROQ_API_KEY:
-        LOGGER.warning(
+
+        LOGGER.info(
             "GROQ_API_KEY non configurée."
         )
+
         return None
 
     if Groq is None:
+
         LOGGER.warning(
-            "Le package groq n'est pas installé."
+            "Package groq non installé."
         )
+
         return None
 
-    client = Groq(
-        api_key=GROQ_API_KEY
-    )
+    try:
 
-    prompt = f"""
-Tu es uniquement un assistant pédagogique spécialisé
+        client = Groq(
+            api_key=GROQ_API_KEY
+        )
+
+        prompt = f"""
+Tu es un assistant pédagogique spécialisé
 dans les annonces économiques.
 
-Explique simplement l'annonce suivante :
+Tu dois expliquer de manière simple et neutre
+l'annonce suivante :
 
-Devise : {event.get("currency", "N/A")}
-Événement : {event.get("event", "N/A")}
-Impact : {event.get("impact", "N/A")}
-Actual : {event.get("actual", "N/A")}
-Prévision : {event.get("forecast", "N/A")}
-Précédent : {event.get("previous", "N/A")}
+Devise :
+{event.get("currency", "N/A")}
 
-Ta réponse doit expliquer :
+Événement :
+{event.get("event", "N/A")}
+
+Impact :
+{event.get("impact", "N/A")}
+
+Actual :
+{event.get("actual", "N/A")}
+
+Prévision :
+{event.get("forecast", "N/A")}
+
+Précédent :
+{event.get("previous", "N/A")}
+
+Explique :
 
 1. Ce qu'est cette annonce.
 2. Pourquoi elle est importante.
-3. Quels actifs ou marchés peuvent être sensibles
+3. Quels marchés peuvent généralement être sensibles
    à cette annonce.
-4. Le type général de réaction possible du marché
-   selon que le résultat est supérieur ou inférieur
-   aux attentes.
+4. Comment une différence entre le résultat réel
+   et les attentes peut généralement influencer
+   les marchés concernés.
 
-INTERDICTIONS ABSOLUES :
+RÈGLES ABSOLUES :
 
-- Ne donne aucun BUY.
-- Ne donne aucun SELL.
-- Ne donne aucune Entry.
-- Ne donne aucun Stop Loss.
-- Ne donne aucun Take Profit.
-- Ne donne aucun score.
-- Ne donne aucun RR.
-- Ne fais aucune analyse technique.
-- Ne dis pas si un signal doit être validé ou rejeté.
-- Ne bloque jamais une entrée.
-- Ne modifie jamais une décision du moteur de trading.
+Tu es uniquement informatif.
 
-Reste informatif, neutre et pédagogique.
+Ne donne PAS :
+- BUY ;
+- SELL ;
+- Entry ;
+- Stop Loss ;
+- Take Profit ;
+- RR ;
+- score ;
+- validation ;
+- rejet ;
+- signal de trading ;
+- décision d'entrée ;
+- décision de sortie.
+
+Ne fais aucune analyse technique.
+
+Ne tente pas de déterminer si un setup du Moteur 2
+doit être accepté ou refusé.
+
+Ne demande jamais au moteur de modifier son score,
+son RR, son Entry, son SL ou son TP.
+
+Reste neutre et pédagogique.
 """
 
-    try:
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Tu es un superviseur "
-                        "d'informations économiques. "
-                        "Tu n'interviens jamais dans "
-                        "les décisions de trading."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            temperature=0.2,
-            max_tokens=500,
+        completion = (
+            client
+            .chat
+            .completions
+            .create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Tu es un superviseur "
+                            "économique informatif. "
+                            "Tu n'as aucune autorité "
+                            "sur les décisions de trading."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                temperature=0.2,
+                max_tokens=500,
+            )
         )
 
-        return (
+        content = (
             completion
             .choices[0]
             .message
             .content
-            .strip()
         )
 
+        if not content:
+            return None
+
+        return content.strip()
+
     except Exception as exc:
-        LOGGER.error(
-            "Erreur Groq economic supervisor : %s",
+
+        LOGGER.warning(
+            "Erreur Groq : %s",
             exc,
         )
+
         return None
 
 
@@ -542,6 +805,9 @@ def format_economic_event(
 ) -> str:
     """
     Formate une annonce pour Telegram.
+
+    Le message indique explicitement que
+    l'information n'est pas une décision de trading.
     """
 
     currency = event.get(
@@ -587,15 +853,22 @@ def format_economic_event(
         f"🕐 Heure : <b>{time_value}</b>\n\n"
         f"📊 Actual : {actual}\n"
         f"🔮 Prévision : {forecast}\n"
-        f"📚 Précédent : {previous}"
+        f"📚 Précédent : {previous}\n\n"
+        "ℹ️ <b>Information uniquement.</b>\n"
+        "Cette annonce ne modifie pas la décision "
+        "du Moteur 2."
     )
 
     if include_ai_explanation:
-        explanation = explain_economic_event(
-            event
+
+        explanation = (
+            explain_economic_event(
+                event
+            )
         )
 
         if explanation:
+
             message += (
                 "\n\n"
                 "🤖 <b>EXPLICATION</b>\n"
@@ -606,30 +879,47 @@ def format_economic_event(
 
 
 # ============================================================
-# RAPPORT COMPLET
+# RAPPORT
 # ============================================================
 
 def build_economic_news_report(
-    high_impact_only: bool = True,
+    symbol: Optional[str] = None,
     include_ai_explanation: bool = False,
 ) -> str:
     """
-    Construit un rapport économique simple.
+    Construit un rapport économique informatif.
     """
 
-    if high_impact_only:
-        events = get_high_impact_events()
-    else:
-        events = fetch_economic_calendar()
+    events = (
+        get_relevant_high_impact_events(
+            symbol
+        )
+    )
+
+    title = (
+        "📢 <b>CALENDRIER ÉCONOMIQUE</b>"
+    )
+
+    if symbol:
+
+        title += (
+            f"\n"
+            f"Marché : "
+            f"<b>{display_symbol(symbol)}</b>"
+        )
+
+    title += "\n\n"
 
     if not events:
+
         return (
-            "📢 <b>CALENDRIER ÉCONOMIQUE</b>\n\n"
-            "Aucune annonce récupérée."
+            title
+            + "Aucune annonce HIGH pertinente "
+            "récupérée."
         )
 
     lines = [
-        "📢 <b>CALENDRIER ÉCONOMIQUE</b>",
+        title.rstrip(),
         "",
     ]
 
@@ -642,26 +932,35 @@ def build_economic_news_report(
         )
 
         if event.get("time"):
+
             lines.append(
                 f"🕐 {event['time']}"
             )
 
         if event.get("forecast"):
+
             lines.append(
-                f"🔮 Prévision : {event['forecast']}"
+                f"🔮 Prévision : "
+                f"{event['forecast']}"
             )
 
         if event.get("previous"):
+
             lines.append(
-                f"📚 Précédent : {event['previous']}"
+                f"📚 Précédent : "
+                f"{event['previous']}"
             )
 
         if include_ai_explanation:
-            explanation = explain_economic_event(
-                event
+
+            explanation = (
+                explain_economic_event(
+                    event
+                )
             )
 
             if explanation:
+
                 lines.extend(
                     [
                         "",
@@ -676,37 +975,161 @@ def build_economic_news_report(
         "ℹ️ Source : Forex Factory"
     )
 
-    return "\n".join(lines)
+    lines.append(
+        "ℹ️ Fonctionnement : "
+        "informatif uniquement."
+    )
+
+    return "\n".join(
+        lines
+    )
 
 
 # ============================================================
-# TEST DU MODULE
+# STATUT DU SUPERVISEUR
+# ============================================================
+
+def get_supervisor_status(
+    symbol: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Retourne l'état du superviseur économique.
+
+    Aucun champ de ce résultat ne doit être utilisé
+    pour modifier ou bloquer une décision de trading.
+    """
+
+    normalized_symbol = (
+        normalize_symbol(symbol)
+        if symbol
+        else None
+    )
+
+    if normalized_symbol and not is_supported_symbol(
+        normalized_symbol
+    ):
+
+        return {
+            "enabled": True,
+            "informational_only": True,
+            "supported_symbol": False,
+            "symbol": normalized_symbol,
+            "source": "Forex Factory",
+            "groq_available": bool(
+                GROQ_API_KEY
+                and Groq is not None
+            ),
+            "events_available": False,
+        }
+
+    events = (
+        get_relevant_high_impact_events(
+            normalized_symbol
+        )
+    )
+
+    return {
+        "enabled": True,
+        "informational_only": True,
+
+        "symbol": normalized_symbol,
+
+        "source": "Forex Factory",
+
+        "groq_available": bool(
+            GROQ_API_KEY
+            and Groq is not None
+        ),
+
+        "events_available": bool(
+            events
+        ),
+
+        "high_impact_count": len(
+            events
+        ),
+
+        # ====================================================
+        # AUTORITÉ DE TRADING
+        # ====================================================
+
+        "can_validate_signal": False,
+        "can_reject_signal": False,
+        "can_block_signal": False,
+        "can_modify_signal": False,
+        "can_modify_score": False,
+        "can_modify_rr": False,
+        "can_modify_entry": False,
+        "can_modify_sl": False,
+        "can_modify_tp": False,
+    }
+
+
+# ============================================================
+# TEST
 # ============================================================
 
 def test_economic_news_supervisor() -> Dict[str, Any]:
     """
-    Test simple du module.
+    Test autonome.
 
-    Cette fonction ne touche jamais au moteur de trading.
+    Ce test ne touche jamais au Moteur 2.
     """
 
-    events = fetch_economic_calendar()
+    try:
 
-    high_impact = [
-        event
-        for event in events
-        if event.get("impact") == "HIGH"
-    ]
+        events = fetch_economic_calendar(
+            high_only=True
+        )
 
-    return {
-        "success": bool(events),
-        "total_events": len(events),
-        "high_impact_events": len(high_impact),
-        "source": "Forex Factory",
-        "groq_available": bool(
-            GROQ_API_KEY and Groq is not None
-        ),
-    }
+        high_events = [
+            event
+            for event in events
+            if event.get("impact")
+            == "HIGH"
+        ]
+
+        return {
+            "success": True,
+            "total_events": len(
+                events
+            ),
+            "high_impact_events": len(
+                high_events
+            ),
+            "source": "Forex Factory",
+            "groq_available": bool(
+                GROQ_API_KEY
+                and Groq is not None
+            ),
+            "informational_only": True,
+            "can_block_signal": False,
+            "can_validate_signal": False,
+            "can_reject_signal": False,
+        }
+
+    except Exception as exc:
+
+        LOGGER.warning(
+            "Test superviseur économique échoué : %s",
+            exc,
+        )
+
+        return {
+            "success": False,
+            "total_events": 0,
+            "high_impact_events": 0,
+            "source": "Forex Factory",
+            "groq_available": bool(
+                GROQ_API_KEY
+                and Groq is not None
+            ),
+            "informational_only": True,
+            "can_block_signal": False,
+            "can_validate_signal": False,
+            "can_reject_signal": False,
+            "error": str(exc),
+        }
 
 
 # ============================================================
@@ -719,27 +1142,56 @@ if __name__ == "__main__":
         level=logging.INFO
     )
 
-    result = test_economic_news_supervisor()
+    result = (
+        test_economic_news_supervisor()
+    )
 
+    print()
     print(
-        "\n"
-        "====================================\n"
-        " NOVA TRADE AI - ECONOMIC SUPERVISOR\n"
-        "====================================\n"
+        "=============================================="
+    )
+    print(
+        " NOVA TRADE AI - ECONOMIC NEWS SUPERVISOR"
+    )
+    print(
+        "=============================================="
     )
 
     print(
-        f"Succès : {result['success']}"
+        f"Succès             : "
+        f"{result['success']}"
     )
 
     print(
-        f"Événements : {result['total_events']}"
+        f"Événements HIGH    : "
+        f"{result['high_impact_events']}"
     )
 
     print(
-        f"HIGH : {result['high_impact_events']}"
+        f"Groq disponible    : "
+        f"{result['groq_available']}"
     )
 
     print(
-        f"Groq disponible : {result['groq_available']}"
+        f"Mode informatif    : "
+        f"{result['informational_only']}"
+    )
+
+    print(
+        f"Peut bloquer       : "
+        f"{result['can_block_signal']}"
+    )
+
+    print(
+        f"Peut valider       : "
+        f"{result['can_validate_signal']}"
+    )
+
+    print(
+        f"Peut rejeter       : "
+        f"{result['can_reject_signal']}"
+    )
+
+    print(
+        "=============================================="
     )
