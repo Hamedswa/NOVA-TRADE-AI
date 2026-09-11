@@ -1,60 +1,20 @@
 NOVA TRADE AI
 
-main.py
+Main entry point
 
-Point d’entrée principal.
+Engine 2 only
 
-MOTEUR 2 :
+Data provider: BiQuote
 
-XAU/USD
+Markets: XAU/USD, BTC/USD, EUR/USD, GBP/USD
 
-BTC/USD
+Timeframes: H4 -> H1 -> M15 -> M5 -> M1
 
-EUR/USD
+Minimum RR: 3.0
 
-GBP/USD
+Minimum score: 60
 
-BiQuote uniquement
-
-H4 -> H1 -> M15 -> M5 -> M1
-
-Architecture :
-
-BiQuote
-
-->
-
-Moteur 2
-
-->
-
-Validation finale
-
-->
-
-Anti-spam
-
-->
-
-Telegram
-
-IMPORTANT :
-
-- Moteur 1 n’est plus utilisé.
-
-- La validation finale appartient exclusivement
-
-à moteur2_validation.py.
-
-- M5 est la confirmation principale.
-
-- M1 est la confirmation secondaire.
-
-- RR minimum = 1:3.
-
-- L’exécution automatique est désactivée.
-
-- Les superviseurs news/session restent informatifs.
+Automatic execution: disabled
 
 from future import annotations
 
@@ -63,12 +23,6 @@ import logging
 from telegram_bot import run_bot
 
 logger = logging.getLogger(name)
-
-============================================================
-
-CONFIGURATION AFFICHÉE
-
-============================================================
 
 ENGINE_NAME = “MOTEUR 2”
 
@@ -93,137 +47,77 @@ MINIMUM_RR = 3.0
 MINIMUM_SCORE = 60.0
 AUTO_EXECUTION = False
 
-============================================================
-
-BANNER
-
-============================================================
-
 def print_banner() -> None:
-“”“Affiche la configuration réelle de NOVA TRADE AI.”””
-
 print()
-print("=" * 72)
-print("                       NOVA TRADE AI")
-print("=" * 72)
-print(
-    f"Moteur actif      : {ENGINE_NAME}"
-)
-print(
-    "Marchés           : "
-    + ", ".join(SUPPORTED_MARKETS)
-)
-print(
-    f"Source            : {DATA_SOURCE}"
-)
-print(
-    "Timeframes        : "
-    + " -> ".join(TIMEFRAMES)
-)
-print(
-    f"RR minimum        : 1:{MINIMUM_RR:g}"
-)
-print(
-    f"Score minimum     : {MINIMUM_SCORE:g}/100"
-)
-print(
-    "Confirmation      : M5 principale + M1 secondaire"
-)
-print(
-    "Validation        : moteur2_validation.py"
-)
-print(
-    "Anti-spam         : après READY_FOR_SIGNAL"
-)
-print(
-    "Exécution auto    : désactivée"
-)
-print("=" * 72)
+print(”=” * 60)
+print(“NOVA TRADE AI”)
+print(”=” * 60)
+print(“Engine           :”, ENGINE_NAME)
+print(“Markets          :”, “, “.join(SUPPORTED_MARKETS))
+print(“Data source      :”, DATA_SOURCE)
+print(“Timeframes       :”, “ -> “.join(TIMEFRAMES))
+print(“Minimum RR       :”, “1:” + str(MINIMUM_RR))
+print(“Minimum score    :”, str(MINIMUM_SCORE) + “/100”)
+print(“Confirmation     : M5 primary + M1 secondary”)
+print(“Final validation : moteur2_validation.py”)
+print(“Auto execution   : disabled”)
+print(”=” * 60)
 print()
-
-============================================================
-
-DÉMARRAGE
-
-============================================================
 
 def main() -> None:
-“””
-Point d’entrée principal.
-
-Le lancement et la gestion du bot Telegram restent
-dans telegram_bot.py.
-"""
 logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
+level=logging.INFO,
+format=(
+“%(asctime)s | “
+“%(levelname)s | “
+“%(name)s | “
+“%(message)s”
+),
 )
+
 print_banner()
 logger.info(
-    "Démarrage de NOVA TRADE AI — %s.",
+    "Starting NOVA TRADE AI - %s",
     ENGINE_NAME,
 )
 logger.info(
-    "Marchés actifs : %s.",
+    "Active markets: %s",
     ", ".join(SUPPORTED_MARKETS),
 )
 logger.info(
-    "Source de données : %s.",
+    "Data source: %s",
     DATA_SOURCE,
 )
 logger.info(
-    "Validation finale : moteur2_validation.py.",
+    "Final validation: moteur2_validation.py",
 )
 logger.info(
-    "Exécution automatique désactivée.",
+    "Automatic execution disabled.",
 )
 try:
     run_bot()
 except KeyboardInterrupt:
     logger.info(
-        "Arrêt manuel de NOVA TRADE AI."
+        "Manual shutdown."
     )
 except Exception:
     logger.exception(
-        "Erreur critique au démarrage de NOVA TRADE AI."
+        "Critical startup error."
     )
     raise
 
-============================================================
-
-ASGI COMPATIBILITY FOR RAILWAY / UVICORN
-
-============================================================
-
 async def app(scope, receive, send):
-“””
-Application ASGI minimale permettant à Uvicorn
-de charger main:app.
+if scope[“type”] != “http”:
+return
 
-Cette application ne contient aucune logique
-de trading et ne modifie pas le Moteur 2.
-"""
-if scope["type"] != "http":
-    return
 body = b"NOVA TRADE AI is running."
 await send(
     {
         "type": "http.response.start",
         "status": 200,
         "headers": [
-            [
-                b"content-type",
-                b"text/plain; charset=utf-8",
-            ],
-            [
-                b"content-length",
-                str(len(body)).encode(),
-            ],
+            [b"content-type", b"text/plain; charset=utf-8"],
+            [b"content-length", str(len(body)).encode()],
         ],
     }
 )
@@ -233,12 +127,6 @@ await send(
         "body": body,
     }
 )
-
-============================================================
-
-ENTRY POINT
-
-============================================================
 
 if name == “main”:
 main()
