@@ -1,21 +1,3 @@
-“””
-NOVA TRADE AI
-Main entry point
-
-Engine 2 only
-
-Data provider: BiQuote
-
-Markets: XAU/USD, BTC/USD, EUR/USD, GBP/USD
-
-Timeframes: H4 -> H1 -> M15 -> M5 -> M1
-
-Minimum RR: 3.0
-Minimum score: 60
-
-Automatic execution: disabled
-“””
-
 from future import annotations
 
 import asyncio
@@ -50,7 +32,7 @@ AUTO_EXECUTION = False
 
 BOT_TASK = None
 
-def print_banner() -> None:
+def print_banner():
 print()
 print(”=” * 60)
 print(“NOVA TRADE AI”)
@@ -67,16 +49,14 @@ print(“Auto execution   : disabled”)
 print(”=” * 60)
 print()
 
-def main() -> None:
+def configure_logging():
 logging.basicConfig(
 level=logging.INFO,
-format=(
-“%(asctime)s | “
-“%(levelname)s | “
-“%(name)s | “
-“%(message)s”
-),
+format=”%(asctime)s | %(levelname)s | %(name)s | %(message)s”,
 )
+
+def start_bot():
+configure_logging()
 
 print_banner()
 logger.info(
@@ -97,46 +77,26 @@ logger.info(
 logger.info(
     "Automatic execution disabled.",
 )
-try:
-    run_bot()
-except KeyboardInterrupt:
-    logger.info("Manual shutdown.")
-except Exception:
-    logger.exception("Critical startup error.")
-    raise
+run_bot()
 
-async def start_telegram_bot() -> None:
-“””
-Lance le bot Telegram dans un thread séparé.
+async def start_telegram_bot():
+logger.info(“Starting Telegram bot…”)
 
-Railway utilise Uvicorn pour démarrer l'application HTTP.
-Le bot Telegram étant basé sur un polling bloquant, il doit
-fonctionner indépendamment du serveur HTTP.
-"""
-logger.info("Démarrage du bot Telegram...")
 try:
-    await asyncio.to_thread(run_bot)
+    await asyncio.to_thread(start_bot)
 except Exception:
-    logger.exception(
-        "Erreur critique dans le bot Telegram."
-    )
+    logger.exception("Telegram bot startup error.")
     raise
 
 async def app(scope, receive, send):
-“””
-Application ASGI compatible Uvicorn/Railway.
-
-Elle fournit :
-    - le serveur HTTP attendu par Railway
-    - le démarrage automatique du bot Telegram
-"""
 global BOT_TASK
+
 if scope["type"] == "lifespan":
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
             logger.info(
-                "Application NOVA TRADE AI démarrée."
+                "NOVA TRADE AI application startup."
             )
             if BOT_TASK is None or BOT_TASK.done():
                 BOT_TASK = asyncio.create_task(
@@ -149,7 +109,7 @@ if scope["type"] == "lifespan":
             )
         elif message["type"] == "lifespan.shutdown":
             logger.info(
-                "Arrêt de l'application NOVA TRADE AI."
+                "NOVA TRADE AI application shutdown."
             )
             if BOT_TASK is not None:
                 BOT_TASK.cancel()
@@ -168,14 +128,8 @@ await send(
         "type": "http.response.start",
         "status": 200,
         "headers": [
-            [
-                b"content-type",
-                b"text/plain; charset=utf-8",
-            ],
-            [
-                b"content-length",
-                str(len(body)).encode(),
-            ],
+            [b"content-type", b"text/plain; charset=utf-8"],
+            [b"content-length", str(len(body)).encode()],
         ],
     }
 )
@@ -187,4 +141,4 @@ await send(
 )
 
 if name == “main”:
-main()
+start_bot()
