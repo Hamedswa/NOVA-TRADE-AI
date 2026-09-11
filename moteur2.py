@@ -53,8 +53,8 @@ PHILOSOPHIE :
     M5 n'est PAS un veto.
     M1 n'est PAS un veto.
 
-    La validation technique vérifie uniquement que le dossier est
-    techniquement cohérent.
+    La validation technique vérifie uniquement que le dossier
+    est techniquement exploitable.
 
     Le Risk Engine construit Entry / SL / TP.
 
@@ -76,6 +76,7 @@ import asyncio
 import inspect
 import logging
 from typing import Any, Dict, List, Optional
+
 
 from biquote_client import BiQuoteClient
 from biquote_stream import BiQuoteStream
@@ -116,12 +117,15 @@ TIMEFRAMES = (
     "M1",
 )
 
+# Timeframes réellement nécessaires pour construire le contexte principal.
 PRIMARY_TIMEFRAMES = (
     "H4",
     "H1",
     "M15",
 )
 
+# Timeframes supplémentaires.
+# Leur absence ne doit PAS empêcher la recherche d'opportunités.
 CONFIRMATION_TIMEFRAMES = (
     "M5",
     "M1",
@@ -133,20 +137,17 @@ CANDLE_LIMIT = 300
 
 SCAN_INTERVAL_SECONDS = 60
 
+
 # ============================================================================
 # RÉFÉRENCES UNIQUEMENT
 # ============================================================================
 
-# IMPORTANT :
-# Ces valeurs ne sont PLUS des conditions de rejet.
-#
-# Elles restent conservées pour compatibilité avec d'autres modules
-# et pour afficher des références de qualité.
+# Ces valeurs ne constituent PAS des conditions de rejet.
 
 REFERENCE_RR = 3.0
 REFERENCE_SCORE = 60.0
 
-# Compatibilité avec l'ancien code.
+# Compatibilité avec les anciens modules.
 MINIMUM_RR = REFERENCE_RR
 MINIMUM_SCORE = REFERENCE_SCORE
 
@@ -184,10 +185,7 @@ def _normalize_symbol(symbol: Any) -> str:
         "GBP": "GBPUSD",
     }
 
-    return aliases.get(
-        value,
-        value,
-    )
+    return aliases.get(value, value)
 
 
 # ============================================================================
@@ -246,9 +244,7 @@ class Moteur2:
             )
 
         self.symbols = tuple(
-            dict.fromkeys(
-                normalized_symbols
-            )
+            dict.fromkeys(normalized_symbols)
         )
 
         if not self.symbols:
@@ -298,9 +294,6 @@ class Moteur2:
         # RISK ENGINE
         # ====================================================================
 
-        # reference_rr est utilisé comme référence.
-        # Le Risk Engine ne doit plus bloquer uniquement parce que le RR
-        # est inférieur à 3.
         self.risk = Moteur2Risk(
             min_rr=REFERENCE_RR,
         )
@@ -383,16 +376,9 @@ class Moteur2:
             return default
 
         if isinstance(data, dict):
-            return data.get(
-                key,
-                default,
-            )
+            return data.get(key, default)
 
-        return getattr(
-            data,
-            key,
-            default,
-        )
+        return getattr(data, key, default)
 
     @staticmethod
     async def _call(
@@ -469,15 +455,10 @@ class Moteur2:
         if symbol not in self.symbols:
             return
 
-        price = self._extract_price(
-            tick
-        )
+        price = self._extract_price(tick)
 
         if price is not None:
-
-            self.current_prices[
-                symbol
-            ] = price
+            self.current_prices[symbol] = price
 
         try:
 
@@ -505,9 +486,7 @@ class Moteur2:
         symbol: str,
     ) -> Optional[float]:
 
-        normalized = _normalize_symbol(
-            symbol
-        )
+        normalized = _normalize_symbol(symbol)
 
         # --------------------------------------------------------------------
         # 1. STREAM
@@ -519,9 +498,7 @@ class Moteur2:
                 normalized
             )
 
-            price = self._extract_price(
-                tick
-            )
+            price = self._extract_price(tick)
 
             if price is not None:
                 return price
@@ -549,9 +526,7 @@ class Moteur2:
         # 3. DERNIER PRIX CONNU
         # --------------------------------------------------------------------
 
-        return self.current_prices.get(
-            normalized
-        )
+        return self.current_prices.get(normalized)
 
     # ========================================================================
     # RAFRAÎCHISSEMENT CACHE
@@ -562,9 +537,7 @@ class Moteur2:
         symbol: str,
     ) -> Dict[str, Any]:
 
-        normalized = _normalize_symbol(
-            symbol
-        )
+        normalized = _normalize_symbol(symbol)
 
         result = await self.cache.refresh_symbol(
             normalized,
@@ -582,9 +555,7 @@ class Moteur2:
         symbol: str,
     ) -> Dict[str, Any]:
 
-        normalized = _normalize_symbol(
-            symbol
-        )
+        normalized = _normalize_symbol(symbol)
 
         candles_by_timeframe: Dict[
             str,
@@ -623,10 +594,7 @@ class Moteur2:
                 candles = None
 
             if candles:
-
-                candles_by_timeframe[
-                    timeframe
-                ] = candles
+                candles_by_timeframe[timeframe] = candles
 
         return candles_by_timeframe
 
@@ -639,9 +607,7 @@ class Moteur2:
         symbol: str,
     ) -> Dict[str, Any]:
 
-        normalized = _normalize_symbol(
-            symbol
-        )
+        normalized = _normalize_symbol(symbol)
 
         await self._refresh_symbol_cache(
             normalized
@@ -675,19 +641,12 @@ class Moteur2:
                 "items",
             ):
 
-                value = setups_result.get(
-                    key
-                )
+                value = setups_result.get(key)
 
-                if isinstance(
-                    value,
-                    list,
-                ):
+                if isinstance(value, list):
                     return value
 
-            return [
-                setups_result
-            ]
+            return [setups_result]
 
         if isinstance(
             setups_result,
@@ -697,13 +656,47 @@ class Moteur2:
             ),
         ):
 
-            return list(
-                setups_result
-            )
+            return list(setups_result)
 
-        return [
-            setups_result
-        ]
+        return [setups_result]
+
+    # ========================================================================
+    # CONSTRUCTION D'UN RESULTAT WAIT
+    # ========================================================================
+
+    @staticmethod
+    def _build_wait_result(
+        *,
+        symbol: str,
+        setup: Any,
+        risk_plan: Any,
+        confirmation_result: Any,
+        score_result: Any,
+        validation_result: Any,
+        decision_result: Any,
+        confidence: float,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+
+        result = {
+            "status": DECISION_WAIT,
+            "symbol": symbol,
+            "setup": setup,
+            "risk": risk_plan,
+            "confirmation": confirmation_result,
+            "score": score_result,
+            "validation": validation_result,
+            "decision": decision_result,
+            "decision_confidence": confidence,
+            "registered": False,
+            "published": False,
+            "auto_execution": False,
+        }
+
+        if reason:
+            result["reason"] = reason
+
+        return result
 
     # ========================================================================
     # TRAITEMENT D'UN SETUP
@@ -722,15 +715,13 @@ class Moteur2:
         current_price: Optional[float],
     ) -> Optional[Dict[str, Any]]:
 
-        normalized = _normalize_symbol(
-            symbol
-        )
+        normalized = _normalize_symbol(symbol)
 
         # ====================================================================
         # 1. RISK ENGINE
         # ====================================================================
         #
-        # Construit le plan.
+        # Le Risk Engine construit le plan.
         #
         # Il ne décide PAS si le trade doit être pris.
         #
@@ -747,8 +738,10 @@ class Moteur2:
         # 2. CONFIRMATION M5 / M1
         # ====================================================================
         #
-        # Information supplémentaire.
-        # Pas de veto automatique.
+        # M5 et M1 sont informatifs.
+        #
+        # Leur absence ou leur non-confirmation ne constitue pas
+        # automatiquement un veto stratégique.
         #
 
         confirmation_result = (
@@ -764,8 +757,9 @@ class Moteur2:
         # 3. SCORE
         # ====================================================================
         #
-        # Mesure descriptive.
-        # Pas de seuil de rejet.
+        # Le score décrit la qualité du dossier.
+        #
+        # Aucun seuil de rejet ici.
         #
 
         score_result = self.score.analyser(
@@ -782,7 +776,9 @@ class Moteur2:
         # 4. VALIDATION TECHNIQUE
         # ====================================================================
         #
-        # Vérifie uniquement la cohérence technique du dossier.
+        # Cette étape ne choisit PAS BUY ou SELL.
+        #
+        # Elle vérifie que le dossier est techniquement exploitable.
         #
 
         validation_result = (
@@ -820,16 +816,26 @@ class Moteur2:
         # 5. DECISION ENGINE
         # ====================================================================
         #
-        # C'est ICI que le cerveau décide.
+        # Le Decision Engine reçoit le dossier complet.
         #
-        # Il reçoit toutes les informations disponibles.
+        # Il peut considérer :
         #
-        # IMPORTANT :
-        # validation_valid=False n'est pas automatiquement interprété
-        # comme une décision stratégique.
+        #   - contexte
+        #   - zones
+        #   - structure
+        #   - confluences
+        #   - setup
+        #   - risk
+        #   - score
+        #   - validation
+        #   - confirmation
+        #   - intelligence marché
         #
-        # En revanche, si le dossier est techniquement impossible,
-        # le Decision Engine le transforme en WAIT technique.
+        # Il produit :
+        #
+        #   BUY
+        #   SELL
+        #   WAIT
         #
 
         decision_result = self.decision.analyser(
@@ -860,10 +866,7 @@ class Moteur2:
         )
 
         try:
-            confidence = float(
-                confidence
-            )
-
+            confidence = float(confidence)
         except (
             TypeError,
             ValueError,
@@ -871,39 +874,79 @@ class Moteur2:
             confidence = 0.0
 
         # ====================================================================
-        # 6. WAIT
+        # 6. SAFETY GUARD TECHNIQUE
         # ====================================================================
         #
-        # WAIT est une décision légitime.
+        # IMPORTANT :
         #
-        # On ne force jamais un signal.
+        # Une validation techniquement invalide ne peut jamais devenir
+        # un signal réel simplement parce que le Decision Engine a renvoyé
+        # BUY ou SELL.
+        #
+        # Cela ne constitue PAS une règle stratégique.
+        #
+        # C'est une protection contre :
+        #
+        #   - Entry invalide
+        #   - SL invalide
+        #   - TP invalide
+        #   - données incohérentes
+        #   - géométrie impossible
+        #   - dossier techniquement inutilisable
+        #
+        # Le Safety Guard ne choisit jamais BUY/SELL.
+        #
+
+        if not validation_valid:
+
+            logger.warning(
+                "Dossier techniquement invalide pour %s : "
+                "Decision=%s | validation_status=%s",
+                normalized,
+                decision,
+                validation_status,
+            )
+
+            return self._build_wait_result(
+                symbol=normalized,
+                setup=setup,
+                risk_plan=risk_plan,
+                confirmation_result=confirmation_result,
+                score_result=score_result,
+                validation_result=validation_result,
+                decision_result=decision_result,
+                confidence=confidence,
+                reason=(
+                    "SAFETY_GUARD_TECHNICAL_VALIDATION"
+                ),
+            )
+
+        # ====================================================================
+        # 7. WAIT
+        # ====================================================================
+        #
+        # WAIT est une vraie décision.
+        #
+        # Aucun signal n'est forcé.
         #
 
         if decision == DECISION_WAIT:
 
-            return {
-                "status": DECISION_WAIT,
-                "symbol": normalized,
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation_result,
-                "score": score_result,
-                "validation": validation_result,
-                "decision": decision_result,
-                "decision_confidence": confidence,
-                "registered": False,
-                "published": False,
-                "auto_execution": False,
-            }
+            return self._build_wait_result(
+                symbol=normalized,
+                setup=setup,
+                risk_plan=risk_plan,
+                confirmation_result=confirmation_result,
+                score_result=score_result,
+                validation_result=validation_result,
+                decision_result=decision_result,
+                confidence=confidence,
+                reason="DECISION_ENGINE_WAIT",
+            )
 
         # ====================================================================
-        # 7. DECISION ACTIONNABLE
+        # 8. DECISION INCONNUE
         # ====================================================================
-        #
-        # BUY / SELL.
-        #
-        # Le Decision Engine a choisi l'opportunité.
-        #
 
         if decision not in (
             DECISION_BUY,
@@ -916,28 +959,32 @@ class Moteur2:
                 normalized,
             )
 
-            return {
-                "status": DECISION_WAIT,
-                "symbol": normalized,
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation_result,
-                "score": score_result,
-                "validation": validation_result,
-                "decision": decision_result,
-                "decision_confidence": confidence,
-                "registered": False,
-                "published": False,
-                "auto_execution": False,
-            }
+            return self._build_wait_result(
+                symbol=normalized,
+                setup=setup,
+                risk_plan=risk_plan,
+                confirmation_result=confirmation_result,
+                score_result=score_result,
+                validation_result=validation_result,
+                decision_result=decision_result,
+                confidence=confidence,
+                reason="UNKNOWN_DECISION",
+            )
 
         # ====================================================================
-        # 8. ANTI-SPAM
+        # 9. ANTI-SPAM
         # ====================================================================
         #
-        # L'anti-spam ne décide pas du marché.
+        # L'AntiSpam ne juge PAS le marché.
         #
-        # Il empêche uniquement la répétition abusive d'un même setup.
+        # Il vérifie seulement :
+        #
+        #   - doublon
+        #   - cooldown
+        #   - répétition du même setup
+        #   - cohérence technique minimale
+        #
+        # La décision BUY/SELL vient déjà du Decision Engine.
         #
 
         antispam_result = (
@@ -945,6 +992,7 @@ class Moteur2:
                 setup=setup,
                 risk_plan=risk_plan,
                 validation=validation_result,
+                decision=decision,
             )
         )
 
@@ -975,7 +1023,7 @@ class Moteur2:
             }
 
         # ====================================================================
-        # 9. IDENTIFIANT SETUP
+        # 10. IDENTIFIANT SETUP
         # ====================================================================
 
         setup_id = self._get(
@@ -1004,7 +1052,7 @@ class Moteur2:
                 )
 
         # ====================================================================
-        # 10. SIGNAL PRÊT POUR TELEGRAM
+        # 11. SIGNAL PRÊT POUR TELEGRAM
         # ====================================================================
 
         signal = {
@@ -1040,24 +1088,24 @@ class Moteur2:
         }
 
         # Conservation du dernier signal actionnable.
-        self.last_signal[
-            normalized
-        ] = signal
+        self.last_signal[normalized] = signal
 
         return signal
 
     # ========================================================================
-    # ENREGISTREMENT APRES PUBLICATION
+    # ENREGISTREMENT APRÈS PUBLICATION
     # ========================================================================
 
     def enregistrer_signal_publie(
         self,
         signal: Any,
     ) -> Optional[str]:
+
         """
         Enregistre un signal uniquement après publication réussie.
 
         Cette méthode :
+
             - ne crée pas de nouveau signal
             - ne modifie pas Entry
             - ne modifie pas SL
@@ -1080,6 +1128,26 @@ class Moteur2:
 
             logger.warning(
                 "Tentative d'enregistrement d'un signal non READY."
+            )
+
+            return None
+
+        decision = str(
+            self._get(
+                signal,
+                "decision",
+                "",
+            )
+        ).strip().upper()
+
+        if decision not in (
+            DECISION_BUY,
+            DECISION_SELL,
+        ):
+
+            logger.warning(
+                "Tentative d'enregistrement d'un signal "
+                "sans décision BUY/SELL."
             )
 
             return None
@@ -1130,8 +1198,31 @@ class Moteur2:
                     risk_plan=risk_plan,
                     setup_id=setup_id,
                     validation=validation,
+                    decision=decision,
                 )
             )
+
+        except TypeError:
+            # Compatibilité avec une ancienne signature.
+            try:
+
+                registered_id = (
+                    self.antispam.enregistrer_signal(
+                        setup=setup,
+                        risk_plan=risk_plan,
+                        setup_id=setup_id,
+                        validation=validation,
+                    )
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Erreur enregistrement signal publié : %s",
+                    exc,
+                )
+
+                return None
 
         except Exception as exc:
 
@@ -1160,17 +1251,11 @@ class Moteur2:
 
                 if stored_signal is not None:
 
-                    stored_signal[
-                        "registered"
-                    ] = True
+                    stored_signal["registered"] = True
 
-                    stored_signal[
-                        "published"
-                    ] = True
+                    stored_signal["published"] = True
 
-                    stored_signal[
-                        "setup_id"
-                    ] = registered_id
+                    stored_signal["setup_id"] = registered_id
 
             return registered_id
 
@@ -1185,9 +1270,7 @@ class Moteur2:
         symbol: str,
     ) -> Dict[str, Any]:
 
-        normalized = _normalize_symbol(
-            symbol
-        )
+        normalized = _normalize_symbol(symbol)
 
         if normalized not in self.symbols:
 
@@ -1210,21 +1293,41 @@ class Moteur2:
                 normalized
             )
 
-            missing_timeframes = [
+            # =================================================================
+            # DONNÉES PRINCIPALES
+            # =================================================================
+            #
+            # H4 / H1 / M15 sont nécessaires pour que le moteur possède
+            # son contexte principal.
+            #
+            # M5 / M1 ne bloquent PAS l'analyse.
+            #
+
+            missing_primary_timeframes = [
                 timeframe
-                for timeframe in TIMEFRAMES
-                if not candles.get(
-                    timeframe
-                )
+                for timeframe in PRIMARY_TIMEFRAMES
+                if not candles.get(timeframe)
             ]
 
-            if missing_timeframes:
+            missing_confirmation_timeframes = [
+                timeframe
+                for timeframe in CONFIRMATION_TIMEFRAMES
+                if not candles.get(timeframe)
+            ]
+
+            if missing_primary_timeframes:
 
                 result = {
-                    "status": "INSUFFICIENT_DATA",
+                    "status": "INSUFFICIENT_PRIMARY_DATA",
                     "symbol": normalized,
                     "missing_timeframes": (
-                        missing_timeframes
+                        missing_primary_timeframes
+                    ),
+                    "missing_primary_timeframes": (
+                        missing_primary_timeframes
+                    ),
+                    "missing_confirmation_timeframes": (
+                        missing_confirmation_timeframes
                     ),
                     "candles": candles,
                     "auto_execution": False,
@@ -1235,6 +1338,19 @@ class Moteur2:
                 ] = result
 
                 return result
+
+            # =================================================================
+            # AVERTISSEMENT M5/M1
+            # =================================================================
+
+            if missing_confirmation_timeframes:
+
+                logger.warning(
+                    "%s : M5/M1 indisponible(s) : %s. "
+                    "Analyse principale maintenue.",
+                    normalized,
+                    missing_confirmation_timeframes,
+                )
 
             # =================================================================
             # PRIX COURANT
@@ -1252,6 +1368,10 @@ class Moteur2:
                     "status": "NO_CURRENT_PRICE",
                     "symbol": normalized,
                     "candles": candles,
+                    "missing_primary_timeframes": [],
+                    "missing_confirmation_timeframes": (
+                        missing_confirmation_timeframes
+                    ),
                     "auto_execution": False,
                 }
 
@@ -1339,24 +1459,18 @@ class Moteur2:
                 Dict[str, Any]
             ] = []
 
-            # IMPORTANT :
-            #
-            # Ancien comportement :
-            #
-            #     if READY:
-            #         append()
-            #         break
-            #
-            # Cela empêchait le moteur de détecter plusieurs opportunités
-            # valides sur le même symbole.
-            #
-            # NOUVEAU :
+            # Aucun break.
             #
             # Toutes les opportunités sont examinées.
             #
-            # Aucun quota.
+            # Il peut y avoir :
             #
-            # Aucun break après le premier signal.
+            #   0 signal
+            #   1 signal
+            #   2 signaux
+            #   plusieurs signaux
+            #
+            # selon ce que le marché présente réellement.
 
             for setup in setups:
 
@@ -1395,9 +1509,7 @@ class Moteur2:
                 if processed is None:
                     continue
 
-                results.append(
-                    processed
-                )
+                results.append(processed)
 
                 processed_status = str(
                     processed.get(
@@ -1439,12 +1551,6 @@ class Moteur2:
             # =================================================================
             # TRI DES SIGNAUX
             # =================================================================
-            #
-            # Tous les signaux sont conservés.
-            #
-            # On les classe simplement du plus convaincant au moins
-            # convaincant pour faciliter leur traitement par Telegram.
-            #
 
             ready_signals.sort(
                 key=lambda item: float(
@@ -1474,7 +1580,7 @@ class Moteur2:
                 overall_status = "NO_SIGNAL"
 
             # =================================================================
-            # RESULTAT FINAL
+            # RÉSULTAT FINAL
             # =================================================================
 
             result = {
@@ -1510,6 +1616,14 @@ class Moteur2:
                     rejected_setups
                 ),
 
+                "missing_primary_timeframes": (
+                    missing_primary_timeframes
+                ),
+
+                "missing_confirmation_timeframes": (
+                    missing_confirmation_timeframes
+                ),
+
                 "auto_execution": False,
 
                 "decision_engine": {
@@ -1520,6 +1634,18 @@ class Moteur2:
                     "m1_blocking": False,
                     "signal_quota": None,
                     "forced_signal": False,
+                },
+
+                "safety_guard": {
+                    "enabled": True,
+                    "purpose": (
+                        "technical_safety_only"
+                    ),
+                    "strategic_decision": False,
+                    "score_decides": False,
+                    "rr_decides": False,
+                    "m5_decides": False,
+                    "m1_decides": False,
                 },
             }
 
@@ -1556,10 +1682,10 @@ class Moteur2:
 
             try:
 
-                results[
-                    symbol
-                ] = await self.analyser_symbole(
-                    symbol
+                results[symbol] = (
+                    await self.analyser_symbole(
+                        symbol
+                    )
                 )
 
             except asyncio.CancelledError:
@@ -1573,9 +1699,7 @@ class Moteur2:
                     exc,
                 )
 
-                results[
-                    symbol
-                ] = {
+                results[symbol] = {
                     "status": "ERROR",
                     "symbol": symbol,
                     "error": str(exc),
@@ -1715,9 +1839,7 @@ class Moteur2:
 
                 result = stop_method()
 
-                if inspect.isawaitable(
-                    result
-                ):
+                if inspect.isawaitable(result):
                     await result
 
         except Exception as exc:
@@ -1763,9 +1885,7 @@ class Moteur2:
 
                 result = close_method()
 
-                if inspect.isawaitable(
-                    result
-                ):
+                if inspect.isawaitable(result):
                     await result
 
         except Exception as exc:
@@ -1876,6 +1996,8 @@ class Moteur2:
             "final_validation_owner": (
                 "moteur2_validation.py"
             ),
+
+            "safety_guard_enabled": True,
 
             "antispam_after_decision": True,
 
