@@ -1,105 +1,47 @@
 """
-NOVA TRADE AI - MOTEUR 2
-
-Orchestrateur principal du moteur déterministe multi-actifs.
-
-Actifs :
-    XAUUSD
-    BTCUSD
-    EURUSD
-    GBPUSD
-
-Timeframes :
-    H4
-    H1
-    M15
-    M5
-    M1
-
+NOVA TRADE AI — ENGINE 2
+moteur2.py
+Orchestrateur principal du moteur 2.
 Pipeline :
-    BiQuote
-        ↓
-    Moteur2Cache
-        ↓
-    Cartographie marché
-        ↓
-    Zones importantes
-        ↓
-    Contexte
-        ↓
-    Confluences
-        ↓
-    Setup
-        ↓
-    Risk
-        ↓
-    Confirmation M5 / M1
-        ↓
-    Score
-        ↓
-    Validation finale
-        ↓
-    Anti-spam
-        ↓
-    Signal
-
-RÈGLES :
-    - BiQuote est la seule source de données.
-    - Le moteur fonctionne indépendamment par symbole.
-    - Aucun symbole ne sert de fallback à un autre.
-    - H4 / H1 / M15 constituent le contexte principal.
-    - M5 est la confirmation principale.
-    - M1 est secondaire.
-    - RR minimum = 3.0.
-    - TP1 est obligatoire.
-    - TP2 / TP3 sont facultatifs.
-    - Score minimum = 60.
-    - READY_FOR_SIGNAL est produit uniquement par
-      moteur2_validation.py.
-    - L'anti-spam intervient uniquement après READY_FOR_SIGNAL.
-    - Aucun signal n'est exécuté automatiquement.
-    - Les superviseurs news/session restent informatifs.
-    - Le tracker reste observation-only.
+BiQuote → Stream/Cache → Cartographie → Zones → Contexte →
+Confluences → Setups → Risk → Confirmation M5/M1 →
+Score → Validation → Anti-spam → Signal.
+Règles :
+- XAUUSD / BTCUSD / EURUSD / GBPUSD
+- H4 → H1 → M15 → M5 → M1
+- RR minimum 1:3
+- Score minimum 60
+- M5 = confirmation principale
+- M1 = confirmation secondaire
+- READY_FOR_SIGNAL appartient exclusivement à moteur2_validation.py
+- News / sessions / tracker : informatifs uniquement
+- Auto-exécution désactivée
 """
-
 from __future__ import annotations
-
 import asyncio
-import copy
+import inspect
 import logging
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-
 from biquote_client import BiQuoteClient
 from biquote_stream import BiQuoteStream
-
-from moteur2_antispam import Moteur2AntiSpam
 from moteur2_cache import Moteur2Cache
-from moteur2_confirmation import Moteur2Confirmation
-from moteur2_confluences import Moteur2Confluences
-from moteur2_contexte import Moteur2Contexte
 from moteur2_marche import Moteur2Marche
-from moteur2_risk import Moteur2Risk
-from moteur2_score import Moteur2Score
-from moteur2_setups import Moteur2Setups
-from moteur2_validation import Moteur2Validation
 from moteur2_zones import Moteur2Zones
-
-
-logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
+from moteur2_contexte import Moteur2Contexte
+from moteur2_confluences import Moteur2Confluences
+from moteur2_setups import Moteur2Setups
+from moteur2_risk import Moteur2Risk
+from moteur2_confirmation import Moteur2Confirmation
+from moteur2_score import Moteur2Score
+from moteur2_validation import Moteur2Validation
+from moteur2_antispam import Moteur2AntiSpam
+logger = logging.getLogger("NOVA_ENGINE_2")
 SUPPORTED_SYMBOLS = (
     "XAUUSD",
     "BTCUSD",
     "EURUSD",
     "GBPUSD",
 )
-
 TIMEFRAMES = (
     "H4",
     "H1",
@@ -107,1755 +49,791 @@ TIMEFRAMES = (
     "M5",
     "M1",
 )
-
-REQUIRED_TIMEFRAMES = TIMEFRAMES
-
+PRIMARY_TIMEFRAMES = (
+    "H4",
+    "H1",
+    "M15",
+)
+CONFIRMATION_TIMEFRAMES = (
+    "M5",
+    "M1",
+)
+ENGINE_NAME = "NOVA TRADE AI - ENGINE 2"
 CANDLE_LIMIT = 300
-
 SCAN_INTERVAL_SECONDS = 60
-
 MINIMUM_RR = 3.0
-
 MINIMUM_SCORE = 60.0
-
-READY_FOR_SIGNAL = "READY_FOR_SIGNAL"
-
-
-# ============================================================================
-# MOTEUR 2
-# ============================================================================
-
-
+def _normalize_symbol(symbol: Any) -> str:
+    """
+    Normalise un symbole sans jamais appliquer de fallback
+    automatique vers XAUUSD.
+    """
+    value = str(symbol or "").strip().upper().replace("/", "")
+    aliases = {
+        "GOLD": "XAUUSD",
+        "XAU/USD": "XAUUSD",
+        "BTC/USD": "BTCUSD",
+        "EUR/USD": "EURUSD",
+        "GBP/USD": "GBPUSD",
+    }
+    return aliases.get(value, value)
 class Moteur2:
     """
-    Orchestrateur principal du Moteur 2.
-
-    Le moteur :
-
-        - collecte les données BiQuote via le cache ;
-        - reçoit les prix temps réel via SignalR ;
-        - construit l'analyse ;
-        - détecte les setups ;
-        - construit le RiskPlan ;
-        - analyse M5/M1 ;
-        - calcule le score ;
-        - demande la validation finale ;
-        - passe dans l'anti-spam uniquement si READY ;
-        - construit le signal interne.
-
-    Le moteur ne réalise aucune exécution automatique.
+    Orchestrateur principal du moteur 2.
     """
-
-    SYMBOLS = SUPPORTED_SYMBOLS
-
     def __init__(
         self,
-        symbols: Optional[List[str]] = None,
+        symbols: Optional[List[str] | tuple[str, ...]] = None,
     ) -> None:
-
-        self.logger = logger
-
-        # ====================================================================
-        # SYMBOLES
-        # ====================================================================
-
-        requested_symbols = (
-            symbols
-            if symbols is not None
-            else list(SUPPORTED_SYMBOLS)
+        raw_symbols = symbols or SUPPORTED_SYMBOLS
+        normalized_symbols = tuple(
+            _normalize_symbol(symbol)
+            for symbol in raw_symbols
         )
-
-        normalized_symbols: List[str] = []
-
-        for symbol in requested_symbols:
-
-            normalized = self._normalize_symbol(
-                symbol
+        invalid_symbols = [
+            symbol
+            for symbol in normalized_symbols
+            if symbol not in SUPPORTED_SYMBOLS
+        ]
+        if invalid_symbols:
+            raise ValueError(
+                f"Symboles non supportés : {invalid_symbols}"
             )
-
-            if (
-                normalized
-                and normalized not in normalized_symbols
-            ):
-                normalized_symbols.append(
-                    normalized
-                )
-
-        if not normalized_symbols:
-            normalized_symbols = list(
-                SUPPORTED_SYMBOLS
+        self.symbols = tuple(dict.fromkeys(normalized_symbols))
+        if not self.symbols:
+            raise ValueError(
+                "Le moteur 2 doit avoir au moins un symbole."
             )
-
-        self.symbols = tuple(
-            normalized_symbols
-        )
-
-        # ====================================================================
-        # BIQUOTE
-        #
-        # Une seule instance de BiQuoteClient est partagée
-        # avec le cache.
-        # ====================================================================
-
+        # ============================================================
+        # DATA PROVIDER
+        # ============================================================
+        # UN SEUL client REST partagé par le moteur et le cache.
         self.biquote = BiQuoteClient()
-
-        # ====================================================================
+        # ============================================================
         # CACHE
-        #
-        # Le cache utilise le même client BiQuote.
-        # Les bougies et les ticks restent donc centralisés
-        # dans la même couche de données.
-        # ====================================================================
-
+        # ============================================================
+        # Le cache reçoit exactement le même client BiQuote.
         self.cache = Moteur2Cache(
             client=self.biquote,
             symbols=self.symbols,
         )
-
-        # ====================================================================
-        # STREAM
-        # ====================================================================
-
+        # ============================================================
+        # STREAM TEMPS RÉEL
+        # ============================================================
         self.stream = BiQuoteStream(
             symbols=self.symbols,
             on_tick=self._handle_tick,
         )
-
-        # ====================================================================
-        # MODULES
-        # ====================================================================
-
+        # ============================================================
+        # MODULES MOTEUR 2
+        # ============================================================
         self.marche = Moteur2Marche()
-
         self.zones = Moteur2Zones()
-
         self.contexte = Moteur2Contexte()
-
         self.confluences = Moteur2Confluences()
-
         self.setups = Moteur2Setups()
-
         self.risk = Moteur2Risk(
             min_rr=MINIMUM_RR,
         )
-
         self.confirmation = Moteur2Confirmation()
-
         self.score = Moteur2Score(
             minimum_rr=MINIMUM_RR,
         )
-
-        self.validation = Moteur2Validation()
-
-        self.antispam = Moteur2AntiSpam()
-
-        # ====================================================================
-        # ÉTAT
-        # ====================================================================
-
-        self.running = False
-
-        self.last_error: Optional[str] = None
-
-        self.last_analysis: Dict[
-            str,
-            Dict[str, Any],
-        ] = {}
-
-        self.last_signal: Dict[
-            str,
-            Optional[Dict[str, Any]],
-        ] = {
-            symbol: None
-            for symbol in self.symbols
-        }
-
-        self.current_prices: Dict[
-            str,
-            Optional[float],
-        ] = {
-            symbol: None
-            for symbol in self.symbols
-        }
-
-        self.symbol_errors: Dict[
-            str,
-            Optional[str],
-        ] = {
-            symbol: None
-            for symbol in self.symbols
-        }
-
-        self.analysis_lock = asyncio.Lock()
-
-        self.stream_task: Optional[
-            asyncio.Task
-        ] = None
-
-    # ========================================================================
-    # UTILITAIRES
-    # ========================================================================
-
-    @staticmethod
-    def _normalize_symbol(
-        symbol: Any,
-    ) -> Optional[str]:
-
-        if symbol is None:
-            return None
-
-        value = (
-            str(symbol)
-            .upper()
-            .strip()
-            .replace("/", "")
-            .replace("-", "")
-            .replace("_", "")
-            .replace(" ", "")
+        self.validation = Moteur2Validation(
+            min_rr=MINIMUM_RR,
         )
-
-        if value in SUPPORTED_SYMBOLS:
-            return value
-
-        return None
-
-    @staticmethod
-    def _now() -> str:
-
-        return datetime.now(
-            timezone.utc
-        ).isoformat()
-
-    @staticmethod
-    def _safe_float(
-        value: Any,
-    ) -> Optional[float]:
-
-        try:
-
-            if value is None:
-                return None
-
-            return float(value)
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            return None
-
+        self.antispam = Moteur2AntiSpam()
+        # ============================================================
+        # ÉTAT
+        # ============================================================
+        self.running = False
+        self.current_prices: Dict[str, float] = {}
+        self.last_analysis: Dict[str, Dict[str, Any]] = {}
+        self.last_signal: Dict[str, Dict[str, Any]] = {}
+        self._stream_task: Optional[asyncio.Task] = None
+        # Évite deux analyses simultanées du même moteur.
+        self.analysis_lock = asyncio.Lock()
+    # ================================================================
+    # OUTILS
+    # ================================================================
     @staticmethod
     def _get(
-        obj: Any,
+        data: Any,
         key: str,
         default: Any = None,
     ) -> Any:
-
-        if obj is None:
+        if data is None:
             return default
-
-        if isinstance(obj, dict):
-
-            return obj.get(
-                key,
-                default,
-            )
-
-        return getattr(
-            obj,
-            key,
-            default,
-        )
-
-    # ========================================================================
-    # PRÉPARATION DU SETUP
-    # ========================================================================
-
-    def _prepare_setup(
-        self,
-        setup: Any,
-        symbol: str,
+        if isinstance(data, dict):
+            return data.get(key, default)
+        return getattr(data, key, default)
+    @staticmethod
+    async def _call(
+        function: Any,
+        *args: Any,
+        **kwargs: Any,
     ) -> Any:
-
         """
-        Garantit que le setup traité par Risk,
-        Confirmation, Score, Validation et Anti-spam
-        porte le symbole réellement analysé.
-
-        Cette méthode ne modifie pas la logique de détection
-        du module moteur2_setups.py.
+        Appelle une fonction sync ou async.
         """
-
-        if isinstance(
-            setup,
-            dict,
-        ):
-
-            prepared = dict(
-                setup
-            )
-
-            prepared["symbol"] = symbol
-
-            return prepared
-
-        try:
-
-            prepared = copy.copy(
-                setup
-            )
-
-            setattr(
-                prepared,
-                "symbol",
-                symbol,
-            )
-
-            return prepared
-
-        except Exception:
-
-            return {
-                "setup_id": self._get(
-                    setup,
-                    "setup_id",
-                    self._get(
-                        setup,
-                        "id",
-                        "SETUP",
-                    ),
-                ),
-                "zone_id": self._get(
-                    setup,
-                    "zone_id",
-                    "",
-                ),
-                "setup_type": self._get(
-                    setup,
-                    "setup_type",
-                    self._get(
-                        setup,
-                        "type",
-                        "UNKNOWN",
-                    ),
-                ),
-                "direction": self._get(
-                    setup,
-                    "direction",
-                    self._get(
-                        setup,
-                        "bias",
-                        "",
-                    ),
-                ),
-                "zone_price": self._get(
-                    setup,
-                    "zone_price",
-                    0.0,
-                ),
-                "timeframe": self._get(
-                    setup,
-                    "timeframe",
-                    "M15",
-                ),
-                "confidence": self._get(
-                    setup,
-                    "confidence",
-                    0.0,
-                ),
-                "context": self._get(
-                    setup,
-                    "context",
-                    "",
-                ),
-                "reason": self._get(
-                    setup,
-                    "reason",
-                    "",
-                ),
-                "entry_ready": self._get(
-                    setup,
-                    "entry_ready",
-                    False,
-                ),
-                "waiting_for_confirmation": self._get(
-                    setup,
-                    "waiting_for_confirmation",
-                    True,
-                ),
-                "supporting_confluences": self._get(
-                    setup,
-                    "supporting_confluences",
-                    [],
-                ),
-                "opposing_confluences": self._get(
-                    setup,
-                    "opposing_confluences",
-                    [],
-                ),
-                "symbol": symbol,
-            }
-
-    # ========================================================================
-    # PRIX
-    # ========================================================================
-
-    def _extract_price(
-        self,
-        tick: Any,
-    ) -> Optional[float]:
-
+        result = function(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    @staticmethod
+    def _extract_price(tick: Any) -> Optional[float]:
         if tick is None:
             return None
-
-        keys = (
+        for key in (
             "mid",
             "price",
             "last",
-            "close",
-        )
-
-        if isinstance(
-            tick,
-            dict,
+            "bid",
+            "ask",
         ):
-
-            for key in keys:
-
-                value = self._safe_float(
-                    tick.get(key)
-                )
-
-                if value is not None:
-                    return value
-
-            bid = self._safe_float(
-                tick.get("bid")
-            )
-
-            ask = self._safe_float(
-                tick.get("ask")
-            )
-
-            if (
-                bid is not None
-                and ask is not None
-            ):
-
-                return (
-                    bid + ask
-                ) / 2.0
-
-            return None
-
-        for key in keys:
-
-            value = self._safe_float(
-                getattr(
-                    tick,
-                    key,
-                    None,
-                )
-            )
-
-            if value is not None:
-                return value
-
-        bid = self._safe_float(
-            getattr(
-                tick,
-                "bid",
-                None,
-            )
-        )
-
-        ask = self._safe_float(
-            getattr(
-                tick,
-                "ask",
-                None,
-            )
-        )
-
-        if (
-            bid is not None
-            and ask is not None
-        ):
-
-            return (
-                bid + ask
-            ) / 2.0
-
+            value = Moteur2._get(tick, key)
+            if value is None:
+                continue
+            try:
+                price = float(value)
+                if price > 0:
+                    return price
+            except (TypeError, ValueError):
+                continue
         return None
-
-    # ========================================================================
-    # SYMBOLE DU TICK
-    # ========================================================================
-
-    def _extract_tick_symbol(
-        self,
-        tick: Any,
-    ) -> Optional[str]:
-
-        for key in (
-            "symbol",
-            "ticker",
-            "instrument",
-            "pair",
-        ):
-
-            value = self._get(
-                tick,
-                key,
-                None,
-            )
-
-            normalized = self._normalize_symbol(
-                value
-            )
-
-            if normalized:
-                return normalized
-
-        return None
-
-    # ========================================================================
-    # TICK → CACHE
-    # ========================================================================
-
+    # ================================================================
+    # TICK TEMPS RÉEL
+    # ================================================================
     async def _handle_tick(
         self,
         tick: Any,
     ) -> None:
-
+        """
+        Réception d'un tick BiQuote.
+        Aucun calcul de signal n'est effectué ici.
+        Le tick est simplement transmis au cache et à l'état courant.
+        """
+        symbol = _normalize_symbol(
+            self._get(tick, "symbol")
+        )
+        if symbol not in self.symbols:
+            return
+        price = self._extract_price(tick)
+        if price is not None:
+            self.current_prices[symbol] = price
         try:
-
-            symbol = self._extract_tick_symbol(
-                tick
+            result = self.cache.update_tick(tick)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning(
+                "Erreur mise à jour tick cache %s : %s",
+                symbol,
+                exc,
             )
-
-            if symbol is None:
-                return
-
-            price = self._extract_price(
-                tick
-            )
-
-            if price is None:
-                return
-
-            self.current_prices[
-                symbol
-            ] = price
-
-            try:
-
-                self.cache.update_tick(
-                    tick
-                )
-
-            except Exception:
-
-                self.logger.debug(
-                    "Impossible de mettre à jour "
-                    "le cache tick pour %s.",
-                    symbol,
-                    exc_info=True,
-                )
-
-        except Exception:
-
-            self.logger.exception(
-                "Erreur traitement tick BiQuote."
-            )
-
-    # ========================================================================
+    # ================================================================
     # PRIX COURANT
-    # ========================================================================
-
-    async def _get_current_price(
+    # ================================================================
+    def _get_current_price(
         self,
         symbol: str,
     ) -> Optional[float]:
-
-        normalized = self._normalize_symbol(
-            symbol
-        )
-
-        if normalized is None:
-            return None
-
-        # --------------------------------------------------------------------
-        # 1. STREAM
-        # --------------------------------------------------------------------
-
+        normalized = _normalize_symbol(symbol)
+        # 1. Stream temps réel
         try:
-
-            tick = self.stream.get_latest_tick(
-                normalized
-            )
-
-            price = self._extract_price(
-                tick
-            )
-
+            tick = self.stream.get_latest_tick(normalized)
+            price = self._extract_price(tick)
             if price is not None:
-
-                self.current_prices[
-                    normalized
-                ] = price
-
                 return price
-
         except Exception:
-
-            self.logger.debug(
-                "Prix stream indisponible pour %s.",
-                normalized,
-                exc_info=True,
-            )
-
-        # --------------------------------------------------------------------
-        # 2. CACHE
-        # --------------------------------------------------------------------
-
+            pass
+        # 2. Cache
         try:
-
-            price = self._safe_float(
-                self.cache.get_current_price(
-                    normalized
+            price = self.cache.get_current_price(normalized)
+            if price is not None:
+                return float(price)
+        except Exception:
+            pass
+        # 3. Dernier prix connu
+        return self.current_prices.get(normalized)
+    # ================================================================
+    # CHANDELIERS
+    # ================================================================
+    async def _refresh_symbol_cache(
+        self,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        """
+        Rafraîchit les cinq timeframes via le cache centralisé.
+        Aucun appel direct à BiQuoteClient.get_candles() ici.
+        """
+        normalized = _normalize_symbol(symbol)
+        result = await asyncio.to_thread(
+            self.cache.refresh_symbol,
+            normalized,
+            False,
+        )
+        return result or {}
+    def _get_cached_candles(
+        self,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        normalized = _normalize_symbol(symbol)
+        candles_by_timeframe: Dict[str, Any] = {}
+        for timeframe in TIMEFRAMES:
+            try:
+                candles = self.cache.get_closed_candles(
+                    normalized,
+                    timeframe,
                 )
-            )
-
-            if price is not None:
-
-                self.current_prices[
-                    normalized
-                ] = price
-
-                return price
-
-        except Exception:
-
-            self.logger.debug(
-                "Prix cache indisponible pour %s.",
-                normalized,
-                exc_info=True,
-            )
-
-        # --------------------------------------------------------------------
-        # 3. DERNIER PRIX CONNU
-        # --------------------------------------------------------------------
-
-        return self.current_prices.get(
-            normalized
-        )
-
-    # ========================================================================
-    # DONNÉES OHLC
-    # ========================================================================
-
+            except TypeError:
+                # Compatibilité avec une éventuelle implémentation
+                # exposant uniquement get_candles().
+                candles = self.cache.get_candles(
+                    normalized,
+                    timeframe,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Erreur lecture cache %s %s : %s",
+                    normalized,
+                    timeframe,
+                    exc,
+                )
+                candles = None
+            if candles:
+                candles_by_timeframe[timeframe] = candles
+        return candles_by_timeframe
     async def _get_candles(
         self,
         symbol: str,
-    ) -> Dict[str, List[Any]]:
-
-        """
-        Récupère les bougies via Moteur2Cache.
-
-        Architecture :
-
-            BiQuote REST
-                 ↓
-            Moteur2Cache
-                 ↓
-            H4/H1/M15/M5/M1
-                 ↓
-            Moteur 2
-
-        Le cache décide si un rafraîchissement réseau
-        est nécessaire selon la fraîcheur du timeframe.
-
-        Aucun tick temps réel n'est transformé en bougie.
-        """
-
-        normalized = self._normalize_symbol(
-            symbol
-        )
-
-        if normalized is None:
-
-            raise ValueError(
-                f"Symbole non supporté : {symbol}"
-            )
-
-        # --------------------------------------------------------------------
-        # Rafraîchissement du symbole.
-        #
-        # Le cache gère lui-même :
-        # - la fraîcheur ;
-        # - les locks ;
-        # - les appels BiQuote ;
-        # - les anciennes données en cas d'erreur temporaire.
-        # --------------------------------------------------------------------
-
-        data = await self.cache.refresh_symbol(
-            normalized,
-            force=False,
-        )
-
-        # --------------------------------------------------------------------
-        # Vérification stricte des timeframes.
-        # --------------------------------------------------------------------
-
-        missing = [
-            timeframe
-            for timeframe in REQUIRED_TIMEFRAMES
-            if (
-                timeframe not in data
-                or not data[timeframe]
-            )
-        ]
-
-        if missing:
-
-            raise RuntimeError(
-                "Timeframes manquants pour "
-                f"{normalized} : "
-                + ", ".join(missing)
-            )
-
-        # --------------------------------------------------------------------
-        # Protection supplémentaire :
-        # seules les bougies clôturées sont transmises
-        # aux modules d'analyse.
-        # --------------------------------------------------------------------
-
-        output: Dict[
-            str,
-            List[Any],
-        ] = {}
-
-        for timeframe in TIMEFRAMES:
-
-            candles = [
-                candle
-                for candle in data[timeframe]
-                if not bool(
-                    getattr(
-                        candle,
-                        "is_open",
-                        False,
-                    )
-                )
-            ]
-
-            if not candles:
-
-                raise RuntimeError(
-                    f"Aucune bougie clôturée "
-                    f"{timeframe} pour {normalized}"
-                )
-
-            output[timeframe] = candles
-
-        return output
-
-    # ========================================================================
-    # EXTRACTION DES SETUPS
-    # ========================================================================
-
+    ) -> Dict[str, Any]:
+        normalized = _normalize_symbol(symbol)
+        await self._refresh_symbol_cache(normalized)
+        candles = self._get_cached_candles(normalized)
+        return candles
+    # ================================================================
+    # SETUPS
+    # ================================================================
     @staticmethod
     def _extract_setups(
         setups_result: Any,
     ) -> List[Any]:
-
         if setups_result is None:
             return []
-
-        if isinstance(
-            setups_result,
-            list,
-        ):
-
-            return setups_result
-
-        if isinstance(
-            setups_result,
-            tuple,
-        ):
-
-            return list(
-                setups_result
-            )
-
-        if isinstance(
-            setups_result,
-            dict,
-        ):
-
-            setups = setups_result.get(
-                "setups"
-            )
-
-            if isinstance(
-                setups,
-                list,
+        if isinstance(setups_result, dict):
+            for key in (
+                "setups",
+                "results",
+                "candidates",
+                "items",
             ):
-
-                return setups
-
-        return []
-
-    # ========================================================================
-    # CONSTRUCTION SIGNAL
-    # ========================================================================
-
-    def _build_signal(
-        self,
-        symbol: str,
-        setup: Any,
-        risk_plan: Any,
-        confirmation: Any,
-        score_result: Any,
-        validation_result: Any,
-        antispam_result: Any,
-    ) -> Dict[str, Any]:
-
-        validation_metadata = (
-            self._get(
-                validation_result,
-                "metadata",
-                {},
-            )
-            or {}
-        )
-
-        return {
-            "engine": "MOTEUR_2",
-            "symbol": symbol,
-            "setup": setup,
-            "risk": risk_plan,
-            "confirmation": confirmation,
-            "score": score_result,
-            "validation": validation_result,
-            "antispam": antispam_result,
-            "status": READY_FOR_SIGNAL,
-            "auto_execution": False,
-            "timestamp": self._now(),
-            "metadata": {
-                "final_validation_owner": (
-                    "moteur2_validation.py"
-                ),
-                "validation_metadata": (
-                    validation_metadata
-                ),
-                "minimum_rr": MINIMUM_RR,
-                "minimum_score": MINIMUM_SCORE,
-                "m5_primary": True,
-                "m1_secondary": True,
-            },
-        }
-
-    # ========================================================================
+                value = setups_result.get(key)
+                if isinstance(value, list):
+                    return value
+            return [setups_result]
+        if isinstance(setups_result, (list, tuple)):
+            return list(setups_result)
+        return [setups_result]
+    # ================================================================
     # TRAITEMENT D'UN SETUP
-    # ========================================================================
-
+    # ================================================================
     async def traiter_setup(
         self,
-        symbol: str,
         setup: Any,
-        zones_result: Dict[str, Any],
-        contexte_result: Dict[str, Any],
-        confluences_result: Dict[str, Any],
-        donnees: Dict[str, List[Any]],
+        *,
+        symbol: str,
+        candles: Dict[str, Any],
+        zones_result: Any,
+        context_result: Any,
+        confluences_result: Any,
         current_price: Optional[float],
-    ) -> Dict[str, Any]:
-
-        prepared_setup = self._prepare_setup(
-            setup,
-            symbol,
-        )
-
-        result: Dict[str, Any] = {
-            "symbol": symbol,
-            "setup": prepared_setup,
-            "risk": None,
-            "confirmation": None,
-            "score": None,
-            "validation": None,
-            "antispam": None,
-            "signal": None,
-            "status": "REJECTED",
-        }
-
-        # ====================================================================
+    ) -> Optional[Dict[str, Any]]:
+        normalized = _normalize_symbol(symbol)
+        # ------------------------------------------------------------
         # RISK
-        # ====================================================================
-
-        try:
-
-            risk_plan = self.risk.analyser_setup(
-                setup=prepared_setup,
-                zones=zones_result,
-                candles=donnees,
-                current_price=current_price,
-                symbol=symbol,
-            )
-
-        except Exception as exc:
-
-            self.logger.exception(
-                "Erreur Risk %s.",
-                symbol,
-            )
-
-            result["reason"] = (
-                f"RISK_ERROR: {exc}"
-            )
-
-            return result
-
-        result["risk"] = risk_plan
-
-        if risk_plan is None:
-
-            result["reason"] = (
-                "RiskPlan indisponible."
-            )
-
-            return result
-
-        if self._get(
-            risk_plan,
-            "valid",
-            False,
-        ) is False:
-
-            result["reason"] = self._get(
-                risk_plan,
-                "reason",
-                "RiskPlan invalide.",
-            )
-
-            return result
-
-        # ====================================================================
-        # CONFIRMATION
-        # ====================================================================
-
-        try:
-
-            confirmation_result = (
-                self.confirmation.analyser(
-                    prepared_setup,
-                    donnees,
-                    risk_plan,
-                    symbol=symbol,
-                )
-            )
-
-        except Exception as exc:
-
-            self.logger.exception(
-                "Erreur Confirmation %s.",
-                symbol,
-            )
-
-            result["reason"] = (
-                f"CONFIRMATION_ERROR: {exc}"
-            )
-
-            return result
-
-        result["confirmation"] = (
-            confirmation_result
+        # ------------------------------------------------------------
+        risk_plan = self.risk.analyser_setup(
+            setup=setup,
+            zones=zones_result,
+            candles=candles,
+            current_price=current_price,
+            symbol=normalized,
         )
-
-        # ====================================================================
+        # ------------------------------------------------------------
+        # CONFIRMATION M5 / M1
+        # ------------------------------------------------------------
+        confirmation_result = self.confirmation.analyser(
+            setup=setup,
+            candles=candles,
+            risk_plan=risk_plan,
+            symbol=normalized,
+        )
+        # ------------------------------------------------------------
         # SCORE
-        # ====================================================================
-
-        try:
-
-            score_result = self.score.analyser(
-                prepared_setup,
-                zones=zones_result,
-                context=contexte_result,
-                confluences=confluences_result,
-                confirmation=confirmation_result,
-                risk_plan=risk_plan,
-                symbol=symbol,
-            )
-
-        except Exception as exc:
-
-            self.logger.exception(
-                "Erreur Score %s.",
-                symbol,
-            )
-
-            result["reason"] = (
-                f"SCORE_ERROR: {exc}"
-            )
-
-            return result
-
-        result["score"] = score_result
-
-        # ====================================================================
-        # VALIDATION FINALE
-        # ====================================================================
-
-        try:
-
-            validation_result = (
-                self.validation.analyser(
-                    setup=prepared_setup,
-                    risk_plan=risk_plan,
-                    confirmation=confirmation_result,
-                    score_result=score_result,
-                    context=contexte_result,
-                    confluences=confluences_result,
-                )
-            )
-
-        except Exception as exc:
-
-            self.logger.exception(
-                "Erreur Validation %s.",
-                symbol,
-            )
-
-            result["reason"] = (
-                f"VALIDATION_ERROR: {exc}"
-            )
-
-            return result
-
-        result["validation"] = (
-            validation_result
+        # ------------------------------------------------------------
+        score_result = self.score.analyser(
+            setup=setup,
+            zones=zones_result,
+            context=context_result,
+            confluences=confluences_result,
+            confirmation=confirmation_result,
+            risk_plan=risk_plan,
+            symbol=normalized,
         )
-
+        # ------------------------------------------------------------
+        # VALIDATION FINALE
+        # ------------------------------------------------------------
+        validation_result = self.validation.valider(
+            setup=setup,
+            risk_plan=risk_plan,
+            confirmation=confirmation_result,
+            score_result=score_result,
+            contexte=context_result,
+            confluences=confluences_result,
+        )
         validation_status = str(
             self._get(
                 validation_result,
                 "status",
-                "REJECTED",
+                "",
             )
-        ).strip().upper()
-
-        result["status"] = (
-            validation_status
-        )
-
-        # ====================================================================
-        # READY UNIQUEMENT
-        # ====================================================================
-
-        if validation_status != READY_FOR_SIGNAL:
-
-            result["reason"] = self._get(
-                validation_result,
-                "reason",
-                "Validation non prête.",
-            )
-
-            return result
-
+        ).upper()
         validation_valid = bool(
             self._get(
                 validation_result,
                 "valid",
-                False,
+                self._get(
+                    validation_result,
+                    "validated",
+                    False,
+                ),
             )
         )
-
-        if not validation_valid:
-
-            result["status"] = "REJECTED"
-
-            result["reason"] = (
-                "READY_FOR_SIGNAL reçu "
-                "sans validation.valid=True."
-            )
-
-            return result
-
-        # ====================================================================
-        # ANTISPAM
-        # ====================================================================
-
+        # ------------------------------------------------------------
+        # SCORE FINAL
+        # ------------------------------------------------------------
+        score_value = self._get(
+            score_result,
+            "score",
+            0.0,
+        )
         try:
-
-            antispam_result = (
-                self.antispam.verifier(
-                    setup=prepared_setup,
-                    risk_plan=risk_plan,
-                    validation=validation_result,
-                )
+            score_value = float(score_value or 0.0)
+        except (TypeError, ValueError):
+            score_value = 0.0
+        if score_value < MINIMUM_SCORE:
+            return {
+                "status": "REJECTED_SCORE",
+                "symbol": normalized,
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation_result,
+                "score": score_result,
+                "validation": validation_result,
+            }
+        # ------------------------------------------------------------
+        # SEUL READY_FOR_SIGNAL PEUT PASSER À L'ANTI-SPAM
+        # ------------------------------------------------------------
+        if (
+            validation_status != "READY_FOR_SIGNAL"
+            or not validation_valid
+        ):
+            return {
+                "status": validation_status or "NOT_READY",
+                "symbol": normalized,
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation_result,
+                "score": score_result,
+                "validation": validation_result,
+            }
+        # ------------------------------------------------------------
+        # ANTI-SPAM
+        # ------------------------------------------------------------
+        setup_id = str(
+            self._get(
+                setup,
+                "setup_id",
+                self._get(
+                    setup,
+                    "id",
+                    "",
+                ),
             )
-
-        except Exception as exc:
-
-            self.logger.exception(
-                "Erreur Anti-spam %s.",
-                symbol,
-            )
-
-            result["reason"] = (
-                f"ANTISPAM_ERROR: {exc}"
-            )
-
-            return result
-
-        result["antispam"] = (
-            antispam_result
+            or ""
         )
-
-        allowed = bool(
+        direction = str(
+            self._get(
+                setup,
+                "direction",
+                "",
+            )
+        ).upper()
+        antispam_result = self.antispam.verifier(
+            symbol=normalized,
+            direction=direction,
+            setup=setup,
+            setup_id=setup_id or None,
+        )
+        antispam_allowed = bool(
             self._get(
                 antispam_result,
                 "allowed",
                 False,
             )
         )
-
-        if not allowed:
-
-            result["status"] = (
-                "ANTISPAM_BLOCKED"
-            )
-
-            result["reason"] = self._get(
-                antispam_result,
-                "reason",
-                "Signal bloqué par l'anti-spam.",
-            )
-
-            return result
-
-        # ====================================================================
-        # ENREGISTREMENT ANTISPAM
-        # ====================================================================
-
-        setup_id = self._get(
-            antispam_result,
-            "setup_id",
-            None,
+        if not antispam_allowed:
+            return {
+                "status": "ANTISPAM_REJECTED",
+                "symbol": normalized,
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation_result,
+                "score": score_result,
+                "validation": validation_result,
+                "antispam": antispam_result,
+            }
+        # ------------------------------------------------------------
+        # ENREGISTREMENT DU SIGNAL DÉJÀ VALIDÉ
+        # ------------------------------------------------------------
+        registered = self.antispam.enregistrer_signal(
+            symbol=normalized,
+            direction=direction,
+            setup=setup,
+            setup_id=setup_id or None,
         )
-
-        if not setup_id:
-
-            setup_id = (
-                self.antispam.generer_setup_id(
-                    prepared_setup,
-                    risk_plan,
-                )
-            )
-
-        try:
-
-            recorded_setup_id = (
-                self.antispam.enregistrer_signal(
-                    setup=prepared_setup,
-                    risk_plan=risk_plan,
-                    setup_id=setup_id,
-                    extra={
-                        "symbol": symbol,
-                        "validation_status": (
-                            validation_status
-                        ),
-                        "score": self._get(
-                            score_result,
-                            "score",
-                            None,
-                        ),
-                        "rr": self._get(
-                            risk_plan,
-                            "primary_rr",
-                            None,
-                        ),
-                    },
-                )
-            )
-
-            if recorded_setup_id is None:
-
-                result["status"] = (
-                    "ANTISPAM_REGISTRATION_FAILED"
-                )
-
-                result["reason"] = (
-                    "Le signal a été validé mais "
-                    "son enregistrement anti-spam "
-                    "a échoué."
-                )
-
-                return result
-
-        except Exception as exc:
-
-            self.logger.exception(
-                "Erreur enregistrement anti-spam %s.",
-                symbol,
-            )
-
-            result["status"] = (
-                "ANTISPAM_REGISTRATION_FAILED"
-            )
-
-            result["reason"] = (
-                f"ANTISPAM_REGISTRATION_ERROR: {exc}"
-            )
-
-            return result
-
-        # ====================================================================
-        # SIGNAL FINAL
-        # ====================================================================
-
-        signal_result = self._build_signal(
-            symbol=symbol,
-            setup=prepared_setup,
-            risk_plan=risk_plan,
-            confirmation=confirmation_result,
-            score_result=score_result,
-            validation_result=validation_result,
-            antispam_result=antispam_result,
-        )
-
-        result["signal"] = signal_result
-
-        result["status"] = (
-            READY_FOR_SIGNAL
-        )
-
-        return result
-
-    # ========================================================================
+        # ------------------------------------------------------------
+        # CONSTRUCTION DU SIGNAL FINAL
+        # ------------------------------------------------------------
+        signal = {
+            "status": "READY_FOR_SIGNAL",
+            "symbol": normalized,
+            "direction": direction,
+            "setup": setup,
+            "risk": risk_plan,
+            "confirmation": confirmation_result,
+            "score": score_result,
+            "validation": validation_result,
+            "antispam": antispam_result,
+            "registered": registered,
+            "auto_execution": False,
+        }
+        self.last_signal[normalized] = signal
+        return signal
+    # ================================================================
     # ANALYSE D'UN SYMBOLE
-    # ========================================================================
-
+    # ================================================================
     async def analyser_symbole(
         self,
         symbol: str,
     ) -> Dict[str, Any]:
-
-        normalized = self._normalize_symbol(
-            symbol
-        )
-
-        if normalized is None:
-
-            return {
-                "engine": "MOTEUR_2",
-                "symbol": symbol,
-                "status": "ERROR",
-                "error": "UNSUPPORTED_SYMBOL",
-                "timestamp": self._now(),
-            }
-
-        self.symbol_errors[
-            normalized
-        ] = None
-
-        try:
-
-            # ================================================================
-            # DONNÉES
-            # ================================================================
-
-            donnees = await self._get_candles(
-                normalized
+        normalized = _normalize_symbol(symbol)
+        if normalized not in self.symbols:
+            raise ValueError(
+                f"Symbole non configuré : {normalized}"
             )
-
-            missing = [
-                timeframe
-                for timeframe in REQUIRED_TIMEFRAMES
-                if (
-                    timeframe not in donnees
-                    or not donnees[timeframe]
-                )
-            ]
-
-            if missing:
-
-                raise RuntimeError(
-                    "Timeframes manquants : "
-                    + ", ".join(missing)
-                )
-
-            # ================================================================
-            # PRIX
-            # ================================================================
-
-            current_price = (
-                await self._get_current_price(
-                    normalized
-                )
-            )
-
-            # ================================================================
-            # CARTOGRAPHIE
-            # ================================================================
-
-            market_map = self.marche.analyser(
-                donnees,
-                symbol=normalized,
-            )
-
-            if not market_map:
-
-                raise RuntimeError(
-                    "Cartographie vide."
-                )
-
-            # ================================================================
-            # ZONES
-            # ================================================================
-
-            zones_result = self.zones.analyser(
-                market_map,
-                current_price=current_price,
-            )
-
-            # ================================================================
-            # CONTEXTE
-            # ================================================================
-
-            contexte_result = (
-                self.contexte.analyser(
-                    donnees,
-                    zones_result,
-                    symbol=normalized,
-                )
-            )
-
-            # ================================================================
-            # CONFLUENCES
-            # ================================================================
-
-            confluences_result = (
-                self.confluences.analyser(
-                    donnees,
-                    zones_result,
-                    contexte_result,
-                    market_map=market_map,
-                    symbol=normalized,
-                )
-            )
-
-            # ================================================================
-            # SETUPS
-            # ================================================================
-
-            setups_result = (
-                self.setups.analyser(
-                    zones_result=zones_result,
-                    confluences_result=confluences_result,
-                    context_result=contexte_result,
-                    candles_by_timeframe=donnees,
-                    symbol=normalized,
-                )
-            )
-
-            setups = self._extract_setups(
-                setups_result
-            )
-
-            # ================================================================
-            # TRAITEMENT
-            # ================================================================
-
-            processed: List[
-                Dict[str, Any]
-            ] = []
-
-            ready_signal: Optional[
-                Dict[str, Any]
-            ] = None
-
-            for setup in setups:
-
-                item = await self.traiter_setup(
-                    symbol=normalized,
-                    setup=setup,
-                    zones_result=zones_result,
-                    contexte_result=contexte_result,
-                    confluences_result=confluences_result,
-                    donnees=donnees,
-                    current_price=current_price,
-                )
-
-                processed.append(
-                    item
-                )
-
-                if (
-                    item.get("status")
-                    == READY_FOR_SIGNAL
-                ):
-
-                    ready_signal = item
-
-                    break
-
-            # ================================================================
-            # RESULTAT
-            # ================================================================
-
-            result = {
-                "engine": "MOTEUR_2",
-                "symbol": normalized,
-                "timestamp": self._now(),
-                "current_price": current_price,
-                "market_map": market_map,
-                "zones": zones_result,
-                "context": contexte_result,
-                "confluences": confluences_result,
-                "setups": setups,
-                "results": processed,
-                "signal": ready_signal,
-                "status": (
-                    READY_FOR_SIGNAL
-                    if ready_signal is not None
-                    else "NO_SIGNAL"
-                ),
-            }
-
-            self.last_analysis[
-                normalized
-            ] = result
-
-            if ready_signal is not None:
-
-                self.last_signal[
-                    normalized
-                ] = ready_signal
-
-            return result
-
-        except Exception as exc:
-
-            self.symbol_errors[
-                normalized
-            ] = str(exc)
-
-            self.last_error = str(
-                exc
-            )
-
-            self.logger.exception(
-                "Erreur analyse %s.",
+        async with self.analysis_lock:
+            logger.info(
+                "Analyse Engine 2 : %s",
                 normalized,
             )
-
-            result = {
-                "engine": "MOTEUR_2",
-                "symbol": normalized,
-                "timestamp": self._now(),
-                "status": "ERROR",
-                "error": str(exc),
-            }
-
-            self.last_analysis[
-                normalized
-            ] = result
-
-            return result
-
-    # ========================================================================
-    # ANALYSE TOUS LES ACTIFS
-    # ========================================================================
-
-    async def analyser_tous(
-        self,
-    ) -> Dict[str, Dict[str, Any]]:
-
-        results: Dict[
-            str,
-            Dict[str, Any],
-        ] = {}
-
-        for symbol in self.symbols:
-
-            results[symbol] = (
-                await self.analyser_symbole(
-                    symbol
+            # --------------------------------------------------------
+            # DONNÉES
+            # --------------------------------------------------------
+            candles = await self._get_candles(
+                normalized,
+            )
+            missing_timeframes = [
+                timeframe
+                for timeframe in TIMEFRAMES
+                if not candles.get(timeframe)
+            ]
+            if missing_timeframes:
+                result = {
+                    "status": "INSUFFICIENT_DATA",
+                    "symbol": normalized,
+                    "missing_timeframes": missing_timeframes,
+                    "candles": candles,
+                }
+                self.last_analysis[normalized] = result
+                return result
+            # --------------------------------------------------------
+            # PRIX
+            # --------------------------------------------------------
+            current_price = self._get_current_price(
+                normalized,
+            )
+            if current_price is None:
+                result = {
+                    "status": "NO_CURRENT_PRICE",
+                    "symbol": normalized,
+                    "candles": candles,
+                }
+                self.last_analysis[normalized] = result
+                return result
+            # --------------------------------------------------------
+            # CARTOGRAPHIE
+            # --------------------------------------------------------
+            cartographie = self.marche.analyser(
+                candles,
+                symbol=normalized,
+            )
+            # --------------------------------------------------------
+            # ZONES
+            # --------------------------------------------------------
+            zones_result = self.zones.analyser(
+                cartographie,
+                current_price=current_price,
+            )
+            # --------------------------------------------------------
+            # CONTEXTE
+            # --------------------------------------------------------
+            context_result = self.contexte.analyser(
+                cartographie,
+                zones_result,
+                symbol=normalized,
+            )
+            # --------------------------------------------------------
+            # CONFLUENCES
+            # --------------------------------------------------------
+            confluences_result = self.confluences.analyser(
+                candles_by_timeframe=candles,
+                zones_result=zones_result,
+                context_result=context_result,
+                market_map=cartographie,
+                symbol=normalized,
+            )
+            # --------------------------------------------------------
+            # SETUPS
+            # --------------------------------------------------------
+            setups_result = self.setups.analyser(
+                candles_by_timeframe=candles,
+                zones_result=zones_result,
+                context_result=context_result,
+                confluences_result=confluences_result,
+                current_price=current_price,
+                symbol=normalized,
+            )
+            setups = self._extract_setups(
+                setups_result,
+            )
+            # --------------------------------------------------------
+            # TRAITEMENT
+            # --------------------------------------------------------
+            results: List[Dict[str, Any]] = []
+            ready_signals: List[Dict[str, Any]] = []
+            for setup in setups:
+                processed = await self.traiter_setup(
+                    setup,
+                    symbol=normalized,
+                    candles=candles,
+                    zones_result=zones_result,
+                    context_result=context_result,
+                    confluences_result=confluences_result,
+                    current_price=current_price,
                 )
+                if processed is None:
+                    continue
+                results.append(processed)
+                if (
+                    processed.get("status")
+                    == "READY_FOR_SIGNAL"
+                ):
+                    ready_signals.append(
+                        processed
+                    )
+                    # Un seul signal READY par scan/symbole.
+                    break
+            # --------------------------------------------------------
+            # RÉSULTAT FINAL
+            # --------------------------------------------------------
+            overall_status = (
+                "READY_FOR_SIGNAL"
+                if ready_signals
+                else "NO_SIGNAL"
             )
-
+            result = {
+                "status": overall_status,
+                "symbol": normalized,
+                "current_price": current_price,
+                "cartographie": cartographie,
+                "zones": zones_result,
+                "contexte": context_result,
+                "confluences": confluences_result,
+                "setups": setups,
+                "results": results,
+                "signals": ready_signals,
+                "auto_execution": False,
+            }
+            self.last_analysis[normalized] = result
+            logger.info(
+                "Analyse Engine 2 terminée : %s → %s",
+                normalized,
+                overall_status,
+            )
+            return result
+    # ================================================================
+    # ANALYSE DE TOUS LES MARCHÉS
+    # ================================================================
+    async def analyser_tous(self) -> Dict[str, Any]:
+        results: Dict[str, Any] = {}
+        for symbol in self.symbols:
+            try:
+                results[symbol] = (
+                    await self.analyser_symbole(symbol)
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Erreur analyse %s : %s",
+                    symbol,
+                    exc,
+                )
+                results[symbol] = {
+                    "status": "ERROR",
+                    "symbol": symbol,
+                    "error": str(exc),
+                }
         return results
-
-    # ========================================================================
-    # STREAM BIQUOTE
-    # ========================================================================
-
-    async def start_stream(
-        self,
-    ) -> None:
-
+    # ================================================================
+    # STREAM
+    # ================================================================
+    async def start_stream(self) -> None:
         try:
-
-            self.logger.info(
-                "Démarrage flux BiQuote : %s",
-                ", ".join(self.symbols),
+            await self._call(
+                self.stream.start,
             )
-
-            await self.stream.run()
-
         except asyncio.CancelledError:
-
-            self.logger.info(
-                "Flux BiQuote Moteur 2 arrêté."
-            )
-
             raise
-
         except Exception as exc:
-
-            self.last_error = str(
-                exc
+            logger.exception(
+                "Erreur stream BiQuote : %s",
+                exc,
             )
-
-            self.logger.exception(
-                "Erreur stream BiQuote."
-            )
-
-    # ========================================================================
-    # BOUCLE PRINCIPALE
-    # ========================================================================
-
-    async def run(
-        self,
-    ) -> None:
-
+    # ================================================================
+    # RUN
+    # ================================================================
+    async def run(self) -> None:
         if self.running:
             return
-
         self.running = True
-
-        self.logger.info(
-            "========================================"
-        )
-
-        self.logger.info(
-            "NOVA TRADE AI — MOTEUR 2"
-        )
-
-        self.logger.info(
-            "========================================"
-        )
-
-        self.logger.info(
-            "BiQuote : source unique"
-        )
-
-        self.logger.info(
-            "Actifs : %s",
-            ", ".join(self.symbols),
-        )
-
-        self.logger.info(
-            "Timeframes : H4 → H1 → M15 → M5 → M1"
-        )
-
-        self.logger.info(
-            "RR minimum : %.1fR",
-            MINIMUM_RR,
-        )
-
-        self.logger.info(
-            "Score minimum : %.0f",
-            MINIMUM_SCORE,
-        )
-
-        self.logger.info(
-            "M5 : confirmation principale"
-        )
-
-        self.logger.info(
-            "M1 : confirmation secondaire"
-        )
-
-        self.logger.info(
-            "Auto-exécution : OFF"
-        )
-
-        self.stream_task = asyncio.create_task(
+        self._stream_task = asyncio.create_task(
             self.start_stream()
         )
-
+        # Laisser le temps au flux temps réel
+        # de s'établir avant le premier scan.
+        await asyncio.sleep(1)
         try:
-
-            await asyncio.sleep(1)
-
-            async with self.analysis_lock:
-
-                await self.analyser_tous()
-
             while self.running:
-
-                await asyncio.sleep(
-                    SCAN_INTERVAL_SECONDS
-                )
-
-                if not self.running:
-                    break
-
-                async with self.analysis_lock:
-
-                    await self.analyser_tous()
-
-        except asyncio.CancelledError:
-
-            self.logger.info(
-                "Moteur 2 annulé."
-            )
-
-            raise
-
-        except Exception as exc:
-
-            self.last_error = str(
-                exc
-            )
-
-            self.logger.exception(
-                "Erreur boucle Moteur 2."
-            )
-
-        finally:
-
-            self.running = False
-
-            if (
-                self.stream_task is not None
-                and not self.stream_task.done()
-            ):
-
-                self.stream_task.cancel()
-
                 try:
-
-                    await self.stream_task
-
+                    await self.analyser_tous()
                 except asyncio.CancelledError:
-
-                    pass
-
-                except Exception:
-
-                    self.logger.exception(
-                        "Erreur fermeture stream."
+                    raise
+                except Exception as exc:
+                    logger.exception(
+                        "Erreur analyse globale : %s",
+                        exc,
                     )
-
-            self.stream_task = None
-
-            # Une seule instance BiQuoteClient est utilisée
-            # par le moteur et le cache.
-            try:
-
-                self.biquote.close()
-
-            except Exception:
-
-                self.logger.exception(
-                    "Erreur fermeture client BiQuote."
+                await asyncio.sleep(
+                    max(
+                        1,
+                        int(SCAN_INTERVAL_SECONDS),
+                    )
                 )
-
-    # ========================================================================
-    # ARRÊT
-    # ========================================================================
-
-    async def stop(
-        self,
-    ) -> None:
-
+        finally:
+            self.running = False
+            if self._stream_task is not None:
+                self._stream_task.cancel()
+                try:
+                    await self._stream_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                self._stream_task = None
+    # ================================================================
+    # STOP
+    # ================================================================
+    async def stop(self) -> None:
         self.running = False
-
+        # Arrêt du stream
         try:
-
-            if hasattr(
+            stop_method = getattr(
                 self.stream,
                 "stop",
-            ):
-
-                stop_result = (
-                    self.stream.stop()
-                )
-
-                if asyncio.iscoroutine(
-                    stop_result
-                ):
-
-                    await stop_result
-
-        except Exception:
-
-            self.logger.exception(
-                "Erreur arrêt stream BiQuote."
+                None,
             )
-
-        if (
-            self.stream_task is not None
-            and not self.stream_task.done()
-        ):
-
-            self.stream_task.cancel()
-
+            if stop_method is not None:
+                result = stop_method()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            logger.warning(
+                "Erreur arrêt stream : %s",
+                exc,
+            )
+        # Annulation éventuelle de la tâche
+        if self._stream_task is not None:
+            self._stream_task.cancel()
             try:
-
-                await self.stream_task
-
+                await self._stream_task
             except asyncio.CancelledError:
-
                 pass
-
             except Exception:
-
-                self.logger.exception(
-                    "Erreur arrêt tâche stream."
-                )
-
-        self.stream_task = None
-
+                pass
+            self._stream_task = None
+        # Fermeture du client partagé.
+        # Le cache utilise le même client, donc une seule fermeture suffit.
         try:
-
-            self.biquote.close()
-
-        except Exception:
-
-            self.logger.exception(
-                "Erreur fermeture BiQuote."
+            close_method = getattr(
+                self.biquote,
+                "close",
+                None,
             )
-
-    # ========================================================================
-    # STATUT
-    # ========================================================================
-
-    def get_status(
-        self,
-    ) -> Dict[str, Any]:
-
+            if close_method is not None:
+                result = close_method()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            logger.warning(
+                "Erreur fermeture BiQuote : %s",
+                exc,
+            )
+    # ================================================================
+    # STATUS
+    # ================================================================
+    def get_status(self) -> Dict[str, Any]:
+        try:
+            cache_status = self.cache.get_status()
+        except Exception:
+            cache_status = {}
+        try:
+            antispam_status = (
+                self.antispam.get_status()
+            )
+        except Exception:
+            antispam_status = {}
         return {
-            "engine": "MOTEUR_2",
-            "data_source": "BiQuote",
-            "symbols": list(
-                self.symbols
-            ),
-            "timeframes": list(
-                TIMEFRAMES
-            ),
+            "engine": ENGINE_NAME,
+            "symbols": list(self.symbols),
+            "source": "BiQuote",
             "running": self.running,
+            "timeframes": list(TIMEFRAMES),
+            "primary_timeframes": list(
+                PRIMARY_TIMEFRAMES
+            ),
+            "confirmation_timeframes": list(
+                CONFIRMATION_TIMEFRAMES
+            ),
+            "minimum_rr": MINIMUM_RR,
+            "minimum_score": MINIMUM_SCORE,
+            "m5_primary_confirmation": True,
+            "m1_secondary_confirmation": True,
+            "auto_execution": False,
+            "cache": cache_status,
+            "antispam": antispam_status,
             "current_prices": dict(
                 self.current_prices
-            ),
-            "last_error": self.last_error,
-            "symbol_errors": dict(
-                self.symbol_errors
             ),
             "last_analysis": dict(
                 self.last_analysis
@@ -1863,55 +841,26 @@ class Moteur2:
             "last_signal": dict(
                 self.last_signal
             ),
-            "minimum_rr": MINIMUM_RR,
-            "minimum_score": MINIMUM_SCORE,
-            "tp1_required": True,
-            "tp2_optional": True,
-            "tp3_optional": True,
-            "m5_primary_confirmation": True,
-            "m1_secondary_confirmation": True,
-            "final_validation_owner": (
-                "moteur2_validation.py"
-            ),
-            "auto_execution": False,
-            "news_supervisor_can_block": False,
-            "session_supervisor_can_block": False,
-            "tracker_can_modify_signal": False,
         }
-
-
-# ============================================================================
-# ENTRYPOINT
-# ============================================================================
-
-
-async def main() -> None:
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(name)s | "
-            "%(message)s"
-        ),
+# ====================================================================
+# COMPATIBILITÉ
+# ====================================================================
+async def analyser_xauusd() -> Dict[str, Any]:
+    moteur = Moteur2(
+        symbols=("XAUUSD",)
     )
-
-    moteur = Moteur2()
-
     try:
-
-        await moteur.run()
-
-    except KeyboardInterrupt:
-
-        pass
-
+        return await moteur.analyser_symbole(
+            "XAUUSD"
+        )
     finally:
-
         await moteur.stop()
-
-
+async def main() -> None:
+    moteur = Moteur2()
+    try:
+        result = await moteur.analyser_tous()
+        print(result)
+    finally:
+        await moteur.stop()
 if __name__ == "__main__":
-
     asyncio.run(main())
