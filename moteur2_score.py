@@ -1,61 +1,131 @@
 """
 NOVA TRADE AI - ENGINE 2
 moteur2_score.py
-Score déterministe de qualité du setup.
-Le score mesure la qualité globale d'un setup déjà détecté.
+
+ÉVALUATEUR DE QUALITÉ DU SETUP
+==============================
+
+RÔLE
+----
+Ce module mesure la qualité globale d'une opportunité détectée.
+
 IMPORTANT
 ---------
-Le score ne remplace jamais les conditions bloquantes.
-Il ne peut pas :
-- créer un setup ;
-- créer un plan de risque ;
-- remplacer le RR minimum ;
-- remplacer la confirmation M5 ;
-- annuler une contradiction majeure ;
-- produire READY_FOR_SIGNAL ;
-- déclencher une entrée.
-La validation finale appartient exclusivement à :
-    moteur2_validation.py
-Hiérarchie :
-    H4 / H1 / M15
-        ↓
-    Setup
-        ↓
-    Risk
-        ↓
-    M5
-        ↓
-    M1
-        ↓
-    Score
-        ↓
-    Validation finale
-Aucune logique externe d'interprétation n'intervient ici.
+Le score est DESCRIPTIF.
+
+Il ne peut PAS :
+    - créer un setup ;
+    - créer un plan de risque ;
+    - décider BUY / SELL ;
+    - décider WAIT ;
+    - imposer un RR minimum ;
+    - imposer un score minimum ;
+    - bloquer un setup ;
+    - déclencher une entrée ;
+    - remplacer le Decision Engine ;
+    - remplacer la validation finale ;
+    - remplacer le Safety Guard.
+
+PHILOSOPHIE
+-----------
+Le moteur doit pouvoir reconnaître une opportunité même lorsque
+toutes les composantes ne sont pas parfaites.
+
+Exemple :
+
+    Setup A
+        score = 88
+        RR = 4.8
+        contexte très favorable
+        timing M5 intéressant
+
+    Setup B
+        score = 61
+        RR = 2.1
+        structure + réaction intéressantes
+
+    Setup C
+        score = 43
+        RR = 1.4
+        contexte mitigé
+
+Les trois peuvent être retournés au Decision Engine.
+
+Le score ne dit PAS :
+    "61 = rejet"
+
+Il dit :
+    "61 = qualité intermédiaire selon les informations disponibles."
+
+ARCHITECTURE
+------------
+Market Data
+    ↓
+Market Radar
+    ↓
+Market Intelligence
+    ↓
+Zones / Contexte / Confluences
+    ↓
+Setup Detection
+    ↓
+Risk Plan
+    ↓
+Confirmation
+    ↓
+Score ← CE MODULE
+    ↓
+Decision Engine
+    ↓
+Safety Guard
+    ↓
+Anti-Spam
+    ↓
+Telegram
+
+Le cerveau décide.
+Le score informe.
+Le Safety Guard protège.
 """
+
 from __future__ import annotations
+
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 import math
+
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
+
 SUPPORTED_SYMBOLS = (
     "XAUUSD",
     "BTCUSD",
     "EURUSD",
     "GBPUSD",
 )
+
 MAX_SCORE = 100.0
+
 # ------------------------------------------------------------
-# Pondération
+# PONDÉRATION
 # ------------------------------------------------------------
 #
-# Les composantes descriptives ne doivent pas se compter
-# plusieurs fois.
+# Le score décrit la qualité de l'opportunité.
 #
-# Le timing M5/M1 reste secondaire par rapport au cœur
-# H4/H1/M15 + qualité du risque.
+# Les pondérations ne sont PAS des conditions bloquantes.
+#
+# Le cœur du marché reste prioritaire :
+#     zone
+#     contexte
+#     structure
+#     réaction
+#     confluences
+#
+# M5/M1 apportent surtout des informations de timing.
 # ------------------------------------------------------------
+
 ZONE_MAX = 18.0
 CONTEXT_MAX = 15.0
 STRUCTURE_MAX = 12.0
@@ -64,7 +134,7 @@ CONFLUENCE_MAX = 10.0
 M5_MAX = 12.0
 M1_MAX = 4.0
 RR_MAX = 17.0
-# Vérification de cohérence.
+
 TOTAL_MAX = (
     ZONE_MAX
     + CONTEXT_MAX
@@ -75,23 +145,34 @@ TOTAL_MAX = (
     + M1_MAX
     + RR_MAX
 )
-# Seuil informatif.
-# La validation finale pourra utiliser ce seuil,
-# mais le score ne l'impose pas lui-même.
+
+# ------------------------------------------------------------
+# REPÈRES INFORMATIFS
+# ------------------------------------------------------------
+#
+# Ces valeurs servent uniquement à interpréter le score.
+# Elles ne constituent PAS des gates.
+# ------------------------------------------------------------
+
 SCORE_THRESHOLD = 60.0
-# Exigence structurelle du moteur.
-MINIMUM_RR = 3.0
+REFERENCE_RR = 3.0
+
 EPSILON = 1e-9
+
+
 # ============================================================
 # RESULTAT
 # ============================================================
+
 @dataclass
 class ScoreResult:
     symbol: str
     setup_id: str
     direction: str
+
     score: float
     quality: str
+
     zone_score: float
     context_score: float
     structure_score: float
@@ -100,32 +181,54 @@ class ScoreResult:
     m5_score: float
     m1_score: float
     rr_score: float
+
     strengths: List[str]
     weaknesses: List[str]
+
     metadata: Dict[str, Any]
+
+
 # ============================================================
 # MOTEUR
 # ============================================================
+
 class Moteur2Score:
     """
-    Calcule le score de qualité d'un setup.
-    Le score est descriptif et déterministe.
-    Il ne possède aucune autorité de validation finale.
+    Évalue la qualité d'un setup.
+
+    IMPORTANT :
+        Ce moteur n'a aucune autorité décisionnelle.
+
+    Il produit :
+        - un score ;
+        - une qualité ;
+        - des forces ;
+        - des faiblesses ;
+        - des informations détaillées.
+
+    Il ne produit jamais :
+        - BUY ;
+        - SELL ;
+        - WAIT ;
+        - READY_FOR_SIGNAL.
     """
+
     def __init__(
         self,
         score_threshold: float = SCORE_THRESHOLD,
-        minimum_rr: float = MINIMUM_RR,
+        minimum_rr: float = REFERENCE_RR,
     ):
-        self.score_threshold = float(
-            score_threshold
-        )
-        self.minimum_rr = float(
-            minimum_rr
-        )
+        # Compatibilité avec l'ancienne architecture.
+        #
+        # Ces valeurs sont conservées dans l'objet mais ne sont
+        # PLUS utilisées comme conditions bloquantes.
+        self.score_threshold = float(score_threshold)
+        self.reference_rr = float(minimum_rr)
+
     # ========================================================
     # OUTILS
     # ========================================================
+
     @staticmethod
     def _get(
         obj: Any,
@@ -134,38 +237,42 @@ class Moteur2Score:
     ) -> Any:
         if obj is None:
             return default
+
         if isinstance(obj, dict):
-            return obj.get(
-                key,
-                default,
-            )
-        return getattr(
-            obj,
-            key,
-            default,
-        )
+            return obj.get(key, default)
+
+        return getattr(obj, key, default)
+
     @staticmethod
     def _number(
         value: Any,
     ) -> Optional[float]:
+
         if value is None:
             return None
+
         try:
             number = float(value)
+
             if not math.isfinite(number):
                 return None
+
             return number
+
         except (
             TypeError,
             ValueError,
         ):
             return None
+
     @staticmethod
     def _normalize_symbol(
         symbol: Any,
     ) -> Optional[str]:
+
         if symbol is None:
             return None
+
         value = (
             str(symbol)
             .upper()
@@ -175,43 +282,45 @@ class Moteur2Score:
             .replace(" ", "")
             .strip()
         )
+
         if value in SUPPORTED_SYMBOLS:
             return value
+
         return None
+
     def _extract_symbol(
         self,
         *objects: Any,
     ) -> Optional[str]:
+
         for obj in objects:
+
             symbol = (
-                self._get(
-                    obj,
-                    "symbol",
-                )
-                or self._get(
-                    obj,
-                    "ticker",
-                )
+                self._get(obj, "symbol")
+                or self._get(obj, "ticker")
             )
-            normalized = (
-                self._normalize_symbol(
-                    symbol
-                )
-            )
+
+            normalized = self._normalize_symbol(symbol)
+
             if normalized:
                 return normalized
+
         return None
+
     @staticmethod
     def _normalize_direction(
         direction: Any,
     ) -> str:
+
         if direction is None:
             return "UNKNOWN"
+
         value = (
             str(direction)
             .upper()
             .strip()
         )
+
         if value in {
             "BUY",
             "LONG",
@@ -221,6 +330,7 @@ class Moteur2Score:
             "BULLISH",
         }:
             return "BUY"
+
         if value in {
             "SELL",
             "SHORT",
@@ -230,13 +340,16 @@ class Moteur2Score:
             "BEARISH",
         }:
             return "SELL"
+
         return "UNKNOWN"
+
     @staticmethod
     def _clamp(
         value: float,
         minimum: float,
         maximum: float,
     ) -> float:
+
         return max(
             minimum,
             min(
@@ -244,53 +357,62 @@ class Moteur2Score:
                 value,
             ),
         )
+
     def _extract_score(
         self,
         obj: Any,
         keys: List[str],
         default: float = 0.0,
     ) -> float:
+
         for key in keys:
+
             value = self._number(
                 self._get(
                     obj,
                     key,
                 )
             )
+
             if value is not None:
                 return value
+
         return default
+
     # ========================================================
     # SCORE ZONE
     # ========================================================
+
     def _score_zone(
         self,
         zones: Any,
         setup: Any,
     ) -> tuple[float, str]:
+
         zone = self._get(
             setup,
             "zone",
         )
+
         if zone is None:
             zone = self._get(
                 setup,
                 "selected_zone",
             )
+
         if zone is None:
-            zone_id = (
-                self._get(
-                    setup,
-                    "zone_id",
-                )
+
+            zone_id = self._get(
+                setup,
+                "zone_id",
             )
-            important_zones = (
-                self._get(
-                    zones,
-                    "important_zones",
-                    [],
-                )
+
+            important_zones = self._get(
+                zones,
+                "important_zones",
+                [],
             )
+
             if (
                 zone_id
                 and isinstance(
@@ -298,7 +420,9 @@ class Moteur2Score:
                     list,
                 )
             ):
+
                 for candidate in important_zones:
+
                     candidate_id = (
                         self._get(
                             candidate,
@@ -309,17 +433,20 @@ class Moteur2Score:
                             "id",
                         )
                     )
-                    if str(candidate_id) == str(
-                        zone_id
-                    ):
+
+                    if str(candidate_id) == str(zone_id):
+
                         zone = candidate
                         break
+
         if zone is None:
+
             important = self._get(
                 zones,
                 "important_zones",
                 [],
             )
+
             if (
                 isinstance(
                     important,
@@ -328,11 +455,14 @@ class Moteur2Score:
                 and important
             ):
                 zone = important[0]
+
         if zone is None:
+
             return (
                 0.0,
                 "Aucune zone importante clairement identifiée.",
             )
+
         strength = self._extract_score(
             zone,
             [
@@ -343,52 +473,76 @@ class Moteur2Score:
             ],
             50.0,
         )
+
         strength = self._clamp(
             strength,
             0.0,
             100.0,
         )
+
         score = (
             strength
             / 100.0
         ) * ZONE_MAX
+
         if score >= ZONE_MAX * 0.70:
+
             reason = (
-                "Zone importante et suffisamment pertinente."
+                "Zone importante et fortement pertinente."
             )
+
         elif score >= ZONE_MAX * 0.45:
+
             reason = (
-                "Zone exploitable mais de pertinence moyenne."
+                "Zone exploitable avec pertinence moyenne."
             )
+
         else:
+
             reason = (
                 "Zone faiblement qualifiée."
             )
-        return score, reason
+
+        return (
+            self._clamp(
+                score,
+                0.0,
+                ZONE_MAX,
+            ),
+            reason,
+        )
+
     # ========================================================
     # CONTEXTE
     # ========================================================
+
     def _score_context(
         self,
         context: Any,
         setup: Any,
     ) -> tuple[float, str]:
+
         if context is None:
+
             context = self._get(
                 setup,
                 "context",
             )
+
         if context is None:
+
             return (
                 0.0,
                 "Contexte indisponible.",
             )
+
         direction = self._normalize_direction(
             self._get(
                 setup,
                 "direction",
             )
         )
+
         global_bias = str(
             self._get(
                 context,
@@ -396,6 +550,7 @@ class Moteur2Score:
                 "",
             )
         ).upper()
+
         alignment = str(
             self._get(
                 context,
@@ -403,19 +558,17 @@ class Moteur2Score:
                 "",
             )
         ).upper()
+
         score = CONTEXT_MAX * 0.45
-        # ----------------------------------------------------
-        # Direction du contexte
-        # ----------------------------------------------------
-        context_direction = (
-            self._normalize_direction(
-                global_bias
-            )
+
+        context_direction = self._normalize_direction(
+            global_bias
         )
-        if (
-            context_direction == direction
-        ):
+
+        if context_direction == direction:
+
             score = CONTEXT_MAX * 0.90
+
         elif (
             context_direction in {
                 "BUY",
@@ -423,20 +576,26 @@ class Moteur2Score:
             }
             and context_direction != direction
         ):
+
+            # Contradiction importante,
+            # mais le score ne bloque jamais le setup.
             score = CONTEXT_MAX * 0.10
+
         elif (
             "COHERENT" in alignment
             and "MIXTE" not in alignment
         ):
+
             score = CONTEXT_MAX * 0.75
-        elif (
-            "MIXTE" in alignment
-        ):
+
+        elif "MIXTE" in alignment:
+
             score = CONTEXT_MAX * 0.35
-        elif (
-            "NON_DEFINI" in alignment
-        ):
+
+        elif "NON_DEFINI" in alignment:
+
             score = CONTEXT_MAX * 0.30
+
         return (
             self._clamp(
                 score,
@@ -447,60 +606,73 @@ class Moteur2Score:
                 "Contexte global cohérent avec la direction."
                 if score >= CONTEXT_MAX * 0.70
                 else
-                "Contexte global encore partiellement exploitable."
+                "Contexte global partiellement exploitable."
             ),
         )
+
     # ========================================================
     # STRUCTURE
     # ========================================================
+
     def _score_structure(
         self,
         context: Any,
         confluences: Any,
         setup: Any,
     ) -> tuple[float, str]:
+
         source = (
             confluences
             or context
             or setup
         )
+
         if source is None:
+
             return (
                 0.0,
                 "Structure indisponible.",
             )
+
         direction = self._normalize_direction(
             self._get(
                 setup,
                 "direction",
             )
         )
+
         explicit = self._number(
             self._get(
                 source,
                 "structure_score",
             )
         )
+
         if explicit is not None:
-            # Accepte un score 0-100 ou 0-12.
+
             if explicit > STRUCTURE_MAX:
+
                 explicit = (
                     explicit
                     / 100.0
                 ) * STRUCTURE_MAX
+
             score = self._clamp(
                 explicit,
                 0.0,
                 STRUCTURE_MAX,
             )
+
             return (
                 score,
                 (
                     "Structure exploitable."
                     if score >= STRUCTURE_MAX * 0.70
-                    else "Structure partiellement exploitable."
+                    else
+                    "Structure partiellement exploitable."
                 ),
             )
+
         structure = str(
             self._get(
                 source,
@@ -508,49 +680,67 @@ class Moteur2Score:
                 "",
             )
         ).upper()
+
         score = STRUCTURE_MAX * 0.45
+
         bullish_words = (
             "HAUSSI",
             "BULLISH",
             "BUY",
         )
+
         bearish_words = (
             "BAISS",
             "BEARISH",
             "SELL",
         )
+
         is_bullish = any(
             word in structure
             for word in bullish_words
         )
+
         is_bearish = any(
             word in structure
             for word in bearish_words
         )
+
         if (
             direction == "BUY"
             and is_bullish
         ):
+
             score = STRUCTURE_MAX * 0.90
+
         elif (
             direction == "SELL"
             and is_bearish
         ):
+
             score = STRUCTURE_MAX * 0.90
+
         elif (
             direction == "BUY"
             and is_bearish
         ):
+
             score = STRUCTURE_MAX * 0.10
+
         elif (
             direction == "SELL"
             and is_bullish
         ):
+
             score = STRUCTURE_MAX * 0.10
+
         elif "RANGE" in structure:
+
             score = STRUCTURE_MAX * 0.50
+
         elif "TRANSITION" in structure:
+
             score = STRUCTURE_MAX * 0.35
+
         return (
             self._clamp(
                 score,
@@ -560,17 +750,21 @@ class Moteur2Score:
             (
                 "Structure cohérente avec la direction."
                 if score >= STRUCTURE_MAX * 0.70
-                else "Structure encore partiellement exploitable."
+                else
+                "Structure encore partiellement exploitable."
             ),
         )
+
     # ========================================================
     # REACTION
     # ========================================================
+
     def _score_reaction(
         self,
         confluences: Any,
         setup: Any,
     ) -> tuple[float, str]:
+
         source = (
             confluences
             or self._get(
@@ -579,169 +773,224 @@ class Moteur2Score:
             )
             or setup
         )
+
         if source is None:
+
             return (
                 0.0,
                 "Réaction indisponible.",
             )
+
         explicit = self._number(
             self._get(
                 source,
                 "reaction_score",
             )
         )
+
         if explicit is not None:
+
             if explicit <= 1.0:
+
                 score = (
                     explicit
                     * REACTION_MAX
                 )
+
             elif explicit <= 100.0:
+
                 score = (
                     explicit
                     / 100.0
                 ) * REACTION_MAX
+
             else:
+
                 score = REACTION_MAX
+
         else:
+
             reaction = self._get(
                 source,
                 "reaction",
             )
+
             if isinstance(
                 reaction,
                 dict,
             ):
+
                 strength = self._number(
                     reaction.get(
                         "strength"
                     )
                 )
+
             else:
+
                 strength = self._number(
                     self._get(
                         source,
                         "reaction_strength",
                     )
                 )
+
             if strength is None:
                 strength = 0.0
+
             if strength <= 1.0:
+
                 score = (
                     strength
                     * REACTION_MAX
                 )
+
             else:
+
                 score = (
                     strength
                     / 100.0
                 ) * REACTION_MAX
+
         score = self._clamp(
             score,
             0.0,
             REACTION_MAX,
         )
+
         if score >= REACTION_MAX * 0.70:
+
             reason = (
                 "Réaction du prix clairement favorable."
             )
+
         elif score >= REACTION_MAX * 0.45:
+
             reason = (
                 "Réaction présente mais modérée."
             )
+
         else:
+
             reason = (
                 "Réaction encore faible."
             )
+
         return score, reason
+
     # ========================================================
     # CONFLUENCES
     # ========================================================
+
     def _score_confluence(
         self,
         confluences: Any,
     ) -> tuple[float, str]:
+
         if confluences is None:
+
             return (
                 0.0,
                 "Aucune confluence disponible.",
             )
+
         explicit = self._number(
             self._get(
                 confluences,
                 "confluence_score",
             )
         )
+
         if explicit is not None:
+
             if explicit > CONFLUENCE_MAX:
+
                 explicit = (
                     explicit
                     / 100.0
                 ) * CONFLUENCE_MAX
+
             score = self._clamp(
                 explicit,
                 0.0,
                 CONFLUENCE_MAX,
             )
+
             return (
                 score,
                 (
                     "Confluences suffisamment cohérentes."
                     if score >= CONFLUENCE_MAX * 0.65
-                    else "Confluences encore limitées."
+                    else
+                    "Confluences encore limitées."
                 ),
             )
+
         items = self._get(
             confluences,
             "confluences",
             [],
         )
+
         if not isinstance(
             items,
             list,
         ):
             items = []
+
         useful = 0
-        strengths = []
+
         for item in items:
+
             strength = self._number(
                 self._get(
                     item,
                     "strength",
                 )
             )
+
             if strength is None:
+
                 strength = self._number(
                     self._get(
                         item,
                         "score",
                     )
                 )
+
             if strength is None:
                 strength = 50.0
+
             strength = self._clamp(
                 strength,
                 0.0,
                 100.0,
             )
+
             if strength >= 45.0:
                 useful += 1
-                strengths.append(
-                    strength
-                )
-        # Rendement décroissant :
-        # la 4e ou 5e confluence ne doit pas
-        # gonfler artificiellement le score.
+
+        # Rendement décroissant.
         if useful == 0:
+
             score = 0.0
+
         elif useful == 1:
+
             score = CONFLUENCE_MAX * 0.35
+
         elif useful == 2:
+
             score = CONFLUENCE_MAX * 0.60
+
         elif useful == 3:
+
             score = CONFLUENCE_MAX * 0.78
+
         else:
+
             score = CONFLUENCE_MAX * 0.90
+
         return (
             self._clamp(
                 score,
@@ -755,72 +1004,96 @@ class Moteur2Score:
                 "Peu de confluences exploitables."
             ),
         )
+
     # ========================================================
     # M5
     # ========================================================
+
     def _score_m5(
         self,
         confirmation: Any,
         direction: str,
     ) -> tuple[float, str]:
+
         if confirmation is None:
+
             return (
                 0.0,
-                "Confirmation M5 indisponible.",
+                "Information M5 indisponible.",
             )
+
         value = self._number(
             self._get(
                 confirmation,
                 "m5_score",
             )
         )
+
         if value is None:
+
             value = self._number(
                 self._get(
                     confirmation,
                     "score_m5",
                 )
             )
+
         if value is None:
+
             return (
                 0.0,
                 "Score M5 indisponible.",
             )
+
         value = self._clamp(
             value,
             0.0,
             100.0,
         )
+
         bias = self._normalize_direction(
             self._get(
                 confirmation,
                 "m5_bias",
             )
         )
-        # Le score M5 est directionnel.
+
+        # M5 reste informatif.
+        #
+        # Une contradiction réduit sa contribution,
+        # mais ne rejette jamais le setup.
         if (
             bias not in {
                 direction,
                 "UNKNOWN",
             }
         ):
+
             value *= 0.45
+
         score = (
             value
             / 100.0
         ) * M5_MAX
+
         if score >= M5_MAX * 0.70:
+
             reason = (
-                "M5 fournit un timing de bonne qualité."
+                "M5 fournit un timing favorable."
             )
+
         elif score >= M5_MAX * 0.45:
+
             reason = (
-                "M5 apporte une confirmation modérée."
+                "M5 apporte une information de timing modérée."
             )
+
         else:
+
             reason = (
-                "M5 apporte une confirmation limitée."
+                "M5 apporte peu de confirmation actuellement."
             )
+
         return (
             self._clamp(
                 score,
@@ -829,71 +1102,92 @@ class Moteur2Score:
             ),
             reason,
         )
+
     # ========================================================
     # M1
     # ========================================================
+
     def _score_m1(
         self,
         confirmation: Any,
         direction: str,
     ) -> tuple[float, str]:
+
         if confirmation is None:
+
             return (
                 0.0,
-                "Confirmation M1 indisponible.",
+                "Information M1 indisponible.",
             )
+
         value = self._number(
             self._get(
                 confirmation,
                 "m1_score",
             )
         )
+
         if value is None:
+
             value = self._number(
                 self._get(
                     confirmation,
                     "score_m1",
                 )
             )
+
         if value is None:
+
             return (
                 0.0,
                 "Score M1 indisponible.",
             )
+
         value = self._clamp(
             value,
             0.0,
             100.0,
         )
+
         bias = self._normalize_direction(
             self._get(
                 confirmation,
                 "m1_bias",
             )
         )
+
         if (
             bias not in {
                 direction,
                 "UNKNOWN",
             }
         ):
+
             value *= 0.40
+
         score = (
             value
             / 100.0
         ) * M1_MAX
+
         if score >= M1_MAX * 0.70:
+
             reason = (
                 "M1 renforce utilement le timing."
             )
+
         elif score >= M1_MAX * 0.45:
+
             reason = (
                 "M1 apporte une information secondaire."
             )
+
         else:
+
             reason = (
                 "M1 apporte peu d'information supplémentaire."
             )
+
         return (
             self._clamp(
                 score,
@@ -902,103 +1196,254 @@ class Moteur2Score:
             ),
             reason,
         )
+
     # ========================================================
     # RR
     # ========================================================
+
     def _score_rr(
         self,
         risk_plan: Any,
     ) -> tuple[float, str]:
+
         if risk_plan is None:
+
             return (
                 0.0,
                 "Plan de risque indisponible.",
             )
+
         rr = self._number(
             self._get(
                 risk_plan,
                 "primary_rr",
             )
         )
+
         if rr is None:
+
             rr = self._number(
                 self._get(
                     risk_plan,
                     "rr_tp1",
                 )
             )
+
         if rr is None:
+
             return (
                 0.0,
                 "RR primaire indisponible.",
             )
+
         # ----------------------------------------------------
-        # Le minimum structurel est 3R.
+        # NOUVELLE PHILOSOPHIE
+        # ----------------------------------------------------
         #
-        # Le score récompense davantage les RR supérieurs,
-        # mais ne transforme jamais un RR inférieur à 3
-        # en plan acceptable.
+        # Le RR n'est PLUS un minimum obligatoire.
+        #
+        # Le score représente simplement son intérêt.
+        #
+        # Un RR inférieur à 3 :
+        #     → contribution plus faible
+        #     → MAIS PAS DE REJET
+        #
+        # Un RR autour de 3 :
+        #     → contribution correcte
+        #
+        # Un RR supérieur à 4/5 :
+        #     → contribution forte
+        #
+        # Le Decision Engine décidera ensuite si le rapport
+        # risque/opportunité est suffisamment intéressant.
         # ----------------------------------------------------
-        if rr < self.minimum_rr:
+
+        if rr <= 0.0:
+
             return (
                 0.0,
-                (
-                    f"RR primaire de {rr:.2f}, "
-                    f"inférieur au minimum requis de "
-                    f"{self.minimum_rr:.2f}."
-                ),
+                "RR non exploitable ou négatif.",
             )
-        # 3R = environ 65 % du maximum.
-        # 4R = environ 82 %.
-        # 5R ou plus = maximum.
-        if rr >= 5.0:
-            score = RR_MAX
-        elif rr >= 4.0:
-            score = RR_MAX * 0.82
-        else:
-            # Entre 3R et 4R.
-            progress = (
-                rr - 3.0
+
+        if rr < 1.0:
+
+            # Très faible mais toujours descriptif.
+            ratio = rr / 1.0
+
+            score = RR_MAX * 0.15 * ratio
+
+            reason = (
+                f"RR primaire faible ({rr:.2f}R), "
+                "mais conservé comme information."
             )
+
+        elif rr < 2.0:
+
+            # 1R → 15%
+            # 2R → 40%
+            progress = rr - 1.0
+
+            score = (
+                RR_MAX * 0.15
+                + progress
+                * RR_MAX
+                * 0.25
+            )
+
+            reason = (
+                f"RR primaire de {rr:.2f}R, "
+                "modéré."
+            )
+
+        elif rr < 3.0:
+
+            # 2R → 40%
+            # 3R → 65%
+            progress = rr - 2.0
+
+            score = (
+                RR_MAX * 0.40
+                + progress
+                * RR_MAX
+                * 0.25
+            )
+
+            reason = (
+                f"RR primaire de {rr:.2f}R, "
+                "intéressant mais inférieur à la référence 3R."
+            )
+
+        elif rr < 4.0:
+
+            # 3R → 65%
+            # 4R → 82%
+            progress = rr - 3.0
+
             score = (
                 RR_MAX * 0.65
                 + progress
                 * RR_MAX
                 * 0.17
             )
-        score = self._clamp(
-            score,
-            0.0,
-            RR_MAX,
-        )
+
+            reason = (
+                f"RR primaire de {rr:.2f}R, "
+                "favorable."
+            )
+
+        elif rr < 5.0:
+
+            # 4R → 82%
+            # 5R → 100%
+            progress = rr - 4.0
+
+            score = (
+                RR_MAX * 0.82
+                + progress
+                * RR_MAX
+                * 0.18
+            )
+
+            reason = (
+                f"RR primaire de {rr:.2f}R, "
+                "très favorable."
+            )
+
+        else:
+
+            score = RR_MAX
+
+            reason = (
+                f"RR primaire de {rr:.2f}R, "
+                "excellent rapport potentiel."
+            )
+
         return (
-            score,
-            (
-                f"RR primaire de {rr:.2f}, "
-                "compatible avec le minimum requis."
+            self._clamp(
+                score,
+                0.0,
+                RR_MAX,
             ),
+            reason,
         )
+
     # ========================================================
     # QUALITÉ
     # ========================================================
+
     @staticmethod
     def _quality_label(
         score: float,
     ) -> str:
+
         if score >= 85.0:
             return "A+"
+
         if score >= 75.0:
             return "A"
+
         if score >= 65.0:
             return "B"
+
         if score >= 55.0:
             return "C"
+
         if score >= 40.0:
             return "D"
+
         return "E"
+
+    # ========================================================
+    # INTERPRÉTATION
+    # ========================================================
+
+    @staticmethod
+    def _score_interpretation(
+        score: float,
+    ) -> str:
+
+        if score >= 85.0:
+
+            return (
+                "Opportunité présentant de très fortes confluences "
+                "selon les données actuellement disponibles."
+            )
+
+        if score >= 75.0:
+
+            return (
+                "Opportunité de très bonne qualité."
+            )
+
+        if score >= 65.0:
+
+            return (
+                "Opportunité de bonne qualité avec plusieurs "
+                "éléments favorables."
+            )
+
+        if score >= 55.0:
+
+            return (
+                "Opportunité intermédiaire nécessitant une analyse "
+                "plus approfondie du contexte."
+            )
+
+        if score >= 40.0:
+
+            return (
+                "Opportunité fragile ou incomplètement construite."
+            )
+
+        return (
+            "Opportunité actuellement faible selon les informations "
+            "disponibles."
+        )
+
     # ========================================================
     # ANALYSE
     # ========================================================
+
     def analyser(
         self,
         setup: Any,
@@ -1009,6 +1454,7 @@ class Moteur2Score:
         risk_plan: Any = None,
         symbol: Optional[str] = None,
     ) -> ScoreResult:
+
         resolved_symbol = (
             self._normalize_symbol(symbol)
             if symbol is not None
@@ -1018,8 +1464,10 @@ class Moteur2Score:
                 confirmation,
             )
         )
+
         if resolved_symbol is None:
             resolved_symbol = "UNKNOWN"
+
         setup_id = str(
             self._get(
                 setup,
@@ -1031,6 +1479,7 @@ class Moteur2Score:
             )
             or "SETUP"
         )
+
         direction = self._normalize_direction(
             self._get(
                 setup,
@@ -1041,21 +1490,25 @@ class Moteur2Score:
                 "direction",
             )
         )
+
         # ----------------------------------------------------
         # COMPOSANTS
         # ----------------------------------------------------
+
         zone_score, zone_reason = (
             self._score_zone(
                 zones,
                 setup,
             )
         )
+
         context_score, context_reason = (
             self._score_context(
                 context,
                 setup,
             )
         )
+
         structure_score, structure_reason = (
             self._score_structure(
                 context,
@@ -1063,37 +1516,44 @@ class Moteur2Score:
                 setup,
             )
         )
+
         reaction_score, reaction_reason = (
             self._score_reaction(
                 confluences,
                 setup,
             )
         )
+
         confluence_score, confluence_reason = (
             self._score_confluence(
                 confluences,
             )
         )
+
         m5_score, m5_reason = (
             self._score_m5(
                 confirmation,
                 direction,
             )
         )
+
         m1_score, m1_reason = (
             self._score_m1(
                 confirmation,
                 direction,
             )
         )
+
         rr_score, rr_reason = (
             self._score_rr(
                 risk_plan,
             )
         )
+
         # ----------------------------------------------------
         # TOTAL
         # ----------------------------------------------------
+
         total = (
             zone_score
             + context_score
@@ -1104,20 +1564,25 @@ class Moteur2Score:
             + m1_score
             + rr_score
         )
+
         total = self._clamp(
             total,
             0.0,
             MAX_SCORE,
         )
+
         total = round(
             total,
             2,
         )
+
         # ----------------------------------------------------
         # FORCES / FAIBLESSES
         # ----------------------------------------------------
+
         strengths: List[str] = []
         weaknesses: List[str] = []
+
         components = [
             (
                 zone_score,
@@ -1152,8 +1617,8 @@ class Moteur2Score:
             (
                 m5_score,
                 M5_MAX,
-                "M5 apporte un bon timing.",
-                "M5 apporte peu de confirmation.",
+                "M5 apporte un timing intéressant.",
+                "M5 apporte peu d'information.",
             ),
             (
                 m1_score,
@@ -1164,33 +1629,41 @@ class Moteur2Score:
             (
                 rr_score,
                 RR_MAX,
-                "RR compatible avec le minimum requis.",
-                "RR insuffisant.",
+                "Rapport risque/potentiel favorable.",
+                "Rapport risque/potentiel limité.",
             ),
         ]
+
         for (
             value,
             maximum,
             positive,
             negative,
         ) in components:
+
             if value >= maximum * 0.70:
+
                 strengths.append(
                     positive
                 )
+
             elif value < maximum * 0.40:
+
                 weaknesses.append(
                     negative
                 )
+
         # ----------------------------------------------------
         # INFORMATIONS DÉTAILLÉES
         # ----------------------------------------------------
+
         rr_primary = self._number(
             self._get(
                 risk_plan,
                 "primary_rr",
             )
         )
+
         confirmation_valid = bool(
             self._get(
                 confirmation,
@@ -1198,6 +1671,7 @@ class Moteur2Score:
                 False,
             )
         )
+
         risk_valid = bool(
             self._get(
                 risk_plan,
@@ -1205,7 +1679,29 @@ class Moteur2Score:
                 False,
             )
         )
+
+        # ----------------------------------------------------
+        # RÉFÉRENCE RR
+        # ----------------------------------------------------
+        #
+        # Important :
+        #
+        # rr_reference_met est purement informatif.
+        #
+        # Il ne signifie PAS :
+        #     "signal autorisé"
+        #
+        # Il signifie uniquement :
+        #     "le RR atteint la référence de qualité de 3R".
+        # ----------------------------------------------------
+
+        rr_reference_met = (
+            rr_primary is not None
+            and rr_primary >= self.reference_rr
+        )
+
         metadata = {
+
             "components": {
                 "zone": round(
                     zone_score,
@@ -1240,6 +1736,7 @@ class Moteur2Score:
                     2,
                 ),
             },
+
             "maximums": {
                 "zone": ZONE_MAX,
                 "context": CONTEXT_MAX,
@@ -1250,32 +1747,88 @@ class Moteur2Score:
                 "m1": M1_MAX,
                 "rr": RR_MAX,
             },
+
             "total_maximum": TOTAL_MAX,
-            "score_threshold": (
+
+            # ------------------------------------------------
+            # REPÈRES UNIQUEMENT
+            # ------------------------------------------------
+
+            "score_threshold_reference": (
                 self.score_threshold
             ),
-            "minimum_rr": (
-                self.minimum_rr
+
+            "reference_rr": (
+                self.reference_rr
             ),
+
+            "score_threshold_is_blocking": False,
+
+            "rr_reference_is_blocking": False,
+
+            # ------------------------------------------------
+            # RR
+            # ------------------------------------------------
+
             "rr_primary": rr_primary,
-            "rr_requirement_met": (
-                rr_primary is not None
-                and rr_primary >= self.minimum_rr
+
+            "rr_reference_met": (
+                rr_reference_met
             ),
-            "risk_plan_valid": risk_valid,
+
+            "rr_requirement_met": (
+                rr_reference_met
+            ),
+
+            # ------------------------------------------------
+            # ÉTAT DES AUTRES MODULES
+            # ------------------------------------------------
+
+            "risk_plan_valid": (
+                risk_valid
+            ),
+
             "confirmation_valid": (
                 confirmation_valid
             ),
+
             "confirmation_status": self._get(
                 confirmation,
                 "confirmation_status",
             ),
-            "m5_is_primary_confirmation": True,
-            "m1_is_secondary_confirmation": True,
+
+            # ------------------------------------------------
+            # HIÉRARCHIE
+            # ------------------------------------------------
+
+            "m5_is_secondary_information": True,
+
+            "m1_is_secondary_information": True,
+
             "score_is_decisive": False,
+
+            "score_is_blocking": False,
+
+            "score_can_reject_setup": False,
+
+            "final_decision_owner": (
+                "moteur2_decision.py"
+            ),
+
             "final_validation_owner": (
                 "moteur2_validation.py"
             ),
+
+            # ------------------------------------------------
+            # INTERPRÉTATION
+            # ------------------------------------------------
+
+            "interpretation": (
+                self._score_interpretation(
+                    total
+                )
+            ),
+
             "reasons": {
                 "zone": zone_reason,
                 "context": context_reason,
@@ -1287,53 +1840,72 @@ class Moteur2Score:
                 "rr": rr_reason,
             },
         }
+
         return ScoreResult(
+
             symbol=resolved_symbol,
+
             setup_id=setup_id,
+
             direction=direction,
+
             score=total,
+
             quality=self._quality_label(
                 total
             ),
+
             zone_score=round(
                 zone_score,
                 2,
             ),
+
             context_score=round(
                 context_score,
                 2,
             ),
+
             structure_score=round(
                 structure_score,
                 2,
             ),
+
             reaction_score=round(
                 reaction_score,
                 2,
             ),
+
             confluence_score=round(
                 confluence_score,
                 2,
             ),
+
             m5_score=round(
                 m5_score,
                 2,
             ),
+
             m1_score=round(
                 m1_score,
                 2,
             ),
+
             rr_score=round(
                 rr_score,
                 2,
             ),
+
             strengths=strengths,
+
             weaknesses=weaknesses,
+
             metadata=metadata,
         )
+
     # ========================================================
     # PLUSIEURS SETUPS
     # ========================================================
+
     def analyser_setups(
         self,
         setups: Any,
@@ -1343,12 +1915,15 @@ class Moteur2Score:
         confirmations: Any = None,
         risk_plans: Any = None,
     ) -> List[ScoreResult]:
+
         if setups is None:
             return []
+
         if isinstance(
             setups,
             dict,
         ):
+
             setup_list = (
                 setups.get("setups")
                 or setups.get(
@@ -1359,44 +1934,57 @@ class Moteur2Score:
                 )
                 or []
             )
+
         elif isinstance(
             setups,
             (list, tuple),
         ):
+
             setup_list = list(
                 setups
             )
+
         else:
+
             setup_list = [
                 setups
             ]
+
         results: List[
             ScoreResult
         ] = []
+
         for index, setup in enumerate(
             setup_list
         ):
+
             confirmation = None
             risk_plan = None
+
             # ------------------------------------------------
             # Confirmation
             # ------------------------------------------------
+
             if isinstance(
                 confirmations,
                 list,
             ):
+
                 if index < len(
                     confirmations
                 ):
+
                     confirmation = (
                         confirmations[
                             index
                         ]
                     )
+
             elif isinstance(
                 confirmations,
                 dict,
             ):
+
                 setup_id = str(
                     self._get(
                         setup,
@@ -1408,30 +1996,37 @@ class Moteur2Score:
                     )
                     or ""
                 )
+
                 confirmation = (
                     confirmations.get(
                         setup_id
                     )
                 )
+
             # ------------------------------------------------
             # Risk
             # ------------------------------------------------
+
             if isinstance(
                 risk_plans,
                 list,
             ):
+
                 if index < len(
                     risk_plans
                 ):
+
                     risk_plan = (
                         risk_plans[
                             index
                         ]
                     )
+
             elif isinstance(
                 risk_plans,
                 dict,
             ):
+
                 setup_id = str(
                     self._get(
                         setup,
@@ -1443,11 +2038,13 @@ class Moteur2Score:
                     )
                     or ""
                 )
+
                 risk_plan = (
                     risk_plans.get(
                         setup_id
                     )
                 )
+
             result = self.analyser(
                 setup=setup,
                 zones=zones,
@@ -1456,23 +2053,31 @@ class Moteur2Score:
                 confirmation=confirmation,
                 risk_plan=risk_plan,
             )
+
             results.append(
                 result
             )
+
         return results
+
     # ========================================================
     # DICTIONNAIRE
     # ========================================================
+
     @staticmethod
     def to_dict(
         result: ScoreResult,
     ) -> Dict[str, Any]:
+
         return asdict(
             result
         )
+
+
 # ============================================================
 # FONCTION PUBLIQUE
 # ============================================================
+
 def calculer_score(
     setup: Any,
     zones: Any = None,
@@ -1482,7 +2087,9 @@ def calculer_score(
     risk_plan: Any = None,
     symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
+
     moteur = Moteur2Score()
+
     result = moteur.analyser(
         setup=setup,
         zones=zones,
@@ -1492,19 +2099,25 @@ def calculer_score(
         risk_plan=risk_plan,
         symbol=symbol,
     )
+
     return moteur.to_dict(
         result
     )
+
+
 # ============================================================
 # TEST LOCAL
 # ============================================================
+
 if __name__ == "__main__":
+
     setup_test = {
         "setup_id": "XAUUSD_BUY_TEST",
         "symbol": "XAUUSD",
         "direction": "BUY",
         "setup_type": "CONTINUATION",
     }
+
     zones_test = {
         "important_zones": [
             {
@@ -1515,11 +2128,13 @@ if __name__ == "__main__":
             }
         ]
     }
+
     context_test = {
         "global_bias": "BUY",
         "alignment": "COHERENT",
         "structure": "HAUSSIERE",
     }
+
     confluences_test = {
         "confluences": [
             {
@@ -1537,6 +2152,7 @@ if __name__ == "__main__":
         ],
         "reaction_score": 75,
     }
+
     confirmation_test = {
         "m5_score": 78,
         "m1_score": 68,
@@ -1545,12 +2161,18 @@ if __name__ == "__main__":
         "confirmation_status": "CONFIRMED_M5_M1",
         "confirmation_valid": True,
     }
+
+    # Test volontairement avec RR < 3.
+    #
+    # Le nouveau moteur doit continuer à produire
+    # un score normalement.
     risk_plan_test = {
         "symbol": "XAUUSD",
         "direction": "BUY",
-        "primary_rr": 3.2,
+        "primary_rr": 2.2,
         "valid": True,
     }
+
     result = calculer_score(
         setup=setup_test,
         zones=zones_test,
@@ -1559,5 +2181,7 @@ if __name__ == "__main__":
         confirmation=confirmation_test,
         risk_plan=risk_plan_test,
     )
+
     from pprint import pprint
+
     pprint(result)
