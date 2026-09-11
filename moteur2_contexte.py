@@ -1,1015 +1,1647 @@
 """
-NOVA TRADE AI - Moteur 2
+NOVA TRADE AI - MOTEUR 2
 moteur2_contexte.py
-Détermination du contexte de marché.
-Actifs :
-    XAUUSD
-    BTCUSD
-    EURUSD
-    GBPUSD
-Timeframes :
-    H4
-    H1
-    M15
-    M5
-    M1
+
+Analyse adaptative du contexte de marché.
+
 Rôle :
-    - analyser le contexte H4
-    - analyser le contexte H1
-    - analyser le comportement M15
-    - analyser le comportement M5
-    - analyser le timing M1
-    - déterminer le contexte global
-    - décrire le comportement du prix autour des zones
+    - observer H4 / H1 / M15 / M5 / M1
+    - détecter direction, structure, régime, momentum, volatilité
+    - mesurer la cohérence ou la divergence des timeframes
+    - analyser le comportement autour des zones
+    - fournir des informations au reste du moteur
+
 IMPORTANT :
-    Ce module est descriptif.
-    Il ne :
-        - produit pas de BUY/SELL
-        - ne valide pas de setup
-        - ne calcule pas Entry/SL/TP
-        - ne calcule pas le RR
-        - ne bloque pas un signal
-La décision finale appartient exclusivement
-à moteur2_validation.py.
+    Ce module NE décide PAS BUY / SELL / WAIT.
+    Ce module NE valide PAS un setup.
+    Ce module NE bloque PAS une opportunité.
+    L'absence d'alignement parfait entre timeframes n'est PAS un rejet.
+    M5 et M1 sont informatifs.
+    La décision finale appartient à moteur2_decision.py.
 """
+
 from __future__ import annotations
-from dataclasses import asdict, dataclass
+
+from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
+
 from biquote_client import Candle
-# ---------------------------------------------------------------------------
+
+
+# ============================================================================
 # CONFIGURATION
-# ---------------------------------------------------------------------------
-SUPPORTED_SYMBOLS = (
-    "XAUUSD",
-    "BTCUSD",
-    "EURUSD",
-    "GBPUSD",
-)
-SUPPORTED_TIMEFRAMES = (
-    "H4",
-    "H1",
-    "M15",
-    "M5",
-    "M1",
-)
-MIN_CANDLES_TREND = 20
-MIN_CANDLES_STRUCTURE = 5
-# Nombre de bougies utilisées pour la détection de direction.
-DIRECTION_LOOKBACK = {
+# ============================================================================
+
+TIMEFRAMES = ("H4", "H1", "M15", "M5", "M1")
+
+TIMEFRAME_WEIGHT = {
+    "H4": 4.0,
+    "H1": 3.0,
+    "M15": 2.5,
+    "M5": 1.0,
+    "M1": 0.5,
+}
+
+LOOKBACK = {
     "H4": 20,
     "H1": 30,
     "M15": 30,
     "M5": 25,
     "M1": 20,
 }
-# Seuil de variation minimale exprimé en multiples
-# de l'amplitude moyenne des bougies.
-#
-# Cela remplace le seuil fixe de 0.10 %.
-TREND_RANGE_MULTIPLIER = {
-    "H4": 1.50,
-    "H1": 1.50,
-    "M15": 1.35,
-    "M5": 1.25,
-    "M1": 1.15,
-}
-VOLATILITY_LOOKBACK = 20
-# Seuil maximal de largeur relative d'un marché considéré
-# comme comprimé/range.
-RANGE_WIDTH_ATR_MULTIPLIER = 8.0
-# Tolérance autour d'une zone :
-# exprimée en multiples de l'amplitude moyenne des bougies.
-ZONE_REACTION_ATR_MULTIPLIER = {
-    "H4": 1.50,
-    "H1": 1.50,
-    "M15": 1.35,
-    "M5": 1.20,
-    "M1": 1.00,
-}
-TIMEFRAME_PRIORITY = {
-    "H4": 4,
-    "H1": 3,
-    "M15": 2,
-    "M5": 1,
-    "M1": 0,
-}
-# ---------------------------------------------------------------------------
+
+MIN_CANDLES = 5
+
+TREND_THRESHOLD = 0.0010
+RANGE_THRESHOLD = 0.0060
+
+# M5/M1 ne peuvent jamais devenir des bloqueurs.
+NON_BLOCKING_TIMEFRAMES = ("M5", "M1")
+
+
+# ============================================================================
 # STRUCTURES
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 @dataclass
 class ContextTimeframe:
-    """
-    Contexte descriptif d'un timeframe.
-    """
     timeframe: str
     direction: str
     structure: str
+    regime: str
     strength: float
+    momentum: float
+    volatility: float
     price: Optional[float]
+    observations: List[str]
     reason: str
+
+
 @dataclass
 class GlobalContext:
-    """
-    Contexte descriptif global du marché.
-    """
     direction: str
     state: str
+    regime: str
     strength: float
+    momentum: float
+    volatility: float
     dominant_timeframe: str
     alignment: str
+    directional_balance: float
+    observations: List[str]
     reason: str
-# ---------------------------------------------------------------------------
-# MOTEUR CONTEXTE
-# ---------------------------------------------------------------------------
+
+
+# ============================================================================
+# MOTEUR
+# ============================================================================
+
 class Moteur2Contexte:
-    """
-    Analyse du contexte de marché.
-    H4 :
-        contexte global
-    H1 :
-        contexte intermédiaire
-    M15 :
-        contexte principal
-    M5 :
-        comportement de confirmation
-    M1 :
-        timing secondaire
-    Aucun timeframe ne produit ici une décision finale.
-    """
+
     def __init__(self) -> None:
         pass
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # ANALYSE PRINCIPALE
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     def analyser(
         self,
         candles_by_timeframe: Dict[str, List[Candle]],
         zones_result: Optional[Dict[str, Any]] = None,
-        symbol: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Analyse le contexte de tous les timeframes disponibles.
-        """
-        resolved_symbol = self._resolve_symbol(
-            symbol=symbol,
-            zones_result=zones_result,
-        )
+
         contexts: Dict[str, Dict[str, Any]] = {}
-        for timeframe in SUPPORTED_TIMEFRAMES:
+
+        for timeframe in TIMEFRAMES:
+
             candles = candles_by_timeframe.get(
                 timeframe,
                 [],
             )
+
             if not candles:
                 continue
+
             context = self._analyser_timeframe(
-                candles=candles,
-                timeframe=timeframe,
+                candles,
+                timeframe,
             )
-            contexts[timeframe] = asdict(
-                context
-            )
-        global_context = (
-            self._determine_global_context(
-                contexts
-            )
+
+            contexts[timeframe] = asdict(context)
+
+        global_context = self._determine_global_context(
+            contexts
         )
-        zone_context = (
-            self._analyser_zone_context(
-                candles_by_timeframe=candles_by_timeframe,
-                zones_result=zones_result,
-            )
+
+        zone_context = self._analyser_zone_context(
+            candles_by_timeframe,
+            zones_result,
         )
+
+        symbol = self._resolve_symbol(
+            candles_by_timeframe,
+            zones_result,
+        )
+
         return {
-            "symbol": resolved_symbol,
+            "symbol": symbol,
+
             "timeframes": contexts,
+
             "global": asdict(
                 global_context
             ),
+
             "zone_context": zone_context,
+
+            # Informations destinées aux modules suivants.
+            "market_state": global_context.state,
+            "market_regime": global_context.regime,
+            "direction": global_context.direction,
+            "alignment": global_context.alignment,
+
+            "observations": (
+                global_context.observations
+            ),
+
+            # IMPORTANT : aucun blocage.
+            "adaptive": True,
+            "m5_m1_non_blocking": True,
+            "alignment_is_non_blocking": True,
+            "context_is_decision": False,
+            "decision_owner": "moteur2_decision.py",
         }
-    # -----------------------------------------------------------------------
-    # SYMBOLE
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def _normalize_symbol(
-        symbol: Optional[str],
-    ) -> Optional[str]:
-        if symbol is None:
-            return None
-        normalized = (
-            str(symbol)
-            .upper()
-            .replace("/", "")
-            .replace("-", "")
-            .replace("_", "")
-            .replace(" ", "")
-        )
-        return normalized or None
-    def _resolve_symbol(
-        self,
-        symbol: Optional[str],
-        zones_result: Optional[Dict[str, Any]],
-    ) -> Optional[str]:
-        normalized = self._normalize_symbol(
-            symbol
-        )
-        if normalized:
-            return normalized
-        if isinstance(
-            zones_result,
-            dict,
-        ):
-            normalized = self._normalize_symbol(
-                zones_result.get("symbol")
-            )
-            if normalized:
-                return normalized
-        # Aucun fallback artificiel vers XAUUSD.
-        return None
-    # -----------------------------------------------------------------------
-    # ANALYSE TIMEFRAME
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # TIMEFRAME
+    # ========================================================================
+
     def _analyser_timeframe(
         self,
         candles: List[Candle],
         timeframe: str,
     ) -> ContextTimeframe:
-        cleaned = self._clean_candles(
+
+        candles = self._clean_candles(
             candles
         )
-        if len(cleaned) < MIN_CANDLES_STRUCTURE:
+
+        if len(candles) < MIN_CANDLES:
+
             return ContextTimeframe(
                 timeframe=timeframe,
                 direction="NEUTRE",
                 structure="INSUFFISANTE",
+                regime="INCONNU",
                 strength=0.0,
+                momentum=0.0,
+                volatility=0.0,
                 price=None,
-                reason="Pas assez de données.",
+                observations=[
+                    "Données insuffisantes."
+                ],
+                reason="Pas assez de bougies.",
             )
-        price = self._safe_float(
-            cleaned[-1].close
+
+        price = float(
+            candles[-1].close
         )
+
         direction = self._detect_direction(
-            cleaned,
+            candles,
             timeframe,
         )
+
         structure = self._detect_structure(
-            cleaned,
-            timeframe,
+            candles
         )
+
+        momentum = self._calculate_momentum(
+            candles
+        )
+
+        volatility = self._calculate_volatility(
+            candles
+        )
+
+        regime = self._detect_regime(
+            candles,
+            structure,
+            volatility,
+        )
+
         strength = self._calculate_strength(
-            candles=cleaned,
+            direction,
+            structure,
+            momentum,
+            volatility,
+            regime,
+        )
+
+        observations = self._build_observations(
+            candles=candles,
             direction=direction,
             structure=structure,
-            timeframe=timeframe,
+            regime=regime,
+            momentum=momentum,
+            volatility=volatility,
         )
-        reason = self._build_reason(
-            direction=direction,
-            structure=structure,
-        )
+
         return ContextTimeframe(
             timeframe=timeframe,
             direction=direction,
             structure=structure,
+            regime=regime,
             strength=round(
                 strength,
                 2,
             ),
+            momentum=round(
+                momentum,
+                3,
+            ),
+            volatility=round(
+                volatility,
+                4,
+            ),
             price=price,
-            reason=reason,
+            observations=observations,
+            reason=self._build_reason(
+                direction,
+                structure,
+                regime,
+            ),
         )
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # DIRECTION
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     def _detect_direction(
         self,
         candles: List[Candle],
         timeframe: str,
     ) -> str:
-        if len(candles) < MIN_CANDLES_STRUCTURE:
-            return "NEUTRE"
+
         lookback = min(
-            DIRECTION_LOOKBACK.get(
+            LOOKBACK.get(
                 timeframe,
                 20,
             ),
             len(candles),
         )
+
         recent = candles[-lookback:]
-        start_price = self._safe_float(
+
+        if len(recent) < 3:
+            return "NEUTRE"
+
+        start = float(
             recent[0].close
         )
-        end_price = self._safe_float(
+
+        end = float(
             recent[-1].close
         )
-        if (
-            start_price is None
-            or end_price is None
-            or start_price <= 0
-        ):
+
+        if start <= 0:
             return "NEUTRE"
-        variation = abs(
-            end_price - start_price
+
+        variation = (
+            end - start
+        ) / start
+
+        # Utilisation de la volatilité pour éviter qu'un petit mouvement
+        # soit interprété comme une vraie tendance.
+        average_range = self._average_range(
+            recent
         )
-        average_range = (
-            self._average_candle_range(
-                recent
-            )
-        )
-        if (
-            average_range is None
-            or average_range <= 0
-        ):
-            return "NEUTRE"
-        # Variation totale rapportée à la volatilité
-        # moyenne du timeframe.
-        movement_units = (
-            variation / average_range
-        )
-        minimum_units = (
-            TREND_RANGE_MULTIPLIER.get(
-                timeframe,
-                1.25,
-            )
-        )
-        if movement_units < minimum_units:
-            return "NEUTRE"
-        if end_price > start_price:
+
+        if average_range > 0:
+
+            normalized_move = abs(
+                end - start
+            ) / average_range
+
+            if normalized_move < 0.35:
+                return "NEUTRE"
+
+        if variation >= TREND_THRESHOLD:
             return "HAUSSIER"
-        if end_price < start_price:
+
+        if variation <= -TREND_THRESHOLD:
             return "BAISSIER"
+
+        # Une tendance peut être détectée même si la variation globale
+        # est modérée, lorsque les dernières bougies montrent une pression
+        # cohérente.
+        momentum = self._directional_candle_bias(
+            recent
+        )
+
+        if momentum >= 0.60:
+            return "HAUSSIER"
+
+        if momentum <= -0.60:
+            return "BAISSIER"
+
         return "NEUTRE"
-    # -----------------------------------------------------------------------
-    # STRUCTURE DESCRIPTIVE
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # STRUCTURE
+    # ========================================================================
+
     def _detect_structure(
         self,
         candles: List[Candle],
-        timeframe: str,
     ) -> str:
+
         if len(candles) < 6:
             return "INSUFFISANTE"
-        recent = candles[-6:]
+
+        recent = candles[-7:]
+
         highs = [
             float(c.high)
             for c in recent
         ]
+
         lows = [
             float(c.low)
             for c in recent
         ]
-        higher_highs = self._is_increasing(
+
+        higher_highs = self._is_mostly_increasing(
             highs
         )
-        higher_lows = self._is_increasing(
+
+        higher_lows = self._is_mostly_increasing(
             lows
         )
-        lower_highs = self._is_decreasing(
+
+        lower_highs = self._is_mostly_decreasing(
             highs
         )
-        lower_lows = self._is_decreasing(
+
+        lower_lows = self._is_mostly_decreasing(
             lows
         )
-        if higher_highs and higher_lows:
-            return "STRUCTURE_HAUSSIERE"
-        if lower_highs and lower_lows:
-            return "STRUCTURE_BAISSIERE"
-        # -------------------------------------------------------------------
-        # Détection d'une compression/range avec volatilité locale.
-        # -------------------------------------------------------------------
-        recent_range = (
-            max(highs) - min(lows)
-        )
-        average_range = (
-            self._average_candle_range(
-                recent
-            )
-        )
+
         if (
-            average_range is not None
-            and average_range > 0
-            and recent_range
-            <= average_range
-            * RANGE_WIDTH_ATR_MULTIPLIER
+            higher_highs
+            and higher_lows
+        ):
+            return "STRUCTURE_HAUSSIERE"
+
+        if (
+            lower_highs
+            and lower_lows
+        ):
+            return "STRUCTURE_BAISSIERE"
+
+        range_percent = self._range_percent(
+            candles[-20:]
+        )
+
+        if (
+            range_percent is not None
+            and range_percent <= RANGE_THRESHOLD
         ):
             return "RANGE"
+
         return "TRANSITION"
-    # -----------------------------------------------------------------------
-    # FORCE DU CONTEXTE
-    # -----------------------------------------------------------------------
-    def _calculate_strength(
+
+    # ========================================================================
+    # RÉGIME
+    # ========================================================================
+
+    def _detect_regime(
         self,
         candles: List[Candle],
-        direction: str,
         structure: str,
-        timeframe: str,
-    ) -> float:
-        score = 0.0
-        if direction in (
-            "HAUSSIER",
-            "BAISSIER",
-        ):
-            score += 40.0
+        volatility: float,
+    ) -> str:
+
+        if len(candles) < 8:
+            return "INCONNU"
+
+        if structure == "RANGE":
+            if volatility < 0.0025:
+                return "COMPRESSION"
+            return "RANGE"
+
         if structure in (
             "STRUCTURE_HAUSSIERE",
             "STRUCTURE_BAISSIERE",
         ):
-            score += 35.0
-        elif structure == "RANGE":
-            score += 15.0
+
+            if volatility >= 0.006:
+                return "EXPANSION"
+
+            return "TENDANCE"
+
+        if structure == "TRANSITION":
+
+            if volatility >= 0.006:
+                return "TRANSITION_ACTIVE"
+
+            return "TRANSITION"
+
+        return "NEUTRE"
+
+    # ========================================================================
+    # FORCE
+    # ========================================================================
+
+    @staticmethod
+    def _calculate_strength(
+        direction: str,
+        structure: str,
+        momentum: float,
+        volatility: float,
+        regime: str,
+    ) -> float:
+
+        strength = 0.0
+
+        if direction in (
+            "HAUSSIER",
+            "BAISSIER",
+        ):
+            strength += 30.0
+
+        if structure in (
+            "STRUCTURE_HAUSSIERE",
+            "STRUCTURE_BAISSIERE",
+        ):
+            strength += 30.0
+
         elif structure == "TRANSITION":
-            score += 10.0
-        momentum = self._calculate_momentum(
-            candles
-        )
-        score += min(
-            momentum * 25.0,
+            strength += 12.0
+
+        elif structure == "RANGE":
+            strength += 8.0
+
+        strength += min(
+            abs(momentum) * 30.0,
             25.0,
         )
-        # Les petits timeframes sont légèrement
-        # moins stables comme contexte global.
-        if timeframe in (
-            "M5",
-            "M1",
-        ):
-            score *= 0.90
-        return min(
-            score,
-            100.0,
+
+        if regime == "EXPANSION":
+            strength += 15.0
+
+        elif regime == "TENDANCE":
+            strength += 8.0
+
+        return max(
+            0.0,
+            min(
+                100.0,
+                strength,
+            ),
         )
-    # -----------------------------------------------------------------------
-    # MOMENTUM DESCRIPTIF
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # MOMENTUM
+    # ========================================================================
+
     @staticmethod
     def _calculate_momentum(
         candles: List[Candle],
     ) -> float:
+
         if len(candles) < 5:
             return 0.0
+
         recent = candles[-5:]
-        bullish = 0
-        bearish = 0
+
+        values = []
+
         for candle in recent:
+
             open_price = float(
                 candle.open
             )
-            close_price = float(
+
+            close = float(
                 candle.close
             )
-            if close_price > open_price:
+
+            if open_price <= 0:
+                continue
+
+            values.append(
+                (
+                    close - open_price
+                ) / open_price
+            )
+
+        if not values:
+            return 0.0
+
+        return sum(values)
+
+    @staticmethod
+    def _directional_candle_bias(
+        candles: List[Candle],
+    ) -> float:
+
+        if not candles:
+            return 0.0
+
+        bullish = 0
+        bearish = 0
+        total = 0
+
+        for candle in candles[-7:]:
+
+            try:
+
+                open_price = float(
+                    candle.open
+                )
+
+                close = float(
+                    candle.close
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            total += 1
+
+            if close > open_price:
                 bullish += 1
-            elif close_price < open_price:
+
+            elif close < open_price:
                 bearish += 1
-        return abs(
+
+        if total == 0:
+            return 0.0
+
+        return (
             bullish - bearish
-        ) / 5.0
-    # -----------------------------------------------------------------------
+        ) / total
+
+    # ========================================================================
+    # VOLATILITÉ
+    # ========================================================================
+
+    @staticmethod
+    def _calculate_volatility(
+        candles: List[Candle],
+    ) -> float:
+
+        if len(candles) < 3:
+            return 0.0
+
+        recent = candles[-20:]
+
+        values = []
+
+        for candle in recent:
+
+            try:
+
+                high = float(
+                    candle.high
+                )
+
+                low = float(
+                    candle.low
+                )
+
+                close = float(
+                    candle.close
+                )
+
+                if close <= 0:
+                    continue
+
+                values.append(
+                    (high - low) / close
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        if not values:
+            return 0.0
+
+        return sum(values) / len(values)
+
+    # ========================================================================
+    # OBSERVATIONS
+    # ========================================================================
+
+    def _build_observations(
+        self,
+        candles: List[Candle],
+        direction: str,
+        structure: str,
+        regime: str,
+        momentum: float,
+        volatility: float,
+    ) -> List[str]:
+
+        observations: List[str] = []
+
+        if direction == "HAUSSIER":
+            observations.append(
+                "Pression acheteuse dominante."
+            )
+
+        elif direction == "BAISSIER":
+            observations.append(
+                "Pression vendeuse dominante."
+            )
+
+        else:
+            observations.append(
+                "Direction locale non déterminée."
+            )
+
+        if structure == "STRUCTURE_HAUSSIERE":
+            observations.append(
+                "Structure locale favorable aux acheteurs."
+            )
+
+        elif structure == "STRUCTURE_BAISSIERE":
+            observations.append(
+                "Structure locale favorable aux vendeurs."
+            )
+
+        elif structure == "RANGE":
+            observations.append(
+                "Prix évoluant dans une zone de compression/range."
+            )
+
+        elif structure == "TRANSITION":
+            observations.append(
+                "Structure en transition."
+            )
+
+        if regime == "EXPANSION":
+            observations.append(
+                "Volatilité en expansion."
+            )
+
+        elif regime == "COMPRESSION":
+            observations.append(
+                "Volatilité comprimée."
+            )
+
+        elif regime == "TRANSITION_ACTIVE":
+            observations.append(
+                "Transition accompagnée d'une accélération."
+            )
+
+        if abs(momentum) > 0.003:
+            observations.append(
+                "Momentum relativement marqué."
+            )
+
+        if volatility > 0.008:
+            observations.append(
+                "Volatilité élevée."
+            )
+
+        return observations
+
+    # ========================================================================
     # CONTEXTE AUTOUR DES ZONES
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     def _analyser_zone_context(
         self,
         candles_by_timeframe: Dict[str, List[Candle]],
         zones_result: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
+
         if not zones_result:
             return {
                 "available": False,
                 "zones": [],
             }
+
         zones = zones_result.get(
             "zones",
             [],
         )
-        if not isinstance(
-            zones,
-            list,
-        ):
-            zones = []
-        if not zones:
+
+        if not isinstance(zones, list):
             return {
                 "available": True,
                 "zones": [],
             }
-        output: List[Dict[str, Any]] = []
+
+        output = []
+
         for zone in zones:
+
             if not isinstance(zone, dict):
                 continue
-            center = self._safe_float(
-                zone.get("center")
+
+            center = self._extract_zone_price(
+                zone
             )
-            if (
-                center is None
-                or center <= 0
-            ):
+
+            if center is None:
                 continue
+
             timeframe = str(
                 zone.get(
                     "timeframe",
-                    "",
+                    "M15",
                 )
             ).upper()
-            if timeframe not in SUPPORTED_TIMEFRAMES:
-                continue
+
             candles = candles_by_timeframe.get(
                 timeframe,
                 [],
             )
+
             behavior = (
                 self._analyser_price_around_zone(
-                    candles=candles,
-                    zone_price=center,
-                    timeframe=timeframe,
+                    candles,
+                    center,
                 )
             )
+
             item = dict(zone)
             item["price_behavior"] = behavior
+
             output.append(item)
+
         return {
             "available": True,
             "zones": output,
         }
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # COMPORTEMENT AUTOUR D'UNE ZONE
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     def _analyser_price_around_zone(
         self,
         candles: List[Candle],
         zone_price: float,
-        timeframe: str,
     ) -> Dict[str, Any]:
-        cleaned = self._clean_candles(
-            candles
-        )
-        if not cleaned:
+
+        if not candles:
             return {
                 "state": "INCONNU",
                 "reaction": "AUCUNE_DONNEE",
                 "touches": 0,
-                "bullish_reactions": 0,
-                "bearish_reactions": 0,
             }
-        recent = cleaned[-10:]
-        average_range = (
-            self._average_candle_range(
-                recent
-            )
+
+        recent = candles[-12:]
+
+        average_range = self._average_range(
+            recent
         )
-        if (
-            average_range is None
-            or average_range <= 0
-        ):
-            return {
-                "state": "INCONNU",
-                "reaction": "VOLATILITE_INDISPONIBLE",
-                "touches": 0,
-                "bullish_reactions": 0,
-                "bearish_reactions": 0,
-            }
-        tolerance = (
-            average_range
-            * ZONE_REACTION_ATR_MULTIPLIER.get(
-                timeframe,
-                1.20,
+
+        if average_range <= 0:
+            average_range = (
+                zone_price * 0.001
             )
-        )
+
+        tolerance = average_range * 1.25
+
         touches = 0
-        bullish_reactions = 0
-        bearish_reactions = 0
+        bullish = 0
+        bearish = 0
+        last_distance = None
+
         for candle in recent:
-            high = float(
-                candle.high
+
+            try:
+
+                high = float(
+                    candle.high
+                )
+
+                low = float(
+                    candle.low
+                )
+
+                open_price = float(
+                    candle.open
+                )
+
+                close = float(
+                    candle.close
+                )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            last_distance = (
+                close - zone_price
             )
-            low = float(
-                candle.low
-            )
-            close = float(
-                candle.close
-            )
-            open_price = float(
-                candle.open
-            )
+
             if (
                 low - tolerance
                 <= zone_price
                 <= high + tolerance
             ):
+
                 touches += 1
+
                 if close > open_price:
-                    bullish_reactions += 1
+                    bullish += 1
+
                 elif close < open_price:
-                    bearish_reactions += 1
+                    bearish += 1
+
         if touches == 0:
+
             state = "HORS_ZONE"
             reaction = "AUCUNE"
-        elif bullish_reactions > bearish_reactions:
+
+        elif bullish > bearish:
+
             state = "REACTION_HAUSSIERE"
             reaction = "HAUSSIERE"
-        elif bearish_reactions > bullish_reactions:
+
+        elif bearish > bullish:
+
             state = "REACTION_BAISSIERE"
             reaction = "BAISSIERE"
+
         else:
+
             state = "ZONE_TESTEE"
             reaction = "NEUTRE"
+
         return {
             "state": state,
             "reaction": reaction,
             "touches": touches,
-            "bullish_reactions": bullish_reactions,
-            "bearish_reactions": bearish_reactions,
-            "tolerance": round(
-                tolerance,
-                8,
-            ),
+            "bullish_reactions": bullish,
+            "bearish_reactions": bearish,
+            "last_distance": last_distance,
         }
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # CONTEXTE GLOBAL
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     def _determine_global_context(
         self,
         contexts: Dict[str, Dict[str, Any]],
     ) -> GlobalContext:
+
         if not contexts:
+
             return GlobalContext(
                 direction="NEUTRE",
                 state="DONNEES_INSUFFISANTES",
+                regime="INCONNU",
                 strength=0.0,
+                momentum=0.0,
+                volatility=0.0,
                 dominant_timeframe="NONE",
                 alignment="NONE",
-                reason="Aucun timeframe disponible.",
+                directional_balance=0.0,
+                observations=[
+                    "Aucun timeframe disponible."
+                ],
+                reason="Aucune donnée exploitable.",
             )
-        # H4 / H1 / M15 constituent le contexte principal.
-        h4 = contexts.get("H4")
-        h1 = contexts.get("H1")
-        m15 = contexts.get("M15")
-        main_contexts = [
-            context
-            for context in (
-                h4,
-                h1,
-                m15,
-            )
-            if context is not None
-        ]
-        # -------------------------------------------------------------------
-        # Vote directionnel pondéré.
-        #
-        # H4 possède la priorité maximale.
-        # H1 puis M15.
-        # M5/M1 ne participent pas à cette direction globale.
-        # -------------------------------------------------------------------
-        directional_votes = {
-            "HAUSSIER": 0.0,
-            "BAISSIER": 0.0,
-        }
-        for timeframe, context in (
-            ("H4", h4),
-            ("H1", h1),
-            ("M15", m15),
-        ):
-            if context is None:
-                continue
+
+        bullish = 0.0
+        bearish = 0.0
+
+        weighted_strength = 0.0
+        total_weight = 0.0
+
+        momentum_values = []
+        volatility_values = []
+
+        for timeframe, context in contexts.items():
+
             direction = context.get(
-                "direction"
+                "direction",
+                "NEUTRE",
             )
-            strength = self._safe_float(
+
+            strength = float(
                 context.get(
                     "strength",
-                    0,
-                )
-            ) or 0.0
-            priority = (
-                TIMEFRAME_PRIORITY.get(
-                    timeframe,
-                    0,
+                    0.0,
                 )
             )
-            if direction in directional_votes:
-                directional_votes[
-                    direction
-                ] += (
-                    strength
-                    * (priority + 1)
-                )
-        bullish = directional_votes[
-            "HAUSSIER"
-        ]
-        bearish = directional_votes[
-            "BAISSIER"
-        ]
-        if bullish > bearish:
-            direction = "HAUSSIER"
-        elif bearish > bullish:
-            direction = "BAISSIER"
-        else:
-            direction = "NEUTRE"
-        # -------------------------------------------------------------------
-        # H4 reste l'ancrage principal lorsqu'il est directionnel.
-        # -------------------------------------------------------------------
-        if h4:
-            h4_direction = h4.get(
-                "direction"
+
+            weight = TIMEFRAME_WEIGHT.get(
+                timeframe,
+                1.0,
             )
-            if h4_direction in (
-                "HAUSSIER",
-                "BAISSIER",
-            ):
-                direction = h4_direction
-        # -------------------------------------------------------------------
-        # Alignement H4 / H1 / M15.
-        # -------------------------------------------------------------------
-        directional_contexts = [
-            context
-            for context in main_contexts
-            if context.get("direction")
-            in (
-                "HAUSSIER",
-                "BAISSIER",
-            )
-        ]
-        if not directional_contexts:
-            alignment = "NON_DEFINI"
-        elif len(directional_contexts) == 3 and all(
-            context.get("direction")
-            == direction
-            for context in directional_contexts
-        ):
-            alignment = "COHERENT"
-        elif all(
-            context.get("direction")
-            == direction
-            for context in directional_contexts
-        ):
-            alignment = "PARTIEL_COHERENT"
-        else:
-            alignment = "MIXTE"
-        # -------------------------------------------------------------------
-        # État global descriptif.
-        # -------------------------------------------------------------------
-        if direction == "NEUTRE":
-            state = "NEUTRE"
-        elif alignment == "COHERENT":
+
             if direction == "HAUSSIER":
-                state = "TENDANCE_HAUSSIERE"
-            else:
-                state = "TENDANCE_BAISSIERE"
-        elif alignment == "MIXTE":
-            state = "TRANSITION"
-        else:
-            state = "CONTEXTE_DIRECTIONNEL"
-        strengths = [
-            self._safe_float(
-                context.get(
-                    "strength",
-                    0,
+                bullish += (
+                    strength * weight
                 )
-            ) or 0.0
-            for context in main_contexts
-        ]
-        average_strength = (
-            sum(strengths)
-            / len(strengths)
-            if strengths
+
+            elif direction == "BAISSIER":
+                bearish += (
+                    strength * weight
+                )
+
+            weighted_strength += (
+                strength * weight
+            )
+
+            total_weight += weight
+
+            momentum_values.append(
+                float(
+                    context.get(
+                        "momentum",
+                        0.0,
+                    )
+                )
+            )
+
+            volatility_values.append(
+                float(
+                    context.get(
+                        "volatility",
+                        0.0,
+                    )
+                )
+            )
+
+        balance = (
+            bullish - bearish
+        )
+
+        total_directional = (
+            bullish + bearish
+        )
+
+        if total_directional <= 0:
+
+            direction = "NEUTRE"
+            directional_balance = 0.0
+
+        else:
+
+            directional_balance = (
+                balance
+                / total_directional
+            )
+
+            if directional_balance > 0.12:
+                direction = "HAUSSIER"
+
+            elif directional_balance < -0.12:
+                direction = "BAISSIER"
+
+            else:
+                direction = "NEUTRE"
+
+        alignment = self._determine_alignment(
+            contexts,
+            direction,
+        )
+
+        regime = self._determine_global_regime(
+            contexts,
+            direction,
+        )
+
+        strength = (
+            weighted_strength
+            / total_weight
+            if total_weight > 0
             else 0.0
         )
-        dominant_timeframe = (
-            self._dominant_timeframe(
-                contexts=contexts,
-                direction=direction,
+
+        momentum = (
+            sum(momentum_values)
+            / len(momentum_values)
+            if momentum_values
+            else 0.0
+        )
+
+        volatility = (
+            sum(volatility_values)
+            / len(volatility_values)
+            if volatility_values
+            else 0.0
+        )
+
+        state = self._determine_global_state(
+            direction,
+            alignment,
+            regime,
+        )
+
+        dominant = self._dominant_timeframe(
+            contexts,
+            direction,
+        )
+
+        observations = (
+            self._build_global_observations(
+                contexts,
+                direction,
+                alignment,
+                regime,
             )
         )
-        reason = self._build_global_reason(
-            direction=direction,
-            state=state,
-            alignment=alignment,
-        )
+
         return GlobalContext(
             direction=direction,
             state=state,
+            regime=regime,
             strength=round(
-                average_strength,
+                min(
+                    100.0,
+                    strength,
+                ),
                 2,
             ),
-            dominant_timeframe=dominant_timeframe,
+            momentum=round(
+                momentum,
+                4,
+            ),
+            volatility=round(
+                volatility,
+                5,
+            ),
+            dominant_timeframe=dominant,
             alignment=alignment,
-            reason=reason,
+            directional_balance=round(
+                directional_balance,
+                3,
+            ),
+            observations=observations,
+            reason=(
+                f"Direction={direction}; "
+                f"état={state}; "
+                f"régime={regime}; "
+                f"alignement={alignment}."
+            ),
         )
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # ALIGNEMENT
+    # ========================================================================
+
+    @staticmethod
+    def _determine_alignment(
+        contexts: Dict[str, Dict[str, Any]],
+        global_direction: str,
+    ) -> str:
+
+        primary = []
+
+        for timeframe in (
+            "H4",
+            "H1",
+            "M15",
+        ):
+
+            context = contexts.get(
+                timeframe
+            )
+
+            if not context:
+                continue
+
+            direction = context.get(
+                "direction",
+                "NEUTRE",
+            )
+
+            if direction in (
+                "HAUSSIER",
+                "BAISSIER",
+            ):
+                primary.append(
+                    direction
+                )
+
+        if not primary:
+            return "NON_DEFINI"
+
+        if len(primary) == 1:
+            return "PARTIEL"
+
+        if all(
+            item == global_direction
+            for item in primary
+        ):
+            return "COHERENT"
+
+        if any(
+            item != global_direction
+            for item in primary
+        ):
+            return "MIXTE"
+
+        return "PARTIEL"
+
+    # ========================================================================
+    # RÉGIME GLOBAL
+    # ========================================================================
+
+    @staticmethod
+    def _determine_global_regime(
+        contexts: Dict[str, Dict[str, Any]],
+        direction: str,
+    ) -> str:
+
+        regimes = [
+            str(
+                context.get(
+                    "regime",
+                    "INCONNU",
+                )
+            )
+            for context in contexts.values()
+        ]
+
+        if "EXPANSION" in regimes:
+            return "EXPANSION"
+
+        if (
+            "TENDANCE" in regimes
+            and direction != "NEUTRE"
+        ):
+            return "TENDANCE"
+
+        if "TRANSITION_ACTIVE" in regimes:
+            return "TRANSITION_ACTIVE"
+
+        if "COMPRESSION" in regimes:
+            return "COMPRESSION"
+
+        if "RANGE" in regimes:
+            return "RANGE"
+
+        if "TRANSITION" in regimes:
+            return "TRANSITION"
+
+        return "INCONNU"
+
+    # ========================================================================
+    # ÉTAT GLOBAL
+    # ========================================================================
+
+    @staticmethod
+    def _determine_global_state(
+        direction: str,
+        alignment: str,
+        regime: str,
+    ) -> str:
+
+        if regime == "EXPANSION":
+
+            if direction == "HAUSSIER":
+                return "EXPANSION_HAUSSIERE"
+
+            if direction == "BAISSIER":
+                return "EXPANSION_BAISSIERE"
+
+            return "EXPANSION_NEUTRE"
+
+        if regime == "COMPRESSION":
+            return "COMPRESSION"
+
+        if regime == "RANGE":
+            return "RANGE"
+
+        if regime in (
+            "TRANSITION",
+            "TRANSITION_ACTIVE",
+        ):
+            return "TRANSITION"
+
+        if direction == "HAUSSIER":
+            return "DIRECTION_HAUSSIERE"
+
+        if direction == "BAISSIER":
+            return "DIRECTION_BAISSIERE"
+
+        return "NEUTRE"
+
+    # ========================================================================
+    # OBSERVATIONS GLOBALES
+    # ========================================================================
+
+    @staticmethod
+    def _build_global_observations(
+        contexts: Dict[str, Dict[str, Any]],
+        direction: str,
+        alignment: str,
+        regime: str,
+    ) -> List[str]:
+
+        observations = []
+
+        if direction == "HAUSSIER":
+            observations.append(
+                "Biais directionnel global acheteur."
+            )
+
+        elif direction == "BAISSIER":
+            observations.append(
+                "Biais directionnel global vendeur."
+            )
+
+        else:
+            observations.append(
+                "Biais global neutre ou partagé."
+            )
+
+        if alignment == "COHERENT":
+            observations.append(
+                "H4/H1/M15 présentent une cohérence directionnelle."
+            )
+
+        elif alignment == "MIXTE":
+            observations.append(
+                "Les timeframes principaux divergent."
+            )
+
+        elif alignment == "PARTIEL":
+            observations.append(
+                "L'information directionnelle est partielle."
+            )
+
+        if regime == "EXPANSION":
+            observations.append(
+                "Le marché montre une expansion de volatilité."
+            )
+
+        elif regime == "COMPRESSION":
+            observations.append(
+                "Le marché montre une compression."
+            )
+
+        elif regime in (
+            "TRANSITION",
+            "TRANSITION_ACTIVE",
+        ):
+            observations.append(
+                "Le marché traverse une phase de transition."
+            )
+
+        # Divergence M5/M1 = information, jamais veto.
+        m5 = contexts.get("M5")
+        m1 = contexts.get("M1")
+
+        if m5 and direction in (
+            "HAUSSIER",
+            "BAISSIER",
+        ):
+
+            if (
+                m5.get("direction")
+                not in (
+                    direction,
+                    "NEUTRE",
+                )
+            ):
+                observations.append(
+                    "M5 diverge du contexte global : information secondaire."
+                )
+
+        if m1 and direction in (
+            "HAUSSIER",
+            "BAISSIER",
+        ):
+
+            if (
+                m1.get("direction")
+                not in (
+                    direction,
+                    "NEUTRE",
+                )
+            ):
+                observations.append(
+                    "M1 diverge du contexte global : information secondaire."
+                )
+
+        return observations
+
+    # ========================================================================
     # TIMEFRAME DOMINANT
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     @staticmethod
     def _dominant_timeframe(
         contexts: Dict[str, Dict[str, Any]],
         direction: str,
     ) -> str:
+
         candidates = []
+
         for timeframe, context in contexts.items():
+
             if context.get(
                 "direction"
             ) != direction:
                 continue
-            strength = (
-                Moteur2Contexte._safe_float(
-                    context.get(
-                        "strength",
-                        0,
-                    )
-                )
-                or 0.0
-            )
+
             candidates.append(
                 (
-                    TIMEFRAME_PRIORITY.get(
+                    TIMEFRAME_WEIGHT.get(
                         timeframe,
-                        0,
+                        0.0,
                     ),
-                    strength,
+                    float(
+                        context.get(
+                            "strength",
+                            0.0,
+                        )
+                    ),
                     timeframe,
                 )
             )
+
         if not candidates:
             return "NONE"
+
         candidates.sort(
             reverse=True
         )
+
         return candidates[0][2]
-    # -----------------------------------------------------------------------
-    # RAISONS
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # RAISON
+    # ========================================================================
+
     @staticmethod
     def _build_reason(
         direction: str,
         structure: str,
+        regime: str,
     ) -> str:
-        if direction == "HAUSSIER":
-            direction_text = (
-                "pression acheteuse"
-            )
-        elif direction == "BAISSIER":
-            direction_text = (
-                "pression vendeuse"
-            )
-        else:
-            direction_text = (
-                "absence de direction claire"
-            )
-        return (
-            f"{direction_text}; "
-            f"structure={structure}"
-        )
-    @staticmethod
-    def _build_global_reason(
-        direction: str,
-        state: str,
-        alignment: str,
-    ) -> str:
+
         return (
             f"direction={direction}; "
-            f"état={state}; "
-            f"alignement={alignment}"
+            f"structure={structure}; "
+            f"régime={regime}"
         )
-    # -----------------------------------------------------------------------
-    # VOLATILITÉ
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # EXTRACTION PRIX ZONE
+    # ========================================================================
+
     @staticmethod
-    def _average_candle_range(
-        candles: List[Candle],
+    def _extract_zone_price(
+        zone: Dict[str, Any],
     ) -> Optional[float]:
-        if not candles:
-            return None
-        ranges: List[float] = []
-        for candle in candles:
-            try:
-                high = float(
-                    candle.high
-                )
-                low = float(
-                    candle.low
-                )
-            except (
-                TypeError,
-                ValueError,
-                AttributeError,
-            ):
-                continue
+
+        for key in (
+            "center",
+            "price",
+            "level",
+            "zone_price",
+            "value",
+            "mid",
+        ):
+
+            value = Moteur2Contexte._safe_float(
+                zone.get(key)
+            )
+
             if (
-                high > 0
-                and low > 0
-                and high >= low
+                value is not None
+                and value > 0
             ):
-                candle_range = (
-                    high - low
-                )
-                if candle_range > 0:
-                    ranges.append(
-                        candle_range
-                    )
-        if not ranges:
-            return None
-        return (
-            sum(ranges)
-            / len(ranges)
+                return value
+
+        low = Moteur2Contexte._safe_float(
+            zone.get("low")
         )
-    # -----------------------------------------------------------------------
-    # OUTILS
-    # -----------------------------------------------------------------------
+
+        high = Moteur2Contexte._safe_float(
+            zone.get("high")
+        )
+
+        if (
+            low is not None
+            and high is not None
+            and low > 0
+            and high > 0
+        ):
+            return (
+                low + high
+            ) / 2.0
+
+        return None
+
+    # ========================================================================
+    # UTILITAIRES
+    # ========================================================================
+
     @staticmethod
-    def _is_increasing(
+    def _is_mostly_increasing(
         values: List[float],
     ) -> bool:
-        if len(values) < 2:
+
+        if len(values) < 3:
             return False
+
         changes = sum(
             values[i] > values[i - 1]
-            for i in range(
-                1,
-                len(values),
-            )
+            for i in range(1, len(values))
         )
-        return changes >= (
-            len(values) - 2
-        )
+
+        return changes >= len(values) - 2
+
     @staticmethod
-    def _is_decreasing(
+    def _is_mostly_decreasing(
         values: List[float],
     ) -> bool:
-        if len(values) < 2:
+
+        if len(values) < 3:
             return False
+
         changes = sum(
             values[i] < values[i - 1]
-            for i in range(
-                1,
-                len(values),
-            )
+            for i in range(1, len(values))
         )
-        return changes >= (
-            len(values) - 2
-        )
+
+        return changes >= len(values) - 2
+
     @staticmethod
-    def _clean_candles(
+    def _average_range(
         candles: List[Candle],
-    ) -> List[Candle]:
-        output: List[Candle] = []
+    ) -> float:
+
+        ranges = []
+
         for candle in candles:
+
             try:
-                open_price = float(
-                    candle.open
-                )
+
                 high = float(
                     candle.high
                 )
+
                 low = float(
                     candle.low
                 )
-                close = float(
-                    candle.close
-                )
-                if (
-                    open_price > 0
-                    and high > 0
-                    and low > 0
-                    and close > 0
-                    and high >= low
-                    and high >= open_price
-                    and high >= close
-                    and low <= open_price
-                    and low <= close
-                ):
-                    output.append(
-                        candle
+
+                if high >= low:
+                    ranges.append(
+                        high - low
                     )
+
             except (
                 TypeError,
                 ValueError,
-                AttributeError,
             ):
                 continue
-        return output
+
+        if not ranges:
+            return 0.0
+
+        return sum(ranges) / len(ranges)
+
     @staticmethod
-    def _safe_float(
-        value: Any,
+    def _range_percent(
+        candles: List[Candle],
     ) -> Optional[float]:
+
+        if not candles:
+            return None
+
         try:
-            return float(value)
+
+            highest = max(
+                float(c.high)
+                for c in candles
+            )
+
+            lowest = min(
+                float(c.low)
+                for c in candles
+            )
+
         except (
             TypeError,
             ValueError,
         ):
             return None
-# ---------------------------------------------------------------------------
+
+        if lowest <= 0:
+            return None
+
+        return (
+            highest - lowest
+        ) / lowest
+
+    @staticmethod
+    def _clean_candles(
+        candles: List[Candle],
+    ) -> List[Candle]:
+
+        cleaned = []
+
+        for candle in candles:
+
+            try:
+
+                open_price = float(
+                    candle.open
+                )
+
+                high = float(
+                    candle.high
+                )
+
+                low = float(
+                    candle.low
+                )
+
+                close = float(
+                    candle.close
+                )
+
+                if (
+                    open_price > 0
+                    and high >= low
+                    and close > 0
+                ):
+                    cleaned.append(
+                        candle
+                    )
+
+            except (
+                TypeError,
+                ValueError,
+                AttributeError,
+            ):
+                continue
+
+        return cleaned
+
+    @staticmethod
+    def _safe_float(
+        value: Any,
+    ) -> Optional[float]:
+
+        try:
+            return float(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+    @staticmethod
+    def _resolve_symbol(
+        candles_by_timeframe: Dict[str, List[Candle]],
+        zones_result: Optional[Dict[str, Any]],
+    ) -> str:
+
+        if zones_result:
+
+            symbol = zones_result.get(
+                "symbol"
+            )
+
+            if symbol:
+                return (
+                    str(symbol)
+                    .upper()
+                    .replace("/", "")
+                )
+
+        return "XAUUSD"
+
+
+# ============================================================================
 # FONCTION SIMPLE
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 def analyser_contexte(
     candles_by_timeframe: Dict[str, List[Candle]],
     zones_result: Optional[Dict[str, Any]] = None,
-    symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Fonction pratique pour analyser le contexte.
-    """
+
     moteur = Moteur2Contexte()
+
     return moteur.analyser(
         candles_by_timeframe=candles_by_timeframe,
         zones_result=zones_result,
-        symbol=symbol,
     )
