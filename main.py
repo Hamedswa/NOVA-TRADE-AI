@@ -1,37 +1,60 @@
-“””
 NOVA TRADE AI
+
 main.py
+
 Point d’entrée principal.
 
 MOTEUR 2 :
-- XAU/USD
-- BTC/USD
-- EUR/USD
-- GBP/USD
-- BiQuote uniquement
-- H4 → H1 → M15 → M5 → M1
+
+XAU/USD
+
+BTC/USD
+
+EUR/USD
+
+GBP/USD
+
+BiQuote uniquement
+
+H4 -> H1 -> M15 -> M5 -> M1
 
 Architecture :
+
 BiQuote
-↓
+
+->
+
 Moteur 2
-↓
+
+->
+
 Validation finale
-↓
+
+->
+
 Anti-spam
-↓
+
+->
+
 Telegram
 
 IMPORTANT :
+
 - Moteur 1 n’est plus utilisé.
+
 - La validation finale appartient exclusivement
+
 à moteur2_validation.py.
+
 - M5 est la confirmation principale.
+
 - M1 est la confirmation secondaire.
+
 - RR minimum = 1:3.
+
 - L’exécution automatique est désactivée.
+
 - Les superviseurs news/session restent informatifs.
-“””
 
 from future import annotations
 
@@ -95,7 +118,7 @@ print(
 )
 print(
     "Timeframes        : "
-    + " → ".join(TIMEFRAMES)
+    + " -> ".join(TIMEFRAMES)
 )
 print(
     f"RR minimum        : 1:{MINIMUM_RR:g}"
@@ -179,12 +202,11 @@ ASGI COMPATIBILITY FOR RAILWAY / UVICORN
 
 async def app(scope, receive, send):
 “””
-Minimal ASGI application.
+Application ASGI minimale permettant à Uvicorn
+de charger main:app.
 
-Railway/Uvicorn peut charger `main:app`.
-Le bot Telegram reste géré par `main()`.
-Cette application ASGI ne contient aucune logique
-de trading et ne modifie pas le fonctionnement du Moteur 2.
+Cette application ne contient aucune logique
+de trading et ne modifie pas le Moteur 2.
 """
 if scope["type"] != "http":
     return
@@ -194,8 +216,14 @@ await send(
         "type": "http.response.start",
         "status": 200,
         "headers": [
-            [b"content-type", b"text/plain; charset=utf-8"],
-            [b"content-length", str(len(body)).encode()],
+            [
+                b"content-type",
+                b"text/plain; charset=utf-8",
+            ],
+            [
+                b"content-length",
+                str(len(body)).encode(),
+            ],
         ],
     }
 )
