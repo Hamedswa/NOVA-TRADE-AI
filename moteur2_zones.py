@@ -1,50 +1,50 @@
 """
-NOVA TRADE AI - Moteur 2
+NOVA TRADE AI - MOTEUR 2
 moteur2_zones.py
-Sélection et qualification des zones importantes du marché.
-Actifs supportés :
-    XAUUSD
-    BTCUSD
-    EURUSD
-    GBPUSD
-Timeframes :
-    H4
-    H1
-    M15
-    M5
-    M1
-Rôle du module :
-    1. récupérer les zones issues de moteur2_marche.py
-    2. comparer les zones entre les timeframes
-    3. mesurer leur proximité avec le prix actuel
-    4. mesurer leur force
-    5. identifier les zones multi-timeframes
-    6. rechercher les réactions historiques
-    7. produire une liste de zones candidates
+
+Cartographie adaptative des zones de marché.
+
+RÔLE :
+    - récupérer les zones issues de moteur2_marche.py
+    - mesurer leur proximité avec le prix
+    - mesurer leur force et leur activité
+    - rechercher les convergences multi-timeframes
+    - conserver les zones faibles comme informations
+    - classer les zones par pertinence
+
 IMPORTANT :
-    Ce module est descriptif.
+    Ce module ne décide jamais BUY / SELL / WAIT.
+
     Il ne :
-        - décide pas BUY/SELL
-        - ne produit pas de signal
+        - produit pas de signal final
         - ne calcule pas Entry / SL / TP
-        - ne calcule pas le RR
         - ne valide pas un setup final
-        - ne bloque pas un signal
-La validation finale appartient exclusivement
-à moteur2_validation.py.
+        - ne bloque pas une opportunité
+        - n'impose pas un nombre minimal de zones
+        - n'impose pas une force minimale
+        - n'impose pas une convergence multi-timeframe
+
+La décision stratégique appartient exclusivement
+à moteur2_decision.py.
 """
+
 from __future__ import annotations
+
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
-# ---------------------------------------------------------------------------
+
+
+# ============================================================================
 # CONFIGURATION
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 SUPPORTED_SYMBOLS = (
     "XAUUSD",
     "BTCUSD",
     "EURUSD",
     "GBPUSD",
 )
+
 SUPPORTED_TIMEFRAMES = (
     "H4",
     "H1",
@@ -52,9 +52,7 @@ SUPPORTED_TIMEFRAMES = (
     "M5",
     "M1",
 )
-# Importance relative des timeframes.
-# Les grands timeframes ont davantage de poids dans
-# la qualification d'une zone.
+
 TIMEFRAME_WEIGHT = {
     "H4": 4.0,
     "H1": 3.0,
@@ -62,106 +60,121 @@ TIMEFRAME_WEIGHT = {
     "M5": 1.0,
     "M1": 0.5,
 }
-# ---------------------------------------------------------------------------
-# PARAMÈTRES DE VOLATILITÉ
-# ---------------------------------------------------------------------------
-# Tolérance de base exprimée en multiples de la moyenne
-# des amplitudes de bougies.
-#
-# Cette approche évite d'utiliser la même distance absolue
-# ou le même pourcentage pour EURUSD et BTCUSD par exemple.
-TIMEFRAME_ZONE_TOLERANCE_ATR = {
+
+TIMEFRAME_ZONE_TOLERANCE = {
     "H4": 2.50,
     "H1": 2.00,
     "M15": 1.50,
     "M5": 1.20,
     "M1": 1.00,
 }
-# Nombre de bougies utilisées pour estimer l'amplitude
-# moyenne lorsqu'elle est disponible dans la market map.
+
 VOLATILITY_LOOKBACK = 20
-# Protection contre une volatilité aberrante.
+
 MIN_VOLATILITY_RATIO = 0.000001
 MAX_VOLATILITY_RATIO = 0.25
-# ---------------------------------------------------------------------------
-# SCORES
-# ---------------------------------------------------------------------------
-MIN_ZONE_SCORE = 25.0
+
+# Ces valeurs servent uniquement à décrire / classer.
+# Elles ne sont PAS des seuils de rejet.
 IMPORTANT_ZONE_SCORE = 60.0
+
 MAX_PROXIMITY_SCORE = 30.0
 MAX_STRENGTH_SCORE = 21.0
 MAX_REACTION_SCORE = 10.0
 MAX_MULTI_TIMEFRAME_SCORE = 15.0
-# ---------------------------------------------------------------------------
+
+
+# ============================================================================
 # STRUCTURES
-# ---------------------------------------------------------------------------
+# ============================================================================
+
 @dataclass
 class ZoneCandidate:
-    """
-    Zone candidate pour une analyse future.
-    Cette structure ne représente pas un signal.
-    """
     low: float
     high: float
     center: float
+
     kind: str
     timeframe: str
+
     strength: float
     touches: int
+
     distance_percent: float
     distance_units: float
+
     proximity_score: float
     strength_score: float
     timeframe_score: float
     reaction_score: float
     multi_timeframe_score: float
+
     related_timeframes: Tuple[str, ...]
+
     total_score: float
+
     near_current_price: bool
     multi_timeframe: bool
+
+    relevance: str
     reason: str
-# ---------------------------------------------------------------------------
-# MOTEUR DE ZONES
-# ---------------------------------------------------------------------------
+
+
+# ============================================================================
+# MOTEUR
+# ============================================================================
+
 class Moteur2Zones:
     """
-    Qualification des zones intéressantes.
-    Le moteur reste entièrement descriptif.
+    Cartographie adaptative des zones.
+
+    Une zone faible reste une information.
+    Une zone forte devient une information plus importante.
+
+    Le module ne décide jamais si une zone doit produire un trade.
     """
+
     def __init__(
         self,
-        min_score: float = MIN_ZONE_SCORE,
+        min_score: Optional[float] = None,
     ):
-        self.min_score = float(min_score)
-    # -----------------------------------------------------------------------
-    # MÉTHODE PRINCIPALE
-    # -----------------------------------------------------------------------
+        # Conservé uniquement pour compatibilité avec
+        # d'anciens appels du projet.
+        #
+        # IMPORTANT :
+        # ce paramètre ne filtre plus les zones.
+        self.min_score = (
+            float(min_score)
+            if min_score is not None
+            else 0.0
+        )
+
+    # ========================================================================
+    # ANALYSE PRINCIPALE
+    # ========================================================================
+
     def analyser(
         self,
         market_map: Dict[str, Any],
         current_price: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """
-        Analyse la carte du marché et retourne les zones
-        candidates classées par importance.
-        """
+
+        if not isinstance(market_map, dict):
+            market_map = {}
+
         symbol = self._extract_symbol(market_map)
+
         if current_price is None:
             current_price = self._extract_current_price(
                 market_map
             )
+
         raw_zones = self._extract_zones(
             market_map
         )
-        if not raw_zones:
-            return {
-                "symbol": symbol,
-                "current_price": current_price,
-                "zones": [],
-                "important_zones": [],
-                "nearby_zones": [],
-            }
+
         candidates: List[ZoneCandidate] = []
+
         for zone in raw_zones:
             candidate = self._qualify_zone(
                 zone=zone,
@@ -169,184 +182,371 @@ class Moteur2Zones:
                 market_map=market_map,
                 current_price=current_price,
             )
-            if candidate is None:
-                continue
-            if candidate.total_score < self.min_score:
-                continue
-            candidates.append(candidate)
-        # Meilleure zone en premier.
+
+            if candidate is not None:
+                # AUCUN FILTRE DE SCORE.
+                candidates.append(candidate)
+
         candidates.sort(
             key=lambda item: (
                 item.total_score,
-                item.timeframe_score,
+                item.proximity_score,
                 item.strength_score,
+                item.timeframe_score,
             ),
             reverse=True,
         )
+
         important_zones = [
             item
             for item in candidates
             if item.total_score >= IMPORTANT_ZONE_SCORE
         ]
+
         nearby_zones = [
             item
             for item in candidates
             if item.near_current_price
         ]
+
+        distant_zones = [
+            item
+            for item in candidates
+            if not item.near_current_price
+        ]
+
+        strong_zones = [
+            item
+            for item in candidates
+            if item.strength_score >= 14.0
+        ]
+
+        multi_timeframe_zones = [
+            item
+            for item in candidates
+            if item.multi_timeframe
+        ]
+
         return {
             "symbol": symbol,
             "current_price": current_price,
+
             "zones": [
                 asdict(item)
                 for item in candidates
             ],
+
             "important_zones": [
                 asdict(item)
                 for item in important_zones
             ],
+
             "nearby_zones": [
                 asdict(item)
                 for item in nearby_zones
             ],
+
+            "distant_zones": [
+                asdict(item)
+                for item in distant_zones
+            ],
+
+            "strong_zones": [
+                asdict(item)
+                for item in strong_zones
+            ],
+
+            "multi_timeframe_zones": [
+                asdict(item)
+                for item in multi_timeframe_zones
+            ],
+
+            "metadata": {
+                "adaptive": True,
+                "all_detected_zones_preserved": True,
+                "zone_score_is_blocking": False,
+                "minimum_zone_score_is_blocking": False,
+                "important_zone_is_descriptive": True,
+                "proximity_is_blocking": False,
+                "strength_is_blocking": False,
+                "multi_timeframe_is_blocking": False,
+                "m5_m1_are_blocking": False,
+                "zone_module_decides_trade": False,
+                "decision_required": True,
+                "decision_owner": "moteur2_decision.py",
+                "forced_signal": False,
+                "multiple_zones_allowed": True,
+            },
         }
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # SYMBOLE
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     @staticmethod
     def _extract_symbol(
         market_map: Dict[str, Any],
     ) -> Optional[str]:
-        """
-        Extrait le symbole sans jamais imposer XAUUSD
-        comme fallback.
-        """
-        symbol = market_map.get("symbol")
-        if symbol is None:
-            return None
-        normalized = (
-            str(symbol)
-            .upper()
-            .replace("/", "")
-            .replace("-", "")
-            .replace("_", "")
-            .replace(" ", "")
-        )
-        if normalized in SUPPORTED_SYMBOLS:
-            return normalized
-        return normalized or None
-    # -----------------------------------------------------------------------
-    # EXTRACTION DES ZONES
-    # -----------------------------------------------------------------------
-    def _extract_zones(
-        self,
+
+        possible = [
+            market_map.get("symbol"),
+            market_map.get("pair"),
+            market_map.get("instrument"),
+        ]
+
+        for value in possible:
+            if value is None:
+                continue
+
+            normalized = (
+                str(value)
+                .upper()
+                .replace("/", "")
+                .replace("-", "")
+                .replace("_", "")
+                .replace(" ", "")
+            )
+
+            if normalized:
+                return normalized
+
+        return None
+
+    # ========================================================================
+    # PRIX ACTUEL
+    # ========================================================================
+
+    @staticmethod
+    def _extract_current_price(
         market_map: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        """
-        Récupère les zones provenant de moteur2_marche.py.
-        Priorité :
-            1. zones globales
-            2. zones de chaque timeframe
-        """
+    ) -> Optional[float]:
+
+        candidates = [
+            market_map.get("current_price"),
+            market_map.get("price"),
+            market_map.get("last_price"),
+            market_map.get("close"),
+        ]
+
+        for value in candidates:
+            number = Moteur2Zones._safe_float(
+                value,
+                None,
+            )
+
+            if number is not None and number > 0:
+                return number
+
         global_data = market_map.get(
             "global",
             {},
         )
+
         if isinstance(global_data, dict):
+            for key in (
+                "current_price",
+                "price",
+                "last_price",
+                "close",
+            ):
+                number = Moteur2Zones._safe_float(
+                    global_data.get(key),
+                    None,
+                )
+
+                if number is not None and number > 0:
+                    return number
+
+        return None
+
+    # ========================================================================
+    # EXTRACTION DES ZONES
+    # ========================================================================
+
+    def _extract_zones(
+        self,
+        market_map: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+
+        output: List[Dict[str, Any]] = []
+
+        global_data = market_map.get(
+            "global",
+            {},
+        )
+
+        if isinstance(global_data, dict):
+
             global_zones = global_data.get(
                 "zones",
                 [],
             )
-            if isinstance(global_zones, list) and global_zones:
-                output = []
+
+            if isinstance(global_zones, list):
+
                 for zone in global_zones:
+
                     if not isinstance(zone, dict):
                         continue
+
                     item = dict(zone)
+
                     if self._valid_zone(item):
                         output.append(item)
-                if output:
-                    return output
-        # -------------------------------------------------------------------
-        # Fallback interne légitime :
-        # récupération depuis les timeframes.
-        #
-        # Ce n'est PAS un fallback de symbole.
-        # -------------------------------------------------------------------
-        output: List[Dict[str, Any]] = []
+
         timeframes = market_map.get(
             "timeframes",
             {},
         )
-        if not isinstance(timeframes, dict):
-            return output
-        for timeframe, data in timeframes.items():
-            timeframe_name = str(
-                timeframe
-            ).upper()
-            if timeframe_name not in SUPPORTED_TIMEFRAMES:
-                continue
-            if not isinstance(data, dict):
-                continue
-            zones = data.get(
-                "zones",
-                [],
-            )
-            if not isinstance(zones, list):
-                continue
-            for zone in zones:
-                if not isinstance(zone, dict):
+
+        if isinstance(timeframes, dict):
+
+            for timeframe, data in timeframes.items():
+
+                timeframe_name = str(
+                    timeframe
+                ).upper()
+
+                if timeframe_name not in SUPPORTED_TIMEFRAMES:
                     continue
-                item = dict(zone)
-                item.setdefault(
-                    "timeframe",
-                    timeframe_name,
+
+                if not isinstance(data, dict):
+                    continue
+
+                zones = data.get(
+                    "zones",
+                    [],
                 )
-                if self._valid_zone(item):
-                    output.append(item)
-        return output
-    # -----------------------------------------------------------------------
-    # VALIDATION ZONE
-    # -----------------------------------------------------------------------
+
+                if not isinstance(zones, list):
+                    continue
+
+                for zone in zones:
+
+                    if not isinstance(zone, dict):
+                        continue
+
+                    item = dict(zone)
+
+                    item.setdefault(
+                        "timeframe",
+                        timeframe_name,
+                    )
+
+                    if self._valid_zone(item):
+                        output.append(item)
+
+        return self._deduplicate_zones(
+            output
+        )
+
+    # ========================================================================
+    # VALIDATION TECHNIQUE D'UNE ZONE
+    # ========================================================================
+
     @staticmethod
     def _valid_zone(
         zone: Dict[str, Any],
     ) -> bool:
-        required = (
-            "low",
-            "high",
-            "center",
-            "kind",
-            "timeframe",
-        )
-        if not all(
-            key in zone
-            for key in required
-        ):
-            return False
+
         try:
-            low = float(zone["low"])
-            high = float(zone["high"])
-            center = float(zone["center"])
+            low = float(
+                zone.get("low")
+            )
+
+            high = float(
+                zone.get("high")
+            )
+
+            center = float(
+                zone.get("center")
+            )
+
         except (
             TypeError,
             ValueError,
         ):
             return False
+
         if low <= 0 or high <= 0:
             return False
+
         if high < low:
             return False
+
         if not low <= center <= high:
             return False
+
         timeframe = str(
-            zone["timeframe"]
+            zone.get(
+                "timeframe",
+                "",
+            )
         ).upper()
+
         if timeframe not in SUPPORTED_TIMEFRAMES:
             return False
+
         return True
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # DÉDUPLICATION
+    # ========================================================================
+
+    @staticmethod
+    def _deduplicate_zones(
+        zones: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+
+        result: List[Dict[str, Any]] = []
+        seen: Set[Tuple[Any, ...]] = set()
+
+        for zone in zones:
+
+            key = (
+                str(
+                    zone.get(
+                        "timeframe",
+                        "",
+                    )
+                ).upper(),
+
+                round(
+                    Moteur2Zones._safe_float(
+                        zone.get("low"),
+                        0.0,
+                    ),
+                    8,
+                ),
+
+                round(
+                    Moteur2Zones._safe_float(
+                        zone.get("high"),
+                        0.0,
+                    ),
+                    8,
+                ),
+
+                str(
+                    zone.get(
+                        "kind",
+                        "ZONE",
+                    )
+                ).upper(),
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(zone)
+
+        return result
+
+    # ========================================================================
     # QUALIFICATION
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     def _qualify_zone(
         self,
         zone: Dict[str, Any],
@@ -354,6 +554,7 @@ class Moteur2Zones:
         market_map: Dict[str, Any],
         current_price: Optional[float],
     ) -> Optional[ZoneCandidate]:
+
         try:
             low = float(zone["low"])
             high = float(zone["high"])
@@ -363,31 +564,35 @@ class Moteur2Zones:
             ValueError,
         ):
             return None
+
         timeframe = str(
             zone.get(
                 "timeframe",
                 "",
             )
         ).upper()
+
         if timeframe not in SUPPORTED_TIMEFRAMES:
             return None
+
         kind = str(
             zone.get(
                 "kind",
-                "UNKNOWN",
+                "ZONE",
             )
         )
-        strength = self._safe_float(
-            zone.get(
-                "strength",
-                1.0,
-            ),
-            1.0,
-        )
+
         strength = max(
             0.0,
-            strength,
+            self._safe_float(
+                zone.get(
+                    "strength",
+                    1.0,
+                ),
+                1.0,
+            ),
         )
+
         touches = max(
             0,
             int(
@@ -400,57 +605,67 @@ class Moteur2Zones:
                 )
             ),
         )
-        # -------------------------------------------------------------------
-        # VOLATILITÉ LOCALE
-        # -------------------------------------------------------------------
+
         volatility = self._estimate_volatility(
             market_map=market_map,
             timeframe=timeframe,
             reference_price=center,
         )
-        # -------------------------------------------------------------------
-        # DISTANCE AU PRIX
-        # -------------------------------------------------------------------
+
+        # --------------------------------------------------------------------
+        # DISTANCE
+        # --------------------------------------------------------------------
+
         if (
             current_price is not None
             and current_price > 0
         ):
+
             distance = abs(
                 center - current_price
             )
+
             distance_percent = (
                 distance
                 / current_price
                 * 100.0
             )
+
         else:
+
             distance = 0.0
-            distance_percent = 999.0
+            distance_percent = 0.0
+
         distance_units = (
             distance / volatility
             if volatility > 0
-            else 999.0
+            else 0.0
         )
+
         near_current_price = (
             self._is_near_price(
-                distance_units=distance_units,
-                timeframe=timeframe,
+                distance_units,
+                timeframe,
             )
         )
-        # -------------------------------------------------------------------
-        # SCORES
-        # -------------------------------------------------------------------
+
+        # --------------------------------------------------------------------
+        # SCORES DESCRIPTIFS
+        # --------------------------------------------------------------------
+
         proximity_score = (
             self._calculate_proximity_score(
-                distance_units=distance_units,
-                timeframe=timeframe,
+                distance_units,
+                timeframe,
             )
         )
+
         strength_score = (
             self._calculate_strength_score(
                 strength
             )
         )
+
         timeframe_score = (
             TIMEFRAME_WEIGHT.get(
                 timeframe,
@@ -458,11 +673,13 @@ class Moteur2Zones:
             )
             * 4.0
         )
+
         reaction_score = (
             self._calculate_reaction_score(
                 touches
             )
         )
+
         related_timeframes = (
             self._find_related_timeframes(
                 target_zone=zone,
@@ -470,23 +687,25 @@ class Moteur2Zones:
                 market_map=market_map,
             )
         )
+
         multi_tf_count = len(
             related_timeframes
         )
+
         multi_timeframe = (
             multi_tf_count >= 2
         )
-        # Le timeframe d'origine est déjà compté.
-        # Les timeframes supplémentaires ajoutent progressivement
-        # de la valeur sans dépasser le plafond.
+
         additional_tf_count = max(
             0,
             multi_tf_count - 1,
         )
+
         multi_timeframe_score = min(
             additional_tf_count * 5.0,
             MAX_MULTI_TIMEFRAME_SCORE,
         )
+
         total_score = min(
             proximity_score
             + strength_score
@@ -495,6 +714,13 @@ class Moteur2Zones:
             + multi_timeframe_score,
             100.0,
         )
+
+        relevance = (
+            self._classify_relevance(
+                total_score
+            )
+        )
+
         reason = self._build_reason(
             zone=zone,
             near_current_price=near_current_price,
@@ -503,7 +729,9 @@ class Moteur2Zones:
             distance_percent=distance_percent,
             distance_units=distance_units,
             related_timeframes=related_timeframes,
+            relevance=relevance,
         )
+
         return ZoneCandidate(
             low=low,
             high=high,
@@ -552,104 +780,125 @@ class Moteur2Zones:
             ),
             near_current_price=near_current_price,
             multi_timeframe=multi_timeframe,
+            relevance=relevance,
             reason=reason,
         )
-    # -----------------------------------------------------------------------
-    # ESTIMATION DE VOLATILITÉ
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # VOLATILITÉ
+    # ========================================================================
+
     def _estimate_volatility(
         self,
         market_map: Dict[str, Any],
         timeframe: str,
         reference_price: Optional[float] = None,
     ) -> float:
-        """
-        Estime l'amplitude moyenne des bougies du timeframe.
-        Plusieurs formats possibles sont acceptés afin de rester
-        compatible avec les données provenant de BiQuote/cache.
-        Si aucune volatilité exploitable n'est disponible,
-        une petite estimation relative au prix est utilisée.
-        Cette estimation sert uniquement aux distances de zones.
-        """
-        data = (
-            market_map
-            .get("timeframes", {})
-            .get(timeframe, {})
+
+        timeframes = market_map.get(
+            "timeframes",
+            {},
         )
+
+        data = (
+            timeframes.get(
+                timeframe,
+                {},
+            )
+            if isinstance(timeframes, dict)
+            else {}
+        )
+
         if not isinstance(data, dict):
             data = {}
+
         candles = data.get(
             "candles",
             [],
         )
-        if not isinstance(candles, list):
-            candles = []
+
         ranges: List[float] = []
-        for candle in candles[-VOLATILITY_LOOKBACK:]:
-            if not isinstance(candle, dict):
-                continue
-            high = self._safe_float(
-                candle.get("high"),
-                None,
-            )
-            low = self._safe_float(
-                candle.get("low"),
-                None,
-            )
-            if (
-                high is None
-                or low is None
-                or high <= 0
-                or low <= 0
-                or high < low
-            ):
-                continue
-            candle_range = high - low
-            if candle_range > 0:
-                ranges.append(
-                    candle_range
+
+        if isinstance(candles, list):
+
+            for candle in candles[
+                -VOLATILITY_LOOKBACK:
+            ]:
+
+                if not isinstance(candle, dict):
+                    continue
+
+                high = self._safe_float(
+                    candle.get("high"),
+                    None,
                 )
+
+                low = self._safe_float(
+                    candle.get("low"),
+                    None,
+                )
+
+                if (
+                    high is None
+                    or low is None
+                    or high <= 0
+                    or low <= 0
+                    or high < low
+                ):
+                    continue
+
+                candle_range = (
+                    high - low
+                )
+
+                if candle_range > 0:
+                    ranges.append(
+                        candle_range
+                    )
+
         if ranges:
+
             average_range = (
                 sum(ranges)
                 / len(ranges)
             )
+
             if average_range > 0:
                 return average_range
-        # -------------------------------------------------------------------
-        # Autres informations possibles exposées par la cartographie.
-        # -------------------------------------------------------------------
+
         for key in (
             "average_range",
             "avg_range",
             "volatility",
             "candle_range",
         ):
+
             value = self._safe_float(
                 data.get(key),
                 None,
             )
+
             if (
                 value is not None
                 and value > 0
             ):
                 return value
-        # -------------------------------------------------------------------
-        # Dernier recours : estimation relative au prix.
-        #
-        # Elle est volontairement prudente et ne sert pas
-        # à produire un signal.
-        # -------------------------------------------------------------------
+
         price = reference_price
+
         if price is None:
             price = self._safe_float(
-                data.get("current_price"),
+                data.get(
+                    "current_price"
+                ),
                 None,
             )
+
         if (
             price is not None
             and price > 0
         ):
+
             relative_ratio = {
                 "H4": 0.0040,
                 "H1": 0.0020,
@@ -660,52 +909,56 @@ class Moteur2Zones:
                 timeframe,
                 0.0010,
             )
+
             return max(
                 price * relative_ratio,
                 price * MIN_VOLATILITY_RATIO,
             )
+
         return 1.0
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # PROXIMITÉ
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
+    @staticmethod
     def _is_near_price(
-        self,
         distance_units: float,
         timeframe: str,
     ) -> bool:
-        maximum = (
-            TIMEFRAME_ZONE_TOLERANCE_ATR.get(
-                timeframe,
-                1.5,
-            )
+
+        maximum = TIMEFRAME_ZONE_TOLERANCE.get(
+            timeframe,
+            1.5,
         )
-        return distance_units <= maximum
+
+        return (
+            distance_units <= maximum
+        )
+
+    @staticmethod
     def _calculate_proximity_score(
-        self,
         distance_units: float,
         timeframe: str,
     ) -> float:
-        """
-        Score de proximité basé sur la volatilité locale.
-        Une zone au centre du prix obtient le maximum.
-        Une zone trop éloignée obtient zéro.
-        """
-        maximum = (
-            TIMEFRAME_ZONE_TOLERANCE_ATR.get(
-                timeframe,
-                1.5,
-            )
+
+        maximum = TIMEFRAME_ZONE_TOLERANCE.get(
+            timeframe,
+            1.5,
         )
+
         if (
             maximum <= 0
             or distance_units < 0
             or distance_units > maximum
         ):
             return 0.0
+
         ratio = (
             1.0
             - distance_units / maximum
         )
+
         return max(
             0.0,
             min(
@@ -713,17 +966,16 @@ class Moteur2Zones:
                 MAX_PROXIMITY_SCORE,
             ),
         )
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # FORCE
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     @staticmethod
     def _calculate_strength_score(
         strength: float,
     ) -> float:
-        """
-        Transforme la force fournie par la cartographie
-        en score borné.
-        """
+
         return max(
             0.0,
             min(
@@ -731,155 +983,178 @@ class Moteur2Zones:
                 MAX_STRENGTH_SCORE,
             ),
         )
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # RÉACTIONS
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     @staticmethod
     def _calculate_reaction_score(
         touches: int,
     ) -> float:
+
         if touches <= 1:
             return 0.0
+
         if touches == 2:
             return 5.0
+
         if touches == 3:
             return 8.0
+
         return MAX_REACTION_SCORE
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
     # MULTI-TIMEFRAME
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     def _find_related_timeframes(
         self,
         target_zone: Dict[str, Any],
         all_zones: List[Dict[str, Any]],
         market_map: Dict[str, Any],
     ) -> Tuple[str, ...]:
-        """
-        Cherche les timeframes qui identifient une zone
-        située dans une région de prix similaire.
-        La tolérance est adaptative et dépend de la volatilité
-        des deux timeframes comparés.
-        """
+
         target_center = self._safe_float(
             target_zone.get("center"),
             None,
         )
+
         target_timeframe = str(
             target_zone.get(
                 "timeframe",
                 "",
             )
         ).upper()
+
         if (
             target_center is None
             or target_center <= 0
-            or target_timeframe not in SUPPORTED_TIMEFRAMES
+            or target_timeframe
+            not in SUPPORTED_TIMEFRAMES
         ):
             return (
                 target_timeframe,
             ) if target_timeframe else ()
+
         related: Set[str] = {
-            target_timeframe,
+            target_timeframe
         }
+
         target_volatility = (
             self._estimate_volatility(
-                market_map=market_map,
-                timeframe=target_timeframe,
-                reference_price=target_center,
+                market_map,
+                target_timeframe,
+                target_center,
             )
         )
+
         for zone in all_zones:
+
             if not isinstance(zone, dict):
                 continue
+
             timeframe = str(
                 zone.get(
                     "timeframe",
                     "",
                 )
             ).upper()
+
             if timeframe not in SUPPORTED_TIMEFRAMES:
                 continue
+
             if timeframe == target_timeframe:
                 continue
+
             center = self._safe_float(
                 zone.get("center"),
                 None,
             )
+
             if (
                 center is None
                 or center <= 0
             ):
                 continue
+
             other_volatility = (
                 self._estimate_volatility(
-                    market_map=market_map,
-                    timeframe=timeframe,
-                    reference_price=center,
+                    market_map,
+                    timeframe,
+                    center,
                 )
             )
-            tolerance = self._calculate_mtf_tolerance(
-                target_volatility=target_volatility,
-                other_volatility=other_volatility,
-                target_timeframe=target_timeframe,
-                other_timeframe=timeframe,
-                reference_price=(
-                    target_center + center
-                ) / 2.0,
+
+            tolerance = (
+                self._calculate_mtf_tolerance(
+                    target_volatility,
+                    other_volatility,
+                    target_timeframe,
+                    timeframe,
+                    (
+                        target_center
+                        + center
+                    ) / 2.0,
+                )
             )
+
             if abs(
                 center - target_center
             ) <= tolerance:
+
                 related.add(
                     timeframe
                 )
-        ordered = [
+
+        return tuple(
             timeframe
             for timeframe in SUPPORTED_TIMEFRAMES
             if timeframe in related
-        ]
-        return tuple(ordered)
-    # -----------------------------------------------------------------------
+        )
+
+    # ========================================================================
     # TOLÉRANCE MTF
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
+    @staticmethod
     def _calculate_mtf_tolerance(
-        self,
         target_volatility: float,
         other_volatility: float,
         target_timeframe: str,
         other_timeframe: str,
         reference_price: float,
     ) -> float:
-        """
-        Tolérance dynamique pour rapprocher deux zones.
-        On combine les volatilités des deux timeframes,
-        puis on limite la tolérance pour éviter qu'une zone
-        très volatile absorbe artificiellement toutes les autres.
-        """
+
         target_multiplier = (
-            TIMEFRAME_ZONE_TOLERANCE_ATR.get(
+            TIMEFRAME_ZONE_TOLERANCE.get(
                 target_timeframe,
                 1.5,
             )
         )
+
         other_multiplier = (
-            TIMEFRAME_ZONE_TOLERANCE_ATR.get(
+            TIMEFRAME_ZONE_TOLERANCE.get(
                 other_timeframe,
                 1.5,
             )
         )
+
         target_component = (
             target_volatility
             * target_multiplier
         )
+
         other_component = (
             other_volatility
             * other_multiplier
         )
+
         tolerance = (
             target_component
             + other_component
         ) / 2.0
-        # Limite relative de sécurité.
+
         relative_cap = (
             max(
                 reference_price,
@@ -887,6 +1162,7 @@ class Moteur2Zones:
             )
             * 0.01
         )
+
         return max(
             0.0,
             min(
@@ -894,9 +1170,34 @@ class Moteur2Zones:
                 relative_cap,
             ),
         )
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # CLASSIFICATION DESCRIPTIVE
+    # ========================================================================
+
+    @staticmethod
+    def _classify_relevance(
+        score: float,
+    ) -> str:
+
+        if score >= 80:
+            return "EXCEPTIONNELLE"
+
+        if score >= 60:
+            return "IMPORTANTE"
+
+        if score >= 45:
+            return "INTERESSANTE"
+
+        if score >= 30:
+            return "MODEREE"
+
+        return "FAIBLE"
+
+    # ========================================================================
     # RAISON
-    # -----------------------------------------------------------------------
+    # ========================================================================
+
     @staticmethod
     def _build_reason(
         zone: Dict[str, Any],
@@ -906,114 +1207,67 @@ class Moteur2Zones:
         distance_percent: float,
         distance_units: float,
         related_timeframes: Tuple[str, ...],
+        relevance: str,
     ) -> str:
+
         reasons: List[str] = []
+
         kind = str(
             zone.get(
                 "kind",
                 "ZONE",
             )
         )
+
         reasons.append(
             kind.lower()
         )
+
+        reasons.append(
+            f"pertinence {relevance.lower()}"
+        )
+
         if near_current_price:
             reasons.append(
                 "proche du prix actuel"
             )
-        if multi_timeframe:
-            timeframe_text = ", ".join(
-                related_timeframes
-            )
+        else:
             reasons.append(
-                "zone cohérente sur "
-                f"{timeframe_text}"
+                f"à {distance_percent:.3f}% du prix"
             )
+
+        if distance_units > 0:
+            reasons.append(
+                f"{distance_units:.2f} unité(s) de volatilité"
+            )
+
         if touches >= 2:
             reasons.append(
-                f"{touches} réactions détectées"
+                f"{touches} réactions"
             )
-        if distance_units <= 0.50:
+
+        if multi_timeframe:
             reasons.append(
-                "prix très proche de la zone"
+                "convergence "
+                + ", ".join(
+                    related_timeframes
+                )
             )
-        elif distance_percent <= 0.25:
-            reasons.append(
-                "écart de prix faible"
-            )
-        return " + ".join(
+
+        return " | ".join(
             reasons
         )
-    # -----------------------------------------------------------------------
-    # PRIX ACTUEL
-    # -----------------------------------------------------------------------
-    @staticmethod
-    def _extract_current_price(
-        market_map: Dict[str, Any],
-    ) -> Optional[float]:
-        """
-        Recherche le prix actuel dans la market map.
-        Priorité :
-            M1
-            M5
-            M15
-            H1
-            H4
-            global
-        """
-        timeframes = market_map.get(
-            "timeframes",
-            {},
-        )
-        if not isinstance(timeframes, dict):
-            timeframes = {}
-        for timeframe in (
-            "M1",
-            "M5",
-            "M15",
-            "H1",
-            "H4",
-        ):
-            data = timeframes.get(
-                timeframe,
-                {},
-            )
-            if not isinstance(data, dict):
-                continue
-            price = Moteur2Zones._safe_float(
-                data.get("current_price"),
-                None,
-            )
-            if (
-                price is not None
-                and price > 0
-            ):
-                return price
-        global_data = market_map.get(
-            "global",
-            {},
-        )
-        if isinstance(global_data, dict):
-            price = Moteur2Zones._safe_float(
-                global_data.get(
-                    "current_price"
-                ),
-                None,
-            )
-            if (
-                price is not None
-                and price > 0
-            ):
-                return price
-        return None
-    # -----------------------------------------------------------------------
-    # OUTIL FLOAT
-    # -----------------------------------------------------------------------
+
+    # ========================================================================
+    # UTILITAIRE
+    # ========================================================================
+
     @staticmethod
     def _safe_float(
         value: Any,
-        default: Optional[float] = 0.0,
+        default: Optional[float],
     ) -> Optional[float]:
+
         try:
             return float(value)
         except (
@@ -1021,18 +1275,27 @@ class Moteur2Zones:
             ValueError,
         ):
             return default
-# ---------------------------------------------------------------------------
-# FONCTION SIMPLE
-# ---------------------------------------------------------------------------
-def detecter_zones(
+
+
+# ============================================================================
+# FONCTION PUBLIQUE
+# ============================================================================
+
+def analyser_zones(
     market_map: Dict[str, Any],
     current_price: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Fonction pratique pour détecter les zones importantes.
-    """
+
     moteur = Moteur2Zones()
+
     return moteur.analyser(
         market_map=market_map,
         current_price=current_price,
     )
+
+
+# ============================================================================
+# COMPATIBILITÉ
+# ============================================================================
+
+ZoneEngine = Moteur2Zones
