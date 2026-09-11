@@ -2,84 +2,242 @@
 NOVA TRADE AI
 market_hours.py
 
-Gestion des horaires de marché.
+Gestion des horaires de marché — Moteur 2.
 
-Objectifs :
-- savoir si un marché est ouvert ;
-- détecter une fermeture imminente ;
-- empêcher les nouveaux signaux lorsque le marché est fermé ;
-- fournir le nombre de minutes avant la fermeture ;
-- garder les horaires configurables via les variables d'environnement.
+Marchés supportés :
+    XAU/USD
+    BTC/USD
+    EUR/USD
+    GBP/USD
 
-IMPORTANT :
-Les horaires exacts peuvent varier selon le broker.
-Les valeurs par défaut sont donc configurables.
+Symboles internes :
+    XAUUSD
+    BTCUSD
+    EURUSD
+    GBPUSD
+
+Fonctions :
+    - déterminer si un marché est ouvert ;
+    - détecter une fermeture imminente ;
+    - connaître le temps avant fermeture ;
+    - connaître la prochaine ouverture ;
+    - fournir un statut de marché.
+
+IMPORTANT
+---------
+Ce module ne fait AUCUNE analyse de trading.
+
+Il ne :
+    - calcule pas de score ;
+    - calcule pas de RR ;
+    - définit pas Entry ;
+    - définit pas SL ;
+    - définit pas TP ;
+    - valide pas un setup ;
+    - rejette pas un setup.
+
+Il fournit uniquement l'information horaire
+utilisée par le reste du système.
+
+Les horaires par défaut restent configurables
+car les horaires exacts peuvent dépendre du broker
+ou du fournisseur de marché.
 """
 
 from __future__ import annotations
 
 import os
-from datetime import datetime, time, timedelta, timezone
+
+from datetime import (
+    datetime,
+    time,
+    timedelta,
+    timezone,
+)
 
 
 # ============================================================
-# CONFIGURATION
+# MARCHÉS SUPPORTÉS
 # ============================================================
 
-# Cryptos considérées comme disponibles 24/7.
-CRYPTO_SYMBOLS = {
-    "BTC/USD",
-    "ETH/USD",
-    "SOL/USD",
-    "BNB/USD",
-    "XRP/USD",
+SUPPORTED_SYMBOLS = (
+    "XAUUSD",
+    "BTCUSD",
+    "EURUSD",
+    "GBPUSD",
+)
+
+
+DISPLAY_SYMBOLS = {
+    "XAUUSD": "XAU/USD",
+    "BTCUSD": "BTC/USD",
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
 }
 
 
+# ============================================================
+# NORMALISATION
+# ============================================================
+
+def normalize_symbol(
+    symbol: str,
+) -> str:
+    """
+    Normalise un symbole.
+
+    Exemples :
+
+        XAUUSD  -> XAUUSD
+        XAU/USD -> XAUUSD
+        BTC/USD -> BTCUSD
+        EUR-USD -> EURUSD
+    """
+
+    if symbol is None:
+        return ""
+
+    return (
+        str(symbol)
+        .upper()
+        .replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+
+def display_symbol(
+    symbol: str,
+) -> str:
+    """
+    Retourne la représentation lisible du symbole.
+    """
+
+    normalized = normalize_symbol(
+        symbol
+    )
+
+    return DISPLAY_SYMBOLS.get(
+        normalized,
+        normalized,
+    )
+
+
+def is_supported_symbol(
+    symbol: str,
+) -> bool:
+    """
+    Vérifie si le symbole appartient au Moteur 2.
+    """
+
+    return (
+        normalize_symbol(symbol)
+        in SUPPORTED_SYMBOLS
+    )
+
+
+# ============================================================
+# TYPE DE MARCHÉ
+# ============================================================
+
+CRYPTO_SYMBOLS = {
+    "BTCUSD",
+}
+
+FOREX_SYMBOLS = {
+    "EURUSD",
+    "GBPUSD",
+}
+
+CFD_SYMBOLS = {
+    "XAUUSD",
+}
+
+
+def is_crypto(
+    symbol: str,
+) -> bool:
+    """
+    BTC/USD est disponible 24/7.
+    """
+
+    return (
+        normalize_symbol(symbol)
+        in CRYPTO_SYMBOLS
+    )
+
+
+def is_forex(
+    symbol: str,
+) -> bool:
+    """
+    EUR/USD et GBP/USD sont des marchés Forex.
+    """
+
+    return (
+        normalize_symbol(symbol)
+        in FOREX_SYMBOLS
+    )
+
+
+def is_cfd(
+    symbol: str,
+) -> bool:
+    """
+    XAU/USD est traité ici comme CFD/marché
+    avec pause quotidienne configurable.
+    """
+
+    return (
+        normalize_symbol(symbol)
+        in CFD_SYMBOLS
+    )
+
+
+# ============================================================
+# HORAIRES FOREX / XAU
+# ============================================================
+
 # ------------------------------------------------------------
-# HORAIRES FOREX / CFD
+# OUVERTURE HEBDOMADAIRE
 # ------------------------------------------------------------
 
-# Ouverture hebdomadaire par défaut : dimanche 22:00 UTC
 FOREX_WEEKLY_OPEN = os.getenv(
     "FOREX_WEEKLY_OPEN",
     "22:00",
-)
+).strip()
 
-# Fermeture hebdomadaire par défaut : vendredi 22:00 UTC
+
+# ------------------------------------------------------------
+# FERMETURE HEBDOMADAIRE
+# ------------------------------------------------------------
+
 FOREX_WEEKLY_CLOSE = os.getenv(
     "FOREX_WEEKLY_CLOSE",
     "22:00",
-)
+).strip()
 
 
 # ------------------------------------------------------------
 # PAUSE QUOTIDIENNE XAU/USD
 # ------------------------------------------------------------
 
-# Valeurs par défaut :
-# fermeture/pause : 21:00 UTC
-# réouverture      : 22:00 UTC
-#
-# Ces valeurs peuvent être modifiées dans Railway.
-
 XAU_PAUSE_START = os.getenv(
     "XAU_PAUSE_START",
     "21:00",
-)
+).strip()
+
 
 XAU_PAUSE_END = os.getenv(
     "XAU_PAUSE_END",
     "22:00",
-)
+).strip()
 
 
 # ------------------------------------------------------------
 # BUFFER AVANT FERMETURE
 # ------------------------------------------------------------
-
-# Aucun nouveau signal dans les X dernières minutes
-# avant une fermeture programmée.
 
 MARKET_CLOSE_BUFFER_MINUTES = int(
     os.getenv(
@@ -90,21 +248,42 @@ MARKET_CLOSE_BUFFER_MINUTES = int(
 
 
 # ============================================================
+# VALIDATION CONFIGURATION
+# ============================================================
+
+if MARKET_CLOSE_BUFFER_MINUTES < 0:
+    raise ValueError(
+        "MARKET_CLOSE_BUFFER_MINUTES "
+        "ne peut pas être négatif."
+    )
+
+
+# ============================================================
 # OUTILS INTERNES
 # ============================================================
 
-def _parse_time(value: str) -> time:
+def _parse_time(
+    value: str,
+) -> time:
     """
-    Convertit 'HH:MM' en objet time.
+    Convertit HH:MM en datetime.time.
     """
 
     try:
-        hour, minute = map(int, value.split(":"))
 
-        if not (0 <= hour <= 23):
+        hour, minute = map(
+            int,
+            value.split(":"),
+        )
+
+        if not (
+            0 <= hour <= 23
+        ):
             raise ValueError
 
-        if not (0 <= minute <= 59):
+        if not (
+            0 <= minute <= 59
+        ):
             raise ValueError
 
         return time(
@@ -112,19 +291,43 @@ def _parse_time(value: str) -> time:
             minute=minute,
         )
 
-    except (ValueError, TypeError):
+    except (
+        ValueError,
+        TypeError,
+    ):
+
         raise ValueError(
             f"Heure invalide : {value!r}. "
-            f"Format attendu : HH:MM"
+            "Format attendu : HH:MM"
         )
 
 
 def _now_utc() -> datetime:
     """
-    Retourne l'heure actuelle en UTC.
+    Heure actuelle UTC.
     """
 
-    return datetime.now(timezone.utc)
+    return datetime.now(
+        timezone.utc
+    )
+
+
+def _ensure_utc(
+    value: datetime,
+) -> datetime:
+    """
+    Garantit un datetime UTC aware.
+    """
+
+    if value.tzinfo is None:
+
+        return value.replace(
+            tzinfo=timezone.utc
+        )
+
+    return value.astimezone(
+        timezone.utc
+    )
 
 
 def _combine_utc(
@@ -132,7 +335,7 @@ def _combine_utc(
     time_value: time,
 ) -> datetime:
     """
-    Combine une date et une heure dans le fuseau UTC.
+    Combine une date et une heure en UTC.
     """
 
     return datetime.combine(
@@ -140,26 +343,6 @@ def _combine_utc(
         time_value,
         tzinfo=timezone.utc,
     )
-
-
-# ============================================================
-# IDENTIFICATION DU MARCHÉ
-# ============================================================
-
-def is_crypto(symbol: str) -> bool:
-    """
-    Retourne True si le symbole est une crypto.
-    """
-
-    return symbol.upper().strip() in CRYPTO_SYMBOLS
-
-
-def is_forex_or_cfd(symbol: str) -> bool:
-    """
-    Retourne True pour les marchés Forex / CFD.
-    """
-
-    return not is_crypto(symbol)
 
 
 # ============================================================
@@ -171,20 +354,21 @@ def _is_weekly_closed(
     now: datetime,
 ) -> bool:
     """
-    Vérifie si le marché est fermé à cause du week-end.
+    Vérifie la fermeture hebdomadaire.
 
-    Crypto :
-        jamais fermé pour cette logique.
+    BTCUSD :
+        jamais fermé.
 
-    Forex / CFD :
-        fermé du vendredi soir au dimanche soir.
+    EURUSD / GBPUSD / XAUUSD :
+        fermeture hebdomadaire selon la configuration.
     """
 
-    if is_crypto(symbol):
-        return False
+    normalized = normalize_symbol(
+        symbol
+    )
 
-    weekday = now.weekday()
-    current_time = now.time()
+    if normalized == "BTCUSD":
+        return False
 
     weekly_open = _parse_time(
         FOREX_WEEKLY_OPEN
@@ -194,25 +378,43 @@ def _is_weekly_closed(
         FOREX_WEEKLY_CLOSE
     )
 
-    # Samedi : fermé.
+    weekday = now.weekday()
+    current_time = now.time()
+
+    # --------------------------------------------------------
+    # SAMEDI
+    # --------------------------------------------------------
+
     if weekday == 5:
         return True
 
-    # Dimanche :
-    # avant l'heure d'ouverture -> fermé.
-    if weekday == 6:
-        return current_time < weekly_open
+    # --------------------------------------------------------
+    # DIMANCHE
+    # --------------------------------------------------------
 
-    # Vendredi :
-    # après l'heure de fermeture -> fermé.
+    if weekday == 6:
+
+        return (
+            current_time
+            < weekly_open
+        )
+
+    # --------------------------------------------------------
+    # VENDREDI
+    # --------------------------------------------------------
+
     if weekday == 4:
-        return current_time >= weekly_close
+
+        return (
+            current_time
+            >= weekly_close
+        )
 
     return False
 
 
 # ============================================================
-# PAUSE XAU/USD
+# PAUSE QUOTIDIENNE XAU/USD
 # ============================================================
 
 def _is_xau_daily_pause(
@@ -223,7 +425,11 @@ def _is_xau_daily_pause(
     Vérifie la pause quotidienne de XAU/USD.
     """
 
-    if symbol.upper().strip() != "XAU/USD":
+    normalized = normalize_symbol(
+        symbol
+    )
+
+    if normalized != "XAUUSD":
         return False
 
     pause_start = _parse_time(
@@ -236,15 +442,22 @@ def _is_xau_daily_pause(
 
     current_time = now.time()
 
-    # Pause normale dans la même journée.
+    # --------------------------------------------------------
+    # PAUSE DANS LA MÊME JOURNÉE
+    # --------------------------------------------------------
+
     if pause_start < pause_end:
+
         return (
             pause_start
             <= current_time
             < pause_end
         )
 
-    # Gestion d'une pause traversant minuit.
+    # --------------------------------------------------------
+    # PAUSE TRAVERSANT MINUIT
+    # --------------------------------------------------------
+
     return (
         current_time >= pause_start
         or current_time < pause_end
@@ -260,43 +473,54 @@ def is_market_open(
     now: datetime | None = None,
 ) -> bool:
     """
-    Détermine si le marché est actuellement ouvert.
+    Retourne True si le marché est considéré ouvert.
 
-    Crypto :
+    BTCUSD :
         24/7.
 
-    Forex :
-        dimanche soir -> vendredi soir.
+    EURUSD / GBPUSD :
+        horaires Forex.
 
-    XAU/USD :
-        Forex/CFD + pause quotidienne configurable.
+    XAUUSD :
+        horaires hebdomadaires + pause quotidienne.
     """
 
-    symbol = symbol.upper().strip()
+    normalized = normalize_symbol(
+        symbol
+    )
+
+    # Symbole inconnu = pas de statut exploitable.
+    if normalized not in SUPPORTED_SYMBOLS:
+        return False
 
     if now is None:
         now = _now_utc()
-
-    # On s'assure que la date utilisée est UTC.
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
     else:
-        now = now.astimezone(timezone.utc)
+        now = _ensure_utc(now)
 
-    # Crypto : 24/7.
-    if is_crypto(symbol):
+    # --------------------------------------------------------
+    # BTC/USD
+    # --------------------------------------------------------
+
+    if normalized == "BTCUSD":
         return True
 
-    # Fermeture hebdomadaire.
+    # --------------------------------------------------------
+    # FERMETURE HEBDOMADAIRE
+    # --------------------------------------------------------
+
     if _is_weekly_closed(
-        symbol,
+        normalized,
         now,
     ):
         return False
 
-    # Pause quotidienne XAU/USD.
+    # --------------------------------------------------------
+    # PAUSE XAU/USD
+    # --------------------------------------------------------
+
     if _is_xau_daily_pause(
-        symbol,
+        normalized,
         now,
     ):
         return False
@@ -314,11 +538,23 @@ def _next_market_close(
 ) -> datetime | None:
     """
     Retourne la prochaine fermeture connue.
+
+    BTC/USD :
+        None car disponible 24/7.
+
+    EUR/USD / GBP/USD :
+        fermeture hebdomadaire.
+
+    XAU/USD :
+        pause quotidienne ou fermeture hebdomadaire,
+        selon laquelle arrive en premier.
     """
 
-    symbol = symbol.upper().strip()
+    normalized = normalize_symbol(
+        symbol
+    )
 
-    if is_crypto(symbol):
+    if normalized == "BTCUSD":
         return None
 
     weekly_close = _parse_time(
@@ -328,10 +564,10 @@ def _next_market_close(
     candidates: list[datetime] = []
 
     # --------------------------------------------------------
-    # Fermeture quotidienne XAU
+    # PAUSE XAU/USD
     # --------------------------------------------------------
 
-    if symbol == "XAU/USD":
+    if normalized == "XAUUSD":
 
         pause_start = _parse_time(
             XAU_PAUSE_START
@@ -342,16 +578,18 @@ def _next_market_close(
             pause_start,
         )
 
-        if candidate > now:
-            candidates.append(candidate)
+        if candidate <= now:
 
-        else:
-            candidates.append(
-                candidate + timedelta(days=1)
+            candidate += timedelta(
+                days=1
             )
 
+        candidates.append(
+            candidate
+        )
+
     # --------------------------------------------------------
-    # Fermeture hebdomadaire
+    # FERMETURE HEBDOMADAIRE
     # --------------------------------------------------------
 
     days_until_friday = (
@@ -360,7 +598,9 @@ def _next_market_close(
 
     friday = (
         now.date()
-        + timedelta(days=days_until_friday)
+        + timedelta(
+            days=days_until_friday
+        )
     )
 
     weekly_candidate = _combine_utc(
@@ -369,7 +609,10 @@ def _next_market_close(
     )
 
     if weekly_candidate <= now:
-        weekly_candidate += timedelta(days=7)
+
+        weekly_candidate += timedelta(
+            days=7
+        )
 
     candidates.append(
         weekly_candidate
@@ -378,7 +621,9 @@ def _next_market_close(
     if not candidates:
         return None
 
-    return min(candidates)
+    return min(
+        candidates
+    )
 
 
 # ============================================================
@@ -390,37 +635,37 @@ def minutes_until_market_close(
     now: datetime | None = None,
 ) -> int | None:
     """
-    Retourne le nombre de minutes avant la prochaine fermeture.
+    Retourne le nombre entier de minutes avant
+    la prochaine fermeture.
 
-    Retourne None pour les cryptos.
-    Retourne None si le marché est déjà fermé.
+    None signifie :
+        - marché 24/7 ;
+        - ou marché actuellement fermé.
     """
 
-    symbol = symbol.upper().strip()
+    normalized = normalize_symbol(
+        symbol
+    )
 
-    if is_crypto(symbol):
+    if normalized not in SUPPORTED_SYMBOLS:
+        return None
+
+    if normalized == "BTCUSD":
         return None
 
     if now is None:
         now = _now_utc()
-
-    if now.tzinfo is None:
-        now = now.replace(
-            tzinfo=timezone.utc
-        )
     else:
-        now = now.astimezone(
-            timezone.utc
-        )
+        now = _ensure_utc(now)
 
     if not is_market_open(
-        symbol,
+        normalized,
         now,
     ):
         return None
 
     close_dt = _next_market_close(
-        symbol,
+        normalized,
         now,
     )
 
@@ -431,14 +676,16 @@ def minutes_until_market_close(
         close_dt - now
     ).total_seconds()
 
-    return max(
-        0,
-        int(seconds // 60),
+    if seconds <= 0:
+        return 0
+
+    return int(
+        seconds // 60
     )
 
 
 # ============================================================
-# FERMETURE IMMINENTE ?
+# FERMETURE IMMINENTE
 # ============================================================
 
 def is_market_closing_soon(
@@ -446,13 +693,15 @@ def is_market_closing_soon(
     now: datetime | None = None,
 ) -> bool:
     """
-    Retourne True si le marché va fermer
-    dans le délai MARKET_CLOSE_BUFFER_MINUTES.
+    Indique si le marché ouvert approche
+    d'une fermeture programmée.
     """
 
-    minutes = minutes_until_market_close(
-        symbol,
-        now,
+    minutes = (
+        minutes_until_market_close(
+            symbol,
+            now,
+        )
     )
 
     if minutes is None:
@@ -473,38 +722,49 @@ def next_market_open(
     now: datetime | None = None,
 ) -> datetime | None:
     """
-    Retourne approximativement la prochaine ouverture.
+    Retourne la prochaine ouverture connue.
 
-    Les horaires restent configurables car le broker
-    peut utiliser des horaires différents.
+    Si le marché est actuellement ouvert,
+    retourne maintenant.
+
+    BTC/USD :
+        retourne maintenant car 24/7.
     """
 
-    symbol = symbol.upper().strip()
+    normalized = normalize_symbol(
+        symbol
+    )
 
-    if is_crypto(symbol):
-        return now or _now_utc()
+    if normalized not in SUPPORTED_SYMBOLS:
+        return None
 
     if now is None:
         now = _now_utc()
-
-    if now.tzinfo is None:
-        now = now.replace(
-            tzinfo=timezone.utc
-        )
     else:
-        now = now.astimezone(
-            timezone.utc
-        )
+        now = _ensure_utc(now)
 
-    # Si le marché est déjà ouvert, aucune attente.
-    if is_market_open(symbol, now):
+    # --------------------------------------------------------
+    # BTC/USD
+    # --------------------------------------------------------
+
+    if normalized == "BTCUSD":
         return now
 
     # --------------------------------------------------------
-    # XAU/USD : fin de pause quotidienne
+    # MARCHÉ DÉJÀ OUVERT
     # --------------------------------------------------------
 
-    if symbol == "XAU/USD":
+    if is_market_open(
+        normalized,
+        now,
+    ):
+        return now
+
+    # --------------------------------------------------------
+    # PAUSE XAU/USD
+    # --------------------------------------------------------
+
+    if normalized == "XAUUSD":
 
         pause_end = _parse_time(
             XAU_PAUSE_END
@@ -516,10 +776,16 @@ def next_market_open(
         )
 
         if candidate > now:
-            return candidate
+
+            # On vérifie que l'ouverture
+            # quotidienne n'est pas dépassée
+            # par la fermeture hebdomadaire.
+            if now.weekday() < 5:
+
+                return candidate
 
     # --------------------------------------------------------
-    # Ouverture hebdomadaire
+    # OUVERTURE HEBDOMADAIRE
     # --------------------------------------------------------
 
     weekly_open = _parse_time(
@@ -539,7 +805,10 @@ def next_market_open(
     )
 
     if candidate <= now:
-        candidate += timedelta(days=7)
+
+        candidate += timedelta(
+            days=7
+        )
 
     return candidate
 
@@ -553,21 +822,29 @@ def market_status(
     now: datetime | None = None,
 ) -> str:
     """
-    Retourne :
+    Statuts possibles :
 
-    OPEN
-    CLOSING_SOON
-    CLOSED
+        OPEN
+        CLOSING_SOON
+        CLOSED
+        UNSUPPORTED
     """
 
+    normalized = normalize_symbol(
+        symbol
+    )
+
+    if normalized not in SUPPORTED_SYMBOLS:
+        return "UNSUPPORTED"
+
     if not is_market_open(
-        symbol,
+        normalized,
         now,
     ):
         return "CLOSED"
 
     if is_market_closing_soon(
-        symbol,
+        normalized,
         now,
     ):
         return "CLOSING_SOON"
@@ -584,37 +861,151 @@ def get_market_hours_info(
     now: datetime | None = None,
 ) -> dict:
     """
-    Retourne toutes les informations utiles
-    pour le pipeline, Telegram et le monitor.
+    Retourne les informations horaires
+    du marché demandé.
     """
+
+    normalized = normalize_symbol(
+        symbol
+    )
 
     if now is None:
         now = _now_utc()
+    else:
+        now = _ensure_utc(now)
 
     status = market_status(
-        symbol,
+        normalized,
         now,
     )
 
-    minutes = minutes_until_market_close(
-        symbol,
-        now,
+    minutes = (
+        minutes_until_market_close(
+            normalized,
+            now,
+        )
     )
 
     next_open = next_market_open(
-        symbol,
+        normalized,
         now,
     )
 
     return {
-        "symbol": symbol.upper().strip(),
+        "symbol": normalized,
+        "display_symbol": display_symbol(
+            normalized
+        ),
         "status": status,
-        "is_open": status != "CLOSED",
-        "closing_soon": status == "CLOSING_SOON",
+        "is_open": (
+            status
+            in {
+                "OPEN",
+                "CLOSING_SOON",
+            }
+        ),
+        "closing_soon": (
+            status
+            == "CLOSING_SOON"
+        ),
         "minutes_until_close": minutes,
         "next_open": (
             next_open.isoformat()
             if next_open is not None
             else None
         ),
+        "is_crypto": is_crypto(
+            normalized
+        ),
+        "is_forex": is_forex(
+            normalized
+        ),
+        "is_cfd": is_cfd(
+            normalized
+        ),
     }
+
+
+# ============================================================
+# INFORMATIONS TOUS LES MARCHÉS
+# ============================================================
+
+def get_all_market_hours_info(
+    now: datetime | None = None,
+) -> dict[str, dict]:
+    """
+    Retourne les horaires des quatre marchés.
+    """
+
+    if now is None:
+        now = _now_utc()
+
+    return {
+        symbol: get_market_hours_info(
+            symbol,
+            now,
+        )
+        for symbol in SUPPORTED_SYMBOLS
+    }
+
+
+# ============================================================
+# VALIDATION LOCALE
+# ============================================================
+
+def validate_configuration() -> None:
+    """
+    Vérifie la cohérence de la configuration.
+    """
+
+    _parse_time(
+        FOREX_WEEKLY_OPEN
+    )
+
+    _parse_time(
+        FOREX_WEEKLY_CLOSE
+    )
+
+    _parse_time(
+        XAU_PAUSE_START
+    )
+
+    _parse_time(
+        XAU_PAUSE_END
+    )
+
+    if MARKET_CLOSE_BUFFER_MINUTES < 0:
+
+        raise ValueError(
+            "Le buffer de fermeture "
+            "ne peut pas être négatif."
+        )
+
+
+validate_configuration()
+
+
+# ============================================================
+# TEST DIRECT
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 64)
+    print("NOVA TRADE AI — MARKET HOURS")
+    print("=" * 64)
+
+    for symbol in SUPPORTED_SYMBOLS:
+
+        info = get_market_hours_info(
+            symbol
+        )
+
+        print(
+            f"{info['display_symbol']:8} | "
+            f"{info['status']:14} | "
+            f"ouvert={info['is_open']} | "
+            f"fermeture={info['minutes_until_close']}"
+        )
+
+    print("=" * 64)
