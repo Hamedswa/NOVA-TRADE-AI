@@ -77,10 +77,6 @@ SUPPORTED_TIMEFRAMES = (
 )
 
 
-# Rafraîchissement maximum autorisé.
-#
-# Ce sont des fenêtres de rafraîchissement du cache,
-# pas des règles de trading.
 TIMEFRAME_REFRESH_SECONDS = {
     "H4": 8 * 60 * 60,
     "H1": 2 * 60 * 60,
@@ -90,7 +86,6 @@ TIMEFRAME_REFRESH_SECONDS = {
 }
 
 
-# Nombre maximum de bougies conservées.
 DEFAULT_LIMIT = {
     "H4": 300,
     "H1": 500,
@@ -125,36 +120,12 @@ class Moteur2Cache:
     """
     Cache centralisé des données BiQuote du Moteur 2.
 
-    Organisation interne :
-
-        symbol
-          |
-          +-- H4
-          +-- H1
-          +-- M15
-          +-- M5
-          +-- M1
-
-    Ce module :
-
-        - stocke les bougies
-        - stocke les derniers ticks
-        - gère la fraîcheur
-        - gère les refresh
-        - fournit les données aux autres modules
-
-    Ce module ne :
-
-        - détecte pas de setup
-        - calcule pas d'Entry
-        - calcule pas de SL/TP
-        - calcule pas de RR
-        - ne valide aucun signal
-        - ne bloque aucun signal
-
     Compatibilité :
 
-        Moteur2Cache(client=client, symbol="XAUUSD")
+        Moteur2Cache(
+            client=client,
+            symbol="XAUUSD",
+        )
 
     ou :
 
@@ -163,9 +134,8 @@ class Moteur2Cache:
             symbols=["XAUUSD"],
         )
 
-    Le paramètre "symbol" permet au Moteur 2
-    d'utiliser un seul actif sans casser
-    l'ancienne interface "symbols".
+    Le paramètre symbol permet au Moteur 2
+    de fonctionner avec un seul actif.
     """
 
     def __init__(
@@ -179,21 +149,16 @@ class Moteur2Cache:
         self.client = client or BiQuoteClient()
 
         # ------------------------------------------------------------------
-        # Compatibilité avec l'appel du Moteur 2 :
-        #
-        # Moteur2Cache(
-        #     client=self.biquote,
-        #     symbol=self.symbol,
-        # )
-        #
-        # Si "symbol" est fourni, il devient prioritaire.
+        # Compatibilité avec moteur2.py
         # ------------------------------------------------------------------
+
         if symbol is not None:
             symbols = [symbol]
 
         # ------------------------------------------------------------------
         # Symboles
         # ------------------------------------------------------------------
+
         if symbols is None:
             symbols = SUPPORTED_SYMBOLS
 
@@ -231,10 +196,8 @@ class Moteur2Cache:
 
         # ------------------------------------------------------------------
         # Cache des bougies
-        #
-        # _cache["XAUUSD"]["H4"]
-        # _cache["XAUUSD"]["M1"]
         # ------------------------------------------------------------------
+
         self._cache: Dict[
             str,
             Dict[str, TimeframeCache],
@@ -252,15 +215,16 @@ class Moteur2Cache:
         # ------------------------------------------------------------------
         # Dernier tick par symbole
         # ------------------------------------------------------------------
+
         self._latest_ticks: Dict[
             str,
             Tick,
         ] = {}
 
         # ------------------------------------------------------------------
-        # Lock indépendant pour chaque
-        # symbole + timeframe.
+        # Locks
         # ------------------------------------------------------------------
+
         self._locks: Dict[
             str,
             Dict[str, asyncio.Lock],
@@ -280,14 +244,6 @@ class Moteur2Cache:
     def _normalize_symbol(
         symbol: Any,
     ) -> str:
-        """
-        Normalise un symbole.
-
-        Exemples :
-            XAU/USD -> XAUUSD
-            BTC-USD -> BTCUSD
-            EUR USD -> EURUSD
-        """
 
         if not isinstance(symbol, str):
             return ""
@@ -305,9 +261,6 @@ class Moteur2Cache:
         self,
         symbol: str,
     ) -> str:
-        """
-        Valide et normalise un symbole.
-        """
 
         normalized = self._normalize_symbol(
             symbol
@@ -325,9 +278,6 @@ class Moteur2Cache:
     def _validate_timeframe(
         timeframe: str,
     ) -> str:
-        """
-        Valide et normalise un timeframe.
-        """
 
         normalized = str(
             timeframe
@@ -349,15 +299,6 @@ class Moteur2Cache:
         self,
         tick: Any,
     ) -> None:
-        """
-        Met à jour le dernier tick d'un symbole.
-
-        Peut recevoir :
-            - Tick
-            - dict provenant de biquote_stream.py
-
-        Le tick est stocké uniquement pour son symbole.
-        """
 
         try:
 
@@ -390,11 +331,24 @@ class Moteur2Cache:
 
     def get_latest_tick(
         self,
-        symbol: str,
+        symbol: Optional[str] = None,
     ) -> Optional[Tick]:
         """
-        Retourne le dernier tick connu d'un symbole.
+        Retourne le dernier tick connu.
+
+        Si symbol est absent et qu'un seul symbole
+        est configuré, ce symbole est utilisé.
         """
+
+        if symbol is None:
+
+            if len(self.symbols) != 1:
+                raise ValueError(
+                    "Le symbole doit être précisé lorsque "
+                    "plusieurs symboles sont configurés."
+                )
+
+            symbol = self.symbols[0]
 
         normalized = self._validate_symbol(
             symbol
@@ -406,11 +360,20 @@ class Moteur2Cache:
 
     def get_current_price(
         self,
-        symbol: str,
+        symbol: Optional[str] = None,
     ) -> Optional[float]:
         """
-        Retourne le dernier prix mid connu
-        pour le symbole demandé.
+        Retourne le dernier prix mid connu.
+
+        Compatibilité :
+
+            get_current_price()
+
+        lorsque le cache ne contient qu'un seul symbole.
+
+        Ou :
+
+            get_current_price("XAUUSD")
         """
 
         tick = self.get_latest_tick(
@@ -425,11 +388,6 @@ class Moteur2Cache:
     def get_latest_ticks(
         self,
     ) -> Dict[str, Tick]:
-        """
-        Retourne les derniers ticks connus.
-
-        Une copie du dictionnaire est retournée.
-        """
 
         return dict(
             self._latest_ticks
@@ -445,21 +403,6 @@ class Moteur2Cache:
         timeframe: str,
         force: bool = False,
     ) -> List[Candle]:
-        """
-        Rafraîchit un timeframe pour un symbole.
-
-        IMPORTANT :
-        Le biquote_client.py utilise :
-
-            get_candles(
-                timeframe,
-                symbol,
-                limit,
-                closed_only
-            )
-
-        Le cache respecte donc cet ordre.
-        """
 
         symbol = self._validate_symbol(
             symbol
@@ -474,11 +417,6 @@ class Moteur2Cache:
         ][
             timeframe
         ]
-
-        # ------------------------------------------------------------------
-        # Pas besoin de réseau si les données sont
-        # encore suffisamment fraîches.
-        # ------------------------------------------------------------------
 
         if (
             not force
@@ -499,8 +437,6 @@ class Moteur2Cache:
 
         async with lock:
 
-            # Un autre appel a peut-être terminé
-            # le refresh pendant l'attente.
             if (
                 not force
                 and not self._needs_refresh(
@@ -523,16 +459,6 @@ class Moteur2Cache:
                     timeframe,
                 )
 
-                # ------------------------------------------------------------------
-                # BiQuote REST
-                #
-                # closed_only=True
-                #
-                # Les bougies utilisées par le moteur
-                # sont donc explicitement demandées comme
-                # bougies clôturées.
-                # ------------------------------------------------------------------
-
                 candles = await asyncio.to_thread(
                     self.client.get_candles,
                     timeframe,
@@ -546,12 +472,6 @@ class Moteur2Cache:
                         f"Aucune bougie reçue pour "
                         f"{symbol} {timeframe}"
                     )
-
-                # ------------------------------------------------------------------
-                # Protection supplémentaire.
-                #
-                # On ne stocke que des objets Candle valides.
-                # ------------------------------------------------------------------
 
                 valid_candles = [
                     candle
@@ -598,16 +518,6 @@ class Moteur2Cache:
                     timeframe,
                 )
 
-                # ------------------------------------------------------------------
-                # IMPORTANT :
-                #
-                # En cas d'erreur réseau temporaire,
-                # les anciennes données restent disponibles.
-                #
-                # Mais leur état d'erreur est exposé dans
-                # get_status().
-                # ------------------------------------------------------------------
-
                 if cache.candles:
                     return list(
                         cache.candles
@@ -624,9 +534,6 @@ class Moteur2Cache:
         symbol: str,
         force: bool = False,
     ) -> Dict[str, List[Candle]]:
-        """
-        Rafraîchit tous les timeframes d'un symbole.
-        """
 
         symbol = self._validate_symbol(
             symbol
@@ -683,10 +590,6 @@ class Moteur2Cache:
         str,
         Dict[str, List[Candle]],
     ]:
-        """
-        Rafraîchit tous les timeframes de tous
-        les symboles configurés.
-        """
 
         results = await asyncio.gather(
             *[
@@ -738,14 +641,33 @@ class Moteur2Cache:
 
     def get_candles(
         self,
-        symbol: str,
-        timeframe: str,
+        symbol_or_timeframe: str,
+        timeframe: Optional[str] = None,
     ) -> List[Candle]:
         """
-        Retourne les bougies actuellement en cache.
+        Compatibilité avec deux formes :
 
-        Aucune requête réseau n'est déclenchée.
+            get_candles("XAUUSD", "H1")
+
+        ou, pour un cache mono-symbole :
+
+            get_candles("H1")
         """
+
+        if timeframe is None:
+
+            if len(self.symbols) != 1:
+                raise ValueError(
+                    "Le symbole doit être précisé lorsque "
+                    "plusieurs symboles sont configurés."
+                )
+
+            symbol = self.symbols[0]
+            timeframe = symbol_or_timeframe
+
+        else:
+
+            symbol = symbol_or_timeframe
 
         symbol = self._validate_symbol(
             symbol
@@ -765,15 +687,33 @@ class Moteur2Cache:
 
     def get_closed_candles(
         self,
-        symbol: str,
-        timeframe: str,
+        symbol_or_timeframe: str,
+        timeframe: Optional[str] = None,
     ) -> List[Candle]:
         """
-        Retourne uniquement les bougies clôturées.
+        Compatibilité avec deux formes :
 
-        Le tick temps réel n'intervient jamais
-        dans cette liste.
+            get_closed_candles("XAUUSD", "H1")
+
+        ou, pour un cache mono-symbole :
+
+            get_closed_candles("H1")
         """
+
+        if timeframe is None:
+
+            if len(self.symbols) != 1:
+                raise ValueError(
+                    "Le symbole doit être précisé lorsque "
+                    "plusieurs symboles sont configurés."
+                )
+
+            symbol = self.symbols[0]
+            timeframe = symbol_or_timeframe
+
+        else:
+
+            symbol = symbol_or_timeframe
 
         candles = self.get_candles(
             symbol,
@@ -790,16 +730,36 @@ class Moteur2Cache:
 
     def get_latest_closed_candle(
         self,
-        symbol: str,
-        timeframe: str,
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
     ) -> Optional[Candle]:
         """
         Retourne la dernière bougie clôturée.
+
+        Compatibilité :
+
+            get_latest_closed_candle("XAUUSD", "H1")
+
+        ou :
+
+            get_latest_closed_candle("H1")
         """
 
+        if timeframe is None:
+
+            if symbol is None:
+                raise ValueError(
+                    "Le timeframe doit être précisé."
+                )
+
+            timeframe = symbol
+            symbol = None
+
         candles = self.get_closed_candles(
-            symbol,
-            timeframe,
+            symbol if symbol is not None
+            else timeframe,
+            timeframe if symbol is not None
+            else None,
         )
 
         if not candles:
@@ -809,15 +769,21 @@ class Moteur2Cache:
 
     def get_symbol_data(
         self,
-        symbol: str,
+        symbol: Optional[str] = None,
     ) -> Dict[
         str,
         List[Candle],
     ]:
-        """
-        Retourne toutes les bougies en cache
-        pour un symbole.
-        """
+
+        if symbol is None:
+
+            if len(self.symbols) != 1:
+                raise ValueError(
+                    "Le symbole doit être précisé lorsque "
+                    "plusieurs symboles sont configurés."
+                )
+
+            symbol = self.symbols[0]
 
         symbol = self._validate_symbol(
             symbol
@@ -844,9 +810,6 @@ class Moteur2Cache:
         symbol: str,
         timeframe: str,
     ) -> bool:
-        """
-        Indique si un timeframe doit être rafraîchi.
-        """
 
         symbol = self._validate_symbol(
             symbol
@@ -866,9 +829,6 @@ class Moteur2Cache:
         symbol: str,
         timeframe: str,
     ) -> bool:
-        """
-        Vérification interne de fraîcheur.
-        """
 
         cache = self._cache[
             symbol
@@ -901,12 +861,6 @@ class Moteur2Cache:
     def get_status(
         self,
     ) -> Dict[str, Any]:
-        """
-        Retourne l'état complet du cache.
-
-        Les informations sont organisées par symbole
-        puis par timeframe.
-        """
 
         now = time.time()
 
@@ -927,10 +881,6 @@ class Moteur2Cache:
             "latest_ticks": {},
             "markets": {},
         }
-
-        # ------------------------------------------------------------------
-        # Ticks
-        # ------------------------------------------------------------------
 
         for symbol in self.symbols:
 
@@ -964,10 +914,6 @@ class Moteur2Cache:
                         tick.quote_age_seconds
                     ),
                 }
-
-        # ------------------------------------------------------------------
-        # Bougies
-        # ------------------------------------------------------------------
 
         for symbol in self.symbols:
 
@@ -1036,12 +982,6 @@ class Moteur2Cache:
         self,
         tick: Any,
     ) -> Optional[Tick]:
-        """
-        Transforme un dictionnaire tick en objet Tick.
-
-        Si l'objet est déjà un Tick,
-        il est utilisé directement.
-        """
 
         if isinstance(
             tick,
@@ -1116,9 +1056,6 @@ class Moteur2Cache:
     def _safe_float(
         value: Any,
     ) -> Optional[float]:
-        """
-        Conversion sécurisée en float.
-        """
 
         if value is None:
             return None
@@ -1136,12 +1073,6 @@ class Moteur2Cache:
     def _is_closed_candle(
         candle: Candle,
     ) -> bool:
-        """
-        Détermine si une bougie est clôturée.
-
-        Selon le modèle Candle de biquote_client.py :
-            is_open=False -> bougie clôturée.
-        """
 
         return not bool(
             getattr(
@@ -1157,16 +1088,6 @@ class Moteur2Cache:
 # ============================================================================
 
 async def main() -> None:
-    """
-    Test local du cache.
-
-    Ce test :
-        - crée le cache multi-actifs
-        - récupère H1 pour les actifs configurés
-        - affiche les dernières bougies
-        - affiche l'état du cache
-        - ne lance pas SignalR.
-    """
 
     logging.basicConfig(
         level=logging.INFO,
