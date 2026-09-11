@@ -6,12 +6,11 @@ IMPORTANT
 ---------
 Ce module est le SEUL module autorisé à produire :
     READY_FOR_SIGNAL
-Toutes les étapes précédentes fournissent uniquement
-des informations nécessaires à la validation.
 Conditions bloquantes principales :
     - setup valide
     - direction valide
     - symbole supporté
+    - cohérence du symbole entre les composants
     - RiskPlan valide
     - géométrie Entry / SL / TP1 cohérente
     - RR TP1 >= 3.0
@@ -20,8 +19,6 @@ Conditions bloquantes principales :
     - confirmation M5 valide
 TP1 est obligatoire.
 TP2 et TP3 sont optionnels.
-Lorsqu'ils existent, ils doivent respecter l'ordre
-naturel des objectifs.
 M1 est secondaire et ne peut jamais remplacer M5.
 Ce module :
     - ne calcule pas de nouveau setup ;
@@ -225,6 +222,76 @@ class Moteur2Validation:
             if normalized:
                 return normalized
         return None
+    def _symbol_values(
+        self,
+        setup: Any,
+        risk_plan: Any,
+        confirmation: Any,
+        score_result: Any,
+    ) -> Dict[str, Optional[str]]:
+        """
+        Extrait séparément les symboles de chaque composant.
+        Aucun composant ne doit pouvoir masquer une incohérence
+        entre deux parties du pipeline.
+        """
+        sources = {
+            "setup": setup,
+            "risk_plan": risk_plan,
+            "confirmation": confirmation,
+            "score_result": score_result,
+        }
+        values: Dict[str, Optional[str]] = {}
+        for name, source in sources.items():
+            raw_symbol = (
+                self._get(
+                    source,
+                    "symbol",
+                )
+                or self._get(
+                    source,
+                    "ticker",
+                )
+            )
+            if raw_symbol is None:
+                values[name] = None
+            else:
+                values[name] = (
+                    self._normalize_symbol(
+                        raw_symbol
+                    )
+                )
+        return values
+    def _symbols_coherent(
+        self,
+        setup: Any,
+        risk_plan: Any,
+        confirmation: Any,
+        score_result: Any,
+    ) -> bool:
+        """
+        Vérifie que tous les symboles explicitement présents
+        sont supportés et identiques.
+        Un composant sans symbole n'est pas considéré comme
+        contradictoire, mais dès qu'un symbole est fourni,
+        il doit être valide et cohérent.
+        """
+        values = self._symbol_values(
+            setup,
+            risk_plan,
+            confirmation,
+            score_result,
+        )
+        explicit_values = []
+        for value in values.values():
+            if value is not None:
+                explicit_values.append(value)
+        # Aucun symbole explicite.
+        if not explicit_values:
+            return False
+        # Tous les symboles explicites doivent être identiques.
+        return len(
+            set(explicit_values)
+        ) == 1
     # ========================================================
     # DIRECTION
     # ========================================================
@@ -382,7 +449,7 @@ class Moteur2Validation:
             or tp1 is None
         ):
             return False
-        # Les prix doivent être distincts.
+        # Prix distincts.
         if (
             abs(entry - sl) < 1e-12
             or abs(entry - tp1) < 1e-12
@@ -396,13 +463,11 @@ class Moteur2Validation:
                 sl < entry < tp1
             ):
                 return False
-            # TP2 optionnel.
             if tp2 is not None:
                 if not (
                     tp1 < tp2
                 ):
                     return False
-            # TP3 optionnel.
             if tp3 is not None:
                 previous = (
                     tp2
@@ -422,13 +487,11 @@ class Moteur2Validation:
                 tp1 < entry < sl
             ):
                 return False
-            # TP2 optionnel.
             if tp2 is not None:
                 if not (
                     tp2 < tp1
                 ):
                     return False
-            # TP3 optionnel.
             if tp3 is not None:
                 previous = (
                     tp2
@@ -455,8 +518,7 @@ class Moteur2Validation:
                         risk_plan,
                         "tp1",
                     )
-                )
-                is not None
+                ) is not None
             ),
             "tp2": (
                 self._float(
@@ -464,8 +526,7 @@ class Moteur2Validation:
                         risk_plan,
                         "tp2",
                     )
-                )
-                is not None
+                ) is not None
             ),
             "tp3": (
                 self._float(
@@ -473,8 +534,7 @@ class Moteur2Validation:
                         risk_plan,
                         "tp3",
                     )
-                )
-                is not None
+                ) is not None
             ),
         }
     # ========================================================
@@ -566,9 +626,6 @@ class Moteur2Validation:
     ) -> bool:
         if confirmation is None:
             return False
-        # La confirmation finale du module
-        # moteur2_confirmation.py reste l'autorité
-        # descriptive pour cette étape.
         return bool(
             self._get(
                 confirmation,
@@ -617,16 +674,13 @@ class Moteur2Validation:
         ):
             return False
         # M1 est secondaire.
-        # Une information M1 absente ou neutre
-        # ne bloque pas la validation.
+        # Une contradiction M1 seule ne bloque pas.
         if (
             m1_bias not in (
                 "UNKNOWN",
                 direction,
             )
         ):
-            # Une contradiction M1 seule ne doit
-            # pas remplacer la règle M5.
             return True
         return True
     # ========================================================
@@ -672,7 +726,51 @@ class Moteur2Validation:
                 "UNSUPPORTED_OR_MISSING_SYMBOL"
             )
         # ====================================================
-        # 3. DIRECTION
+        # 3. COHERENCE DES SYMBOLES
+        # ====================================================
+        symbol_values = self._symbol_values(
+            setup,
+            risk_plan,
+            confirmation,
+            score_result,
+        )
+        # Si un composant contient explicitement
+        # un symbole invalide, il doit être bloquant.
+        for name, value in symbol_values.items():
+            source = {
+                "setup": setup,
+                "risk_plan": risk_plan,
+                "confirmation": confirmation,
+                "score_result": score_result,
+            }[name]
+            raw_symbol = (
+                self._get(
+                    source,
+                    "symbol",
+                )
+                or self._get(
+                    source,
+                    "ticker",
+                )
+            )
+            if (
+                raw_symbol is not None
+                and value is None
+            ):
+                blockers.append(
+                    f"INVALID_SYMBOL_{name.upper()}"
+                )
+        if not self._symbols_coherent(
+            setup,
+            risk_plan,
+            confirmation,
+            score_result,
+        ):
+            blockers.append(
+                "SYMBOL_INCOHERENT"
+            )
+        # ====================================================
+        # 4. DIRECTION
         # ====================================================
         direction = self._direction(
             setup,
@@ -686,7 +784,7 @@ class Moteur2Validation:
                 "INVALID_DIRECTION"
             )
         # ====================================================
-        # 4. COHERENCE DES DIRECTIONS
+        # 5. COHERENCE DES DIRECTIONS
         # ====================================================
         if direction in (
             "BUY",
@@ -702,7 +800,7 @@ class Moteur2Validation:
                     "DIRECTION_INCOHERENT"
                 )
         # ====================================================
-        # 5. RISK PLAN
+        # 6. RISK PLAN
         # ====================================================
         if risk_plan is None:
             blockers.append(
@@ -716,7 +814,7 @@ class Moteur2Validation:
                     "INVALID_RISK_PLAN"
                 )
         # ====================================================
-        # 6. GEOMETRIE
+        # 7. GEOMETRIE
         # ====================================================
         geometry_valid = False
         if (
@@ -737,7 +835,7 @@ class Moteur2Validation:
                     "INVALID_GEOMETRY"
                 )
         # ====================================================
-        # 7. RR MINIMUM
+        # 8. RR MINIMUM
         # ====================================================
         rr = self._extract_rr(
             risk_plan
@@ -751,7 +849,7 @@ class Moteur2Validation:
                 f"RR_BELOW_MINIMUM_{self.MIN_RR:.1f}"
             )
         # ====================================================
-        # 8. SCORE MINIMUM
+        # 9. SCORE MINIMUM
         # ====================================================
         score = self._extract_score(
             score_result
@@ -765,7 +863,7 @@ class Moteur2Validation:
                 f"SCORE_BELOW_MINIMUM_{self.MIN_SCORE:.0f}"
             )
         # ====================================================
-        # 9. CONTRADICTION MAJEURE
+        # 10. CONTRADICTION MAJEURE
         # ====================================================
         major_contradiction = (
             self._major_contradiction(
@@ -779,7 +877,7 @@ class Moteur2Validation:
                 "MAJOR_CONTRADICTION"
             )
         # ====================================================
-        # 10. TP
+        # 11. TP
         # ====================================================
         tp_presence = self._tp_presence(
             risk_plan
@@ -788,7 +886,6 @@ class Moteur2Validation:
             blockers.append(
                 "TP1_MISSING"
             )
-        # TP2/TP3 ne sont pas obligatoires.
         if not tp_presence["tp2"]:
             warnings.append(
                 "TP2_OPTIONAL_NOT_DEFINED"
@@ -798,7 +895,7 @@ class Moteur2Validation:
                 "TP3_OPTIONAL_NOT_DEFINED"
             )
         # ====================================================
-        # 11. CONFIRMATION M5 / M1
+        # 12. CONFIRMATION M5 / M1
         # ====================================================
         m5_confirmed = (
             self._m5_confirmed(
@@ -834,7 +931,7 @@ class Moteur2Validation:
                 "CONFIRMATION_DIRECTION_INCOHERENT"
             )
         # ====================================================
-        # 12. DECISION - BLOQUEURS
+        # 13. DECISION - BLOQUEURS
         # ====================================================
         if blockers:
             return ValidationResult(
@@ -847,35 +944,24 @@ class Moteur2Validation:
                 warnings=warnings,
                 metadata={
                     "symbol": symbol,
+                    "symbol_values": symbol_values,
                     "setup_id": setup_id,
                     "direction": direction,
                     "score": score,
                     "minimum_score": self.MIN_SCORE,
                     "rr": rr,
                     "minimum_rr": self.MIN_RR,
-                    "geometry_valid": (
-                        geometry_valid
-                    ),
+                    "geometry_valid": geometry_valid,
                     "risk_plan_valid": (
                         self._risk_valid(
                             risk_plan
                         )
                     ),
-                    "tp_presence": (
-                        tp_presence
-                    ),
-                    "m5_confirmed": (
-                        m5_confirmed
-                    ),
-                    "confirmation_valid": (
-                        confirmation_valid
-                    ),
-                    "confirmation_status": (
-                        confirmation_status
-                    ),
-                    "major_contradiction": (
-                        major_contradiction
-                    ),
+                    "tp_presence": tp_presence,
+                    "m5_confirmed": m5_confirmed,
+                    "confirmation_valid": confirmation_valid,
+                    "confirmation_status": confirmation_status,
+                    "major_contradiction": major_contradiction,
                     "final_validation_owner": (
                         "moteur2_validation.py"
                     ),
@@ -883,7 +969,7 @@ class Moteur2Validation:
                 },
             )
         # ====================================================
-        # 13. ATTENTE CONFIRMATION
+        # 14. ATTENTE CONFIRMATION M5
         # ====================================================
         if not m5_confirmed:
             return ValidationResult(
@@ -897,26 +983,19 @@ class Moteur2Validation:
                 warnings=warnings,
                 metadata={
                     "symbol": symbol,
+                    "symbol_values": symbol_values,
                     "setup_id": setup_id,
                     "direction": direction,
                     "score": score,
                     "minimum_score": self.MIN_SCORE,
                     "rr": rr,
                     "minimum_rr": self.MIN_RR,
-                    "geometry_valid": (
-                        geometry_valid
-                    ),
+                    "geometry_valid": geometry_valid,
                     "risk_plan_valid": True,
-                    "tp_presence": (
-                        tp_presence
-                    ),
+                    "tp_presence": tp_presence,
                     "m5_confirmed": False,
-                    "confirmation_valid": (
-                        confirmation_valid
-                    ),
-                    "confirmation_status": (
-                        confirmation_status
-                    ),
+                    "confirmation_valid": confirmation_valid,
+                    "confirmation_status": confirmation_status,
                     "final_validation_owner": (
                         "moteur2_validation.py"
                     ),
@@ -924,7 +1003,7 @@ class Moteur2Validation:
                 },
             )
         # ====================================================
-        # 14. M5 CONFIRME MAIS CONFIRMATION FINALE INVALIDE
+        # 15. M5 CONFIRME MAIS CONFIRMATION FINALE INVALIDE
         # ====================================================
         if not confirmation_valid:
             return ValidationResult(
@@ -939,24 +1018,19 @@ class Moteur2Validation:
                 warnings=warnings,
                 metadata={
                     "symbol": symbol,
+                    "symbol_values": symbol_values,
                     "setup_id": setup_id,
                     "direction": direction,
                     "score": score,
                     "minimum_score": self.MIN_SCORE,
                     "rr": rr,
                     "minimum_rr": self.MIN_RR,
-                    "geometry_valid": (
-                        geometry_valid
-                    ),
+                    "geometry_valid": geometry_valid,
                     "risk_plan_valid": True,
-                    "tp_presence": (
-                        tp_presence
-                    ),
+                    "tp_presence": tp_presence,
                     "m5_confirmed": True,
                     "confirmation_valid": False,
-                    "confirmation_status": (
-                        confirmation_status
-                    ),
+                    "confirmation_status": confirmation_status,
                     "final_validation_owner": (
                         "moteur2_validation.py"
                     ),
@@ -964,7 +1038,7 @@ class Moteur2Validation:
                 },
             )
         # ====================================================
-        # 15. READY FOR SIGNAL
+        # 16. READY FOR SIGNAL
         # ====================================================
         return ValidationResult(
             status=READY_STATUS,
@@ -972,42 +1046,33 @@ class Moteur2Validation:
             reason=(
                 "Setup validé : score minimum atteint, "
                 "RR TP1 >= 3.0, géométrie cohérente, "
-                "absence de contradiction majeure et "
-                "confirmation M5 valide."
+                "symboles cohérents, absence de contradiction "
+                "majeure et confirmation M5 valide."
             ),
             blockers=[],
             warnings=warnings,
             metadata={
                 "symbol": symbol,
+                "symbol_values": symbol_values,
                 "setup_id": setup_id,
                 "direction": direction,
                 "score": score,
                 "minimum_score": self.MIN_SCORE,
                 "rr": rr,
                 "minimum_rr": self.MIN_RR,
-                "geometry_valid": (
-                    geometry_valid
-                ),
+                "geometry_valid": geometry_valid,
                 "risk_plan_valid": True,
-                "tp_presence": (
-                    tp_presence
-                ),
+                "tp_presence": tp_presence,
                 "m5_confirmed": True,
                 "confirmation_valid": True,
-                "confirmation_status": (
-                    confirmation_status
-                ),
+                "confirmation_status": confirmation_status,
                 "final_validation_owner": (
                     "moteur2_validation.py"
                 ),
                 "ready_for_signal": True,
                 "auto_execution": False,
-                "external_supervisors_authority": (
-                    False
-                ),
-                "tracker_can_modify_signal": (
-                    False
-                ),
+                "external_supervisors_authority": False,
+                "tracker_can_modify_signal": False,
             },
         )
 # ============================================================
@@ -1044,9 +1109,7 @@ if __name__ == "__main__":
         "direction": "BUY",
         "entry": 4610.0,
         "sl": 4600.0,
-        # TP1 >= 3R
         "tp1": 4640.0,
-        # Optionnels
         "tp2": 4650.0,
         "tp3": 4660.0,
         "primary_rr": 3.0,
@@ -1064,9 +1127,7 @@ if __name__ == "__main__":
         "m5_confirmed": True,
         "m1_confirmed": True,
         "combined_score": 75.0,
-        "confirmation_status": (
-            "CONFIRMED_M5_M1"
-        ),
+        "confirmation_status": "CONFIRMED_M5_M1",
         "confirmation_valid": True,
     }
     score_test = {
