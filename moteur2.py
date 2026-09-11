@@ -871,20 +871,17 @@ class Moteur2:
             )
             return result
         # ====================================================================
-        # SIGNAL FINAL
-        # ====================================================================
-        signal_result = self._build_signal(
-            symbol=symbol,
-            setup=prepared_setup,
-            risk_plan=risk_plan,
-            confirmation=confirmation_result,
-            score_result=score_result,
-            validation_result=validation_result,
-            antispam_result=antispam_result,
-        )
-        result["signal"] = signal_result
-        # ====================================================================
         # ENREGISTREMENT ANTISPAM
+        #
+        # IMPORTANT :
+        # enregistrer_signal() est volontairement une opération
+        # d'enregistrement uniquement.
+        #
+        # La validation a déjà été effectuée par
+        # moteur2_validation.py et vérifiée juste au-dessus.
+        #
+        # Aucun argument "validation" n'est transmis ici car
+        # moteur2_antispam.py n'en attend pas dans cette méthode.
         # ====================================================================
         setup_id = self._get(
             antispam_result,
@@ -902,7 +899,6 @@ class Moteur2:
                     setup=prepared_setup,
                     risk_plan=risk_plan,
                     setup_id=setup_id,
-                    validation=validation_result,
                     extra={
                         "symbol": symbol,
                         "validation_status": (
@@ -921,9 +917,6 @@ class Moteur2:
                     },
                 )
             )
-            # L'enregistrement est désormais verrouillé
-            # par READY_FOR_SIGNAL. Si celui-ci échoue,
-            # aucun nouveau signal ne doit être créé ici.
             if recorded_setup_id is None:
                 result["status"] = (
                     "ANTISPAM_REGISTRATION_FAILED"
@@ -933,7 +926,6 @@ class Moteur2:
                     "son enregistrement anti-spam "
                     "a échoué."
                 )
-                result["signal"] = None
                 return result
         except Exception as exc:
             self.logger.exception(
@@ -946,8 +938,20 @@ class Moteur2:
             result["reason"] = (
                 f"ANTISPAM_REGISTRATION_ERROR: {exc}"
             )
-            result["signal"] = None
             return result
+        # ====================================================================
+        # SIGNAL FINAL
+        # ====================================================================
+        signal_result = self._build_signal(
+            symbol=symbol,
+            setup=prepared_setup,
+            risk_plan=risk_plan,
+            confirmation=confirmation_result,
+            score_result=score_result,
+            validation_result=validation_result,
+            antispam_result=antispam_result,
+        )
+        result["signal"] = signal_result
         result["status"] = READY_FOR_SIGNAL
         return result
     # ========================================================================
@@ -957,7 +961,9 @@ class Moteur2:
         self,
         symbol: str,
     ) -> Dict[str, Any]:
-        normalized = self._normalize_symbol(symbol)
+        normalized = self._normalize_symbol(
+            symbol
+        )
         if normalized is None:
             return {
                 "engine": "MOTEUR_2",
@@ -1039,12 +1045,17 @@ class Moteur2:
             )
             # ================================================================
             # SETUPS
+            #
+            # CORRECTION :
+            # le symbole réellement analysé est maintenant transmis
+            # explicitement au module des setups.
             # ================================================================
             setups_result = self.setups.analyser(
                 zones_result=zones_result,
                 confluences_result=confluences_result,
                 context_result=contexte_result,
                 candles_by_timeframe=donnees,
+                symbol=normalized,
             )
             setups = self._extract_setups(
                 setups_result
