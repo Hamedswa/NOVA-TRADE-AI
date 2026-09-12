@@ -289,14 +289,19 @@ class Moteur2:
         self,
         donnees: Dict[str, Any],
         zones: Any,
+        cartographie: Any = None,
+        liquidite: Any = None,
     ) -> Any:
 
-        # Signature réelle :
-        # analyser(candles_by_timeframe, zones_result)
+        # Contexte enrichi : données + zones + cartographie + liquidité.
+        # Cette couche reste descriptive et non bloquante.
         return await self._call(
             self.contexte.analyser,
             donnees,
             zones,
+            symbol=self.symbol,
+            cartographie=cartographie,
+            liquidite=liquidite,
         )
 
     # ============================================================
@@ -668,6 +673,8 @@ class Moteur2:
             contexte = await self.analyser_contexte(
                 donnees,
                 zones,
+                cartographie,
+                liquidite,
             )
 
             confluences = await self.analyser_confluences(
