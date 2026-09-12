@@ -235,9 +235,8 @@ class Moteur2:
     ) -> Any:
 
         return await self._call(
-            self.marche.analyser,
+            self.marche.cartographier_marche,
             donnees,
-            symbol=self.symbol,
         )
 
     # ============================================================
@@ -1086,6 +1085,62 @@ class Moteur2Global:
                 return {'status': 'GLOBAL_ENGINE_ERROR', 'engine': ENGINE_NAME,
                         'module': 'moteur2_global', 'signals': [], 'signal_count': 0,
                         'error': str(exc), 'forced_signal': False, 'auto_execution': False}
+
+    async def analyser_symbol(self, symbol: str) -> Dict[str, Any]:
+        """Analyse l'actif demandé via le moteur global multi-actifs.
+
+        Cette méthode est une compatibilité pour l'interface Telegram :
+        le moteur global analyse toujours le portefeuille des 4 actifs, puis
+        retourne uniquement le résultat de l'actif demandé.
+        Elle ne modifie ni la stratégie, ni le ranking, ni les critères de validation.
+        """
+        normalized = (
+            str(symbol).strip().upper()
+            .replace('/', '')
+            .replace(' ', '')
+            .replace('-', '')
+            .replace('_', '')
+        )
+
+        if normalized not in self.symbols:
+            return {
+                'status': 'UNSUPPORTED_SYMBOL',
+                'engine': ENGINE_NAME,
+                'symbol': normalized,
+                'signals': [],
+                'error': f'Symbole non supporté : {normalized}',
+            }
+
+        global_result = await self.analyser()
+        cycle = global_result.get('cycle') or self.last_cycle or {}
+        results = cycle.get('results') or {}
+
+        # Compatibilité avec les deux formes possibles de stockage.
+        result = results.get(normalized)
+        if result is None:
+            for key, value in results.items():
+                key_normalized = (
+                    str(key).strip().upper()
+                    .replace('/', '')
+                    .replace(' ', '')
+                    .replace('-', '')
+                    .replace('_', '')
+                )
+                if key_normalized == normalized:
+                    result = value
+                    break
+
+        if result is None:
+            return {
+                'status': 'SYMBOL_RESULT_UNAVAILABLE',
+                'engine': ENGINE_NAME,
+                'symbol': normalized,
+                'signals': [],
+                'global_status': global_result.get('status'),
+                'error': f'Aucun résultat disponible pour {normalized}.',
+            }
+
+        return result
 
     def obtenir_top_signaux(self) -> List[Any]:
         if not self.last_ranking:
