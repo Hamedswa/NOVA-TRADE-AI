@@ -270,6 +270,7 @@ class Moteur2:
         self,
         cartographie: Any,
         current_price: float,
+        liquidite: Any = None,
     ) -> Any:
 
         # IMPORTANT : méthode réelle de la classe = analyser()
@@ -277,6 +278,7 @@ class Moteur2:
             self.zones.analyser,
             cartographie,
             current_price,
+            liquidite,
         )
 
     # ============================================================
@@ -660,6 +662,7 @@ class Moteur2:
             zones = await self.analyser_zones(
                 cartographie,
                 current_price,
+                liquidite,
             )
 
             contexte = await self.analyser_contexte(
