@@ -2724,4 +2724,719 @@ async def main() -> None:
 
 if __name__ == "__main__":
 
+# ============================================================================
+# NOVA ENGINE 2 — ORCHESTRATEUR GLOBAL MULTI-ACTIFS
+# ============================================================================
+#
+# IMPORTANT :
+# L'import est volontairement effectué à l'intérieur de la classe.
+#
+# Pourquoi ?
+# moteur2_multi_actifs.py importe Moteur2 depuis moteur2.py.
+# Faire l'import en haut de moteur2.py créerait une dépendance circulaire.
+# ============================================================================
+
+
+class Moteur2Global:
+    """
+    Orchestrateur global de NOVA TRADE AI Engine 2.
+
+    Architecture :
+
+        XAUUSD ─┐
+        BTCUSD ─┤
+        EURUSD ─┼──> moteurs indépendants
+        GBPUSD ─┘
+                    ↓
+              résultats individuels
+                    ↓
+              ranking global
+                    ↓
+                 TOP 3
+
+    Ce gestionnaire ne remplace pas Moteur2.
+
+    Moteur2 reste responsable de l'analyse complète d'un seul actif.
+
+    Moteur2Global ajoute uniquement :
+        - multi-actifs ;
+        - ranking global ;
+        - maximum 3 signaux ;
+        - aucun signal forcé.
+    """
+
+    def __init__(
+        self,
+        symbols=None,
+        max_signals: int = 3,
+        parallel: bool = True,
+    ) -> None:
+
+        # ---------------------------------------------------------------
+        # Import tardif pour éviter l'import circulaire.
+        # ---------------------------------------------------------------
+
+        from moteur2_multi_actifs import (
+            Moteur2MultiActifs,
+        )
+
+        from moteur2_ranking import (
+            Moteur2Ranking,
+        )
+
+        # ---------------------------------------------------------------
+        # Configuration
+        # ---------------------------------------------------------------
+
+        if symbols is None:
+
+            symbols = list(
+                SUPPORTED_SYMBOLS
+            )
+
+        self.symbols = tuple(
+            str(symbol)
+            .strip()
+            .upper()
+            .replace("/", "")
+            .replace(" ", "")
+            .replace("-", "")
+            .replace("_", "")
+            for symbol in symbols
+        )
+
+        self.max_signals = max(
+            1,
+            int(max_signals),
+        )
+
+        self.parallel = bool(
+            parallel
+        )
+
+        # ---------------------------------------------------------------
+        # Gestionnaire des moteurs individuels
+        # ---------------------------------------------------------------
+
+        self.multi_actifs = (
+            Moteur2MultiActifs(
+                symbols=self.symbols,
+                parallel=self.parallel,
+            )
+        )
+
+        # ---------------------------------------------------------------
+        # Ranking global
+        # ---------------------------------------------------------------
+
+        self.ranking = Moteur2Ranking(
+            max_signals=self.max_signals
+        )
+
+        # ---------------------------------------------------------------
+        # État
+        # ---------------------------------------------------------------
+
+        self.initialized = False
+        self.running = False
+
+        self.last_cycle = None
+        self.last_ranking = None
+
+        self.analysis_lock = asyncio.Lock()
+
+    # ====================================================================
+    # INITIALISATION
+    # ====================================================================
+
+    async def initialiser(
+        self,
+    ) -> Dict[str, Any]:
+
+        logger.info(
+            "=================================================="
+        )
+
+        logger.info(
+            "NOVA TRADE AI — ENGINE 2 GLOBAL"
+        )
+
+        logger.info(
+            "Initialisation multi-actifs..."
+        )
+
+        logger.info(
+            "Actifs : %s",
+            ", ".join(self.symbols),
+        )
+
+        logger.info(
+            "Maximum signaux : %s",
+            self.max_signals,
+        )
+
+        logger.info(
+            "=================================================="
+        )
+
+        try:
+
+            result = (
+                await self.multi_actifs.initialiser()
+            )
+
+            initialized_symbols = (
+                result.get(
+                    "initialized_symbols",
+                    [],
+                )
+            )
+
+            self.initialized = bool(
+                initialized_symbols
+            )
+
+            return {
+                "success":
+                    self.initialized,
+
+                "engine":
+                    ENGINE_NAME,
+
+                "module":
+                    "moteur2_global",
+
+                "symbols":
+                    list(self.symbols),
+
+                "initialized_symbols":
+                    initialized_symbols,
+
+                "failed_symbols":
+                    result.get(
+                        "failed_symbols",
+                        [],
+                    ),
+
+                "max_signals":
+                    self.max_signals,
+
+                "forced_signal":
+                    False,
+
+                "ranking_is_decision_maker":
+                    False,
+
+                "quality_is_blocking":
+                    False,
+
+                "results":
+                    result.get(
+                        "results",
+                        {},
+                    ),
+            }
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur initialisation Engine 2 Global : %s",
+                exc,
+            )
+
+            self.initialized = False
+
+            return {
+                "success": False,
+                "engine": ENGINE_NAME,
+                "module": "moteur2_global",
+                "symbols": list(
+                    self.symbols
+                ),
+                "error": str(exc),
+            }
+
+    # ====================================================================
+    # STREAMS
+    # ====================================================================
+
+    async def demarrer_streams(
+        self,
+    ) -> Dict[str, Any]:
+
+        try:
+
+            return await (
+                self.multi_actifs.demarrer_streams()
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Erreur démarrage streams globaux : %s",
+                exc,
+            )
+
+            return {
+                "success": False,
+                "error": str(exc),
+            }
+
+    # ====================================================================
+    # ANALYSE GLOBALE
+    # ====================================================================
+
+    async def analyser(
+        self,
+    ) -> Dict[str, Any]:
+
+        async with self.analysis_lock:
+
+            if not self.initialized:
+
+                init = (
+                    await self.initialiser()
+                )
+
+                if not init.get(
+                    "success",
+                    False,
+                ):
+
+                    return {
+                        "status":
+                            "INITIALIZATION_ERROR",
+
+                        "engine":
+                            ENGINE_NAME,
+
+                        "signals":
+                            [],
+
+                        "error":
+                            init.get(
+                                "error",
+                                "Initialisation impossible.",
+                            ),
+                    }
+
+            try:
+
+                # --------------------------------------------------------
+                # 1. Analyse indépendante des 4 actifs
+                # --------------------------------------------------------
+
+                cycle = (
+                    await self.multi_actifs.analyser_tous()
+                )
+
+                self.last_cycle = cycle
+
+                # --------------------------------------------------------
+                # 2. Ranking global
+                # --------------------------------------------------------
+
+                ranking = (
+                    self.ranking.ranker(
+                        cycle
+                    )
+                )
+
+                self.last_ranking = ranking
+
+                # --------------------------------------------------------
+                # 3. Signaux finaux
+                # --------------------------------------------------------
+
+                signals = ranking.get(
+                    "signals",
+                    [],
+                )
+
+                # --------------------------------------------------------
+                # 4. Résultat global
+                # --------------------------------------------------------
+
+                result = {
+
+                    "status":
+                        "SIGNALS_AVAILABLE"
+                        if signals
+                        else "NO_GLOBAL_SIGNAL",
+
+                    "engine":
+                        ENGINE_NAME,
+
+                    "module":
+                        "moteur2_global",
+
+                    "symbols":
+                        list(self.symbols),
+
+                    "max_signals":
+                        self.max_signals,
+
+                    "signals":
+                        signals,
+
+                    "signal_count":
+                        len(signals),
+
+                    "candidates_count":
+                        ranking.get(
+                            "candidate_count",
+                            0,
+                        ),
+
+                    "selected_count":
+                        ranking.get(
+                            "selected_count",
+                            0,
+                        ),
+
+                    "cycle":
+                        cycle,
+
+                    "ranking":
+                        ranking,
+
+                    # ----------------------------------------------------
+                    # Sécurité architecturale
+                    # ----------------------------------------------------
+
+                    "forced_signal":
+                        False,
+
+                    "quality_is_blocking":
+                        False,
+
+                    "ranking_is_decision_maker":
+                        False,
+
+                    "auto_execution":
+                        False,
+
+                    "decision_owner":
+                        "moteur2_decision.py",
+
+                    "risk_owner":
+                        "moteur2_risk.py",
+
+                    "validation_owner":
+                        "moteur2_validation.py",
+
+                    "ranking_owner":
+                        "moteur2_ranking.py",
+                }
+
+                logger.info(
+                    "ENGINE 2 GLOBAL : "
+                    "%s candidat(s) → %s signal(aux) retenu(s).",
+                    ranking.get(
+                        "candidate_count",
+                        0,
+                    ),
+                    len(signals),
+                )
+
+                return result
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Erreur analyse Engine 2 Global : %s",
+                    exc,
+                )
+
+                return {
+                    "status":
+                        "GLOBAL_ENGINE_ERROR",
+
+                    "engine":
+                        ENGINE_NAME,
+
+                    "module":
+                        "moteur2_global",
+
+                    "signals":
+                        [],
+
+                    "signal_count":
+                        0,
+
+                    "error":
+                        str(exc),
+
+                    "forced_signal":
+                        False,
+
+                    "auto_execution":
+                        False,
+                }
+
+    # ====================================================================
+    # TOP 3
+    # ====================================================================
+
+    def obtenir_top_signaux(
+        self,
+    ) -> List[Any]:
+
+        if not self.last_ranking:
+
+            return []
+
+        return self.last_ranking.get(
+            "signals",
+            [],
+        )
+
+    # ====================================================================
+    # STATUS
+    # ====================================================================
+
+    def get_status(
+        self,
+    ) -> Dict[str, Any]:
+
+        try:
+
+            multi_status = (
+                self.multi_actifs.get_status()
+            )
+
+        except Exception as exc:
+
+            multi_status = {
+                "status":
+                    "ERROR",
+                "error":
+                    str(exc),
+            }
+
+        try:
+
+            ranking_status = (
+                self.ranking.get_status()
+            )
+
+        except Exception as exc:
+
+            ranking_status = {
+                "status":
+                    "ERROR",
+                "error":
+                    str(exc),
+            }
+
+        return {
+
+            "engine":
+                ENGINE_NAME,
+
+            "module":
+                "moteur2_global",
+
+            "symbols":
+                list(self.symbols),
+
+            "symbol_count":
+                len(self.symbols),
+
+            "initialized":
+                self.initialized,
+
+            "running":
+                self.running,
+
+            "max_signals":
+                self.max_signals,
+
+            "forced_signal":
+                False,
+
+            "quality_is_blocking":
+                False,
+
+            "ranking_is_decision_maker":
+                False,
+
+            "auto_execution":
+                False,
+
+            "multi_actifs":
+                multi_status,
+
+            "ranking":
+                ranking_status,
+
+            "last_signal_count":
+                len(
+                    self.obtenir_top_signaux()
+                ),
+        }
+
+    # ====================================================================
+    # RUN CONTINU
+    # ====================================================================
+
+    async def run(
+        self,
+        analysis_interval_seconds: int = 10,
+        start_streams: bool = True,
+    ) -> None:
+
+        if not self.initialized:
+
+            init = (
+                await self.initialiser()
+            )
+
+            if not init.get(
+                "success",
+                False,
+            ):
+
+                raise RuntimeError(
+                    "Impossible d'initialiser "
+                    "Engine 2 Global."
+                )
+
+        self.running = True
+
+        logger.info(
+            "ENGINE 2 GLOBAL démarré."
+        )
+
+        stream_task = None
+
+        try:
+
+            # ------------------------------------------------------------
+            # Les streams sont démarrés une seule fois.
+            # ------------------------------------------------------------
+
+            if start_streams:
+
+                stream_task = asyncio.create_task(
+                    self.demarrer_streams()
+                )
+
+            # ------------------------------------------------------------
+            # Boucle globale
+            # ------------------------------------------------------------
+
+            while self.running:
+
+                try:
+
+                    await self.analyser()
+
+                except Exception as exc:
+
+                    logger.exception(
+                        "Erreur cycle global : %s",
+                        exc,
+                    )
+
+                await asyncio.sleep(
+                    max(
+                        1,
+                        int(
+                            analysis_interval_seconds
+                        ),
+                    )
+                )
+
+        finally:
+
+            self.running = False
+
+            if stream_task is not None:
+
+                stream_task.cancel()
+
+                try:
+
+                    await stream_task
+
+                except asyncio.CancelledError:
+
+                    pass
+
+    # ====================================================================
+    # STOP
+    # ====================================================================
+
+    async def stop(
+        self,
+    ) -> None:
+
+        self.running = False
+
+        try:
+
+            await self.multi_actifs.stop()
+
+        except Exception as exc:
+
+            logger.warning(
+                "Erreur arrêt Engine 2 Global : %s",
+                exc,
+            )
+
+
+# ============================================================================
+# INSTANCE GLOBALE
+# ============================================================================
+
+moteur2_global = Moteur2Global(
+    symbols=SUPPORTED_SYMBOLS,
+    max_signals=3,
+    parallel=True,
+)
+
+
+# ============================================================================
+# RACCOURCIS GLOBAUX
+# ============================================================================
+
+async def initialiser_engine2_global(
+) -> Dict[str, Any]:
+
+    return await (
+        moteur2_global.initialiser()
+    )
+
+
+async def analyser_engine2_global(
+) -> Dict[str, Any]:
+
+    return await (
+        moteur2_global.analyser()
+    )
+
+
+async def arreter_engine2_global(
+) -> None:
+
+    await (
+        moteur2_global.stop()
+    )
+
+
+def statut_engine2_global(
+) -> Dict[str, Any]:
+
+    return (
+        moteur2_global.get_status()
+    )
+
+
+def top_signaux_engine2_global(
+) -> List[Any]:
+
+    return (
+        moteur2_global.obtenir_top_signaux()
+    )
     asyncio.run(main())
