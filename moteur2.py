@@ -314,16 +314,19 @@ class Moteur2:
         zones: Any,
         contexte: Any,
         cartographie: Any,
+        liquidite: Any = None,
     ) -> Any:
 
-        # Signature réelle :
-        # analyser(candles, zones, context, market_map)
+        # Confluences enrichies : données + zones + contexte +
+        # cartographie + liquidité. Couche descriptive et non bloquante.
         return await self._call(
             self.confluences.analyser,
             donnees,
             zones,
             contexte,
             cartographie,
+            symbol=self.symbol,
+            liquidity_result=liquidite,
         )
 
     # ============================================================
@@ -682,6 +685,7 @@ class Moteur2:
                 zones,
                 contexte,
                 cartographie,
+                liquidite,
             )
 
             setups_result = await self.analyser_setups(
