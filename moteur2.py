@@ -599,13 +599,48 @@ class Moteur2:
                 current_price = self.cache.get_current_price()
 
             if current_price is None:
+                logger.info(
+                    "Prix live indisponible : %s | attente du premier tick BiQuote...",
+                    self.symbol,
+                )
 
-                return {
-                    "status": "NO_PRICE",
-                    "reason": (
-                        "Aucun prix live BiQuote disponible."
-                    ),
-                }
+                deadline = asyncio.get_running_loop().time() + 15.0
+                while (
+                    current_price is None
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0.5)
+                    try:
+                        await self.rafraichir_cache()
+                    except Exception as exc:
+                        logger.debug(
+                            "Rafraîchissement cache pendant attente prix %s : %s",
+                            self.symbol,
+                            exc,
+                        )
+
+                    try:
+                        current_price = self.cache.get_current_price(self.symbol)
+                    except TypeError:
+                        current_price = self.cache.get_current_price()
+
+                if current_price is None:
+                    logger.warning(
+                        "Aucun prix live BiQuote reçu après 15s : %s",
+                        self.symbol,
+                    )
+                    return {
+                        "status": "NO_PRICE",
+                        "reason": (
+                            "Aucun prix live BiQuote disponible après attente."
+                        ),
+                    }
+
+                logger.info(
+                    "Prix live BiQuote reçu : %s | %s",
+                    self.symbol,
+                    current_price,
+                )
 
             donnees = self.obtenir_donnees()
 
