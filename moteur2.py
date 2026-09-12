@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from biquote_client import BiQuoteClient
 from biquote_stream import BiQuoteStream
@@ -37,20 +37,6 @@ from moteur2_signal import Moteur2Signal
 
 
 SYMBOL = "XAUUSD"
-
-# Les quatre actifs surveillés en permanence par Engine 2.
-# L'ordre est volontaire : XAUUSD, BTCUSD, EURUSD, GBPUSD.
-SUPPORTED_SYMBOLS = (
-    "XAUUSD",
-    "BTCUSD",
-    "EURUSD",
-    "GBPUSD",
-)
-
-# Objectif opérationnel : rechercher activement les meilleures
-# opportunités de la journée. Ce nombre n'est PAS un quota forcé.
-DAILY_SIGNAL_TARGET = 3
-MAX_SIGNALS_PER_CYCLE = 3
 
 TIMEFRAMES = (
     "H4",
@@ -73,10 +59,9 @@ class Moteur2:
             symbol.strip().upper().replace("/", "")
         )
 
-        if self.symbol not in SUPPORTED_SYMBOLS:
+        if self.symbol != "XAUUSD":
             raise ValueError(
-                f"Engine 2 ne supporte pas {self.symbol}. "
-                f"Symboles supportés : {', '.join(SUPPORTED_SYMBOLS)}."
+                "Engine 2 fonctionne uniquement sur XAUUSD."
             )
 
         self.biquote = BiQuoteClient()
@@ -234,9 +219,12 @@ class Moteur2:
         donnees: Dict[str, Any],
     ) -> Any:
 
+        # Moteur2Marche expose la méthode publique `analyser()`.
+        # `cartographier_marche()` est une fonction module-level.
         return await self._call(
-            self.marche.cartographier_marche,
+            self.marche.analyser,
             donnees,
+            symbol=self.symbol,
         )
 
     # ============================================================
@@ -590,57 +578,18 @@ class Moteur2:
 
             await self.rafraichir_cache()
 
-            # Le cache est déjà lié à self.symbol. On tente néanmoins
-            # la forme explicite si une implémentation multi-symboles
-            # de Moteur2Cache l'accepte, avec fallback rétrocompatible.
-            try:
-                current_price = self.cache.get_current_price(self.symbol)
-            except TypeError:
-                current_price = self.cache.get_current_price()
+            current_price = (
+                self.cache.get_current_price()
+            )
 
             if current_price is None:
-                logger.info(
-                    "Prix live indisponible : %s | attente du premier tick BiQuote...",
-                    self.symbol,
-                )
 
-                deadline = asyncio.get_running_loop().time() + 15.0
-                while (
-                    current_price is None
-                    and asyncio.get_running_loop().time() < deadline
-                ):
-                    await asyncio.sleep(0.5)
-                    try:
-                        await self.rafraichir_cache()
-                    except Exception as exc:
-                        logger.debug(
-                            "Rafraîchissement cache pendant attente prix %s : %s",
-                            self.symbol,
-                            exc,
-                        )
-
-                    try:
-                        current_price = self.cache.get_current_price(self.symbol)
-                    except TypeError:
-                        current_price = self.cache.get_current_price()
-
-                if current_price is None:
-                    logger.warning(
-                        "Aucun prix live BiQuote reçu après 15s : %s",
-                        self.symbol,
-                    )
-                    return {
-                        "status": "NO_PRICE",
-                        "reason": (
-                            "Aucun prix live BiQuote disponible après attente."
-                        ),
-                    }
-
-                logger.info(
-                    "Prix live BiQuote reçu : %s | %s",
-                    self.symbol,
-                    current_price,
-                )
+                return {
+                    "status": "NO_PRICE",
+                    "reason": (
+                        "Aucun prix live BiQuote disponible."
+                    ),
+                }
 
             donnees = self.obtenir_donnees()
 
@@ -922,21 +871,6 @@ class Moteur2:
     # STATUS
     # ============================================================
 
-    def _cache_accepts_symbol_price(self) -> bool:
-        """Détecte si get_current_price accepte un symbole explicite."""
-        try:
-            import inspect as _inspect
-            signature = _inspect.signature(self.cache.get_current_price)
-            parameters = list(signature.parameters.values())
-            return any(
-                p.kind in (_inspect.Parameter.POSITIONAL_ONLY,
-                           _inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                           _inspect.Parameter.VAR_POSITIONAL)
-                for p in parameters
-            )
-        except Exception:
-            return False
-
     def get_status(self) -> Dict[str, Any]:
 
         try:
@@ -955,11 +889,7 @@ class Moteur2:
             "source": "BiQuote",
             "running": self.running,
             "initialized": self.initialized,
-            "current_price": (
-                self.cache.get_current_price(self.symbol)
-                if self._cache_accepts_symbol_price()
-                else self.cache.get_current_price()
-            ),
+            "current_price": self.cache.get_current_price(),
             "timeframes": list(TIMEFRAMES),
             "cache": cache_status,
             "antispam": antispam_status,
@@ -1029,10 +959,7 @@ class Moteur2Global:
         if invalid:
             raise ValueError(f"Symboles non supportés : {', '.join(invalid)}")
 
-        self.max_signals = min(
-            MAX_SIGNALS_PER_CYCLE,
-            max(1, int(max_signals)),
-        )
+        self.max_signals = max(1, int(max_signals))
         self.parallel = bool(parallel)
         self.analysis_interval_seconds = max(1, int(analysis_interval_seconds))
         self.multi_actifs = Moteur2MultiActifs(
@@ -1099,7 +1026,6 @@ class Moteur2Global:
                     'module': 'moteur2_global',
                     'symbols': list(self.symbols),
                     'max_signals': self.max_signals,
-                    'daily_signal_target': DAILY_SIGNAL_TARGET,
                     'signals': signals,
                     'signal_count': len(signals),
                     'candidates_count': ranking.get('candidate_count', 0),
@@ -1140,7 +1066,6 @@ class Moteur2Global:
             'symbols': list(self.symbols), 'symbol_count': len(self.symbols),
             'initialized': self.initialized, 'running': self.running,
             'max_signals': self.max_signals,
-            'daily_signal_target': DAILY_SIGNAL_TARGET,
             'analysis_interval_seconds': self.analysis_interval_seconds,
             'forced_signal': False, 'quality_is_blocking': False,
             'ranking_is_decision_maker': False, 'auto_execution': False,
