@@ -4,12 +4,7 @@ moteur2.py
 
 Orchestrateur corrigé.
 
-4 actifs :
-XAUUSD
-BTCUSD
-EURUSD
-GBPUSD
-
+XAUUSD uniquement.
 Source marché : BiQuote uniquement.
 
 Pipeline :
@@ -29,6 +24,7 @@ from biquote_client import BiQuoteClient
 from biquote_stream import BiQuoteStream
 from moteur2_cache import Moteur2Cache
 from moteur2_marche import Moteur2Marche
+from moteur2_liquidite import Moteur2Liquidite
 from moteur2_zones import Moteur2Zones
 from moteur2_contexte import Moteur2Contexte
 from moteur2_confluences import Moteur2Confluences
@@ -43,6 +39,8 @@ from moteur2_signal import Moteur2Signal
 
 SYMBOL = "XAUUSD"
 
+# Les quatre actifs surveillés en permanence par Engine 2.
+# L'ordre est volontaire : XAUUSD, BTCUSD, EURUSD, GBPUSD.
 SUPPORTED_SYMBOLS = (
     "XAUUSD",
     "BTCUSD",
@@ -50,6 +48,8 @@ SUPPORTED_SYMBOLS = (
     "GBPUSD",
 )
 
+# Objectif opérationnel : rechercher activement les meilleures
+# opportunités de la journée. Ce nombre n'est PAS un quota forcé.
 DAILY_SIGNAL_TARGET = 3
 MAX_SIGNALS_PER_CYCLE = 3
 
@@ -93,6 +93,7 @@ class Moteur2:
         )
 
         self.marche = Moteur2Marche()
+        self.liquidite = Moteur2Liquidite()
         self.zones = Moteur2Zones()
         self.contexte = Moteur2Contexte()
         self.confluences = Moteur2Confluences()
@@ -123,10 +124,8 @@ class Moteur2:
     ) -> Any:
         if data is None:
             return default
-
         if isinstance(data, dict):
             return data.get(key, default)
-
         return getattr(data, key, default)
 
     @staticmethod
@@ -156,7 +155,6 @@ class Moteur2:
                 self.cache.update_tick,
                 tick,
             )
-
         except Exception as exc:
             logger.exception(
                 "Erreur mise à jour tick BiQuote : %s",
@@ -199,7 +197,6 @@ class Moteur2:
             }
 
     async def rafraichir_cache(self) -> Any:
-
         return await self._call(
             self.cache.refresh_all
         )
@@ -215,7 +212,6 @@ class Moteur2:
         for timeframe in TIMEFRAMES:
 
             try:
-
                 donnees[timeframe] = (
                     self.cache.get_closed_candles(
                         timeframe
@@ -223,7 +219,6 @@ class Moteur2:
                 )
 
             except TypeError:
-
                 donnees[timeframe] = (
                     self.cache.get_closed_candles(
                         timeframe=timeframe
@@ -241,13 +236,30 @@ class Moteur2:
         donnees: Dict[str, Any],
     ) -> Any:
 
-        # Méthode réelle de Moteur2Marche = analyser()
-        # cartographier_marche() est une fonction module-level,
-        # pas une méthode de l'instance.
         return await self._call(
-            self.marche.analyser,
+            self.marche.cartographier_marche,
             donnees,
-            symbol=self.symbol,
+        )
+
+    # ============================================================
+    # LIQUIDITÉ
+    # ============================================================
+
+    async def analyser_liquidite(
+        self,
+        cartographie: Any,
+        current_price: float,
+    ) -> Any:
+        """
+        Analyse descriptive de la liquidité après la cartographie.
+
+        Cette couche est contributive et non bloquante : elle ne décide
+        jamais BUY/SELL et ne remplace aucune validation existante.
+        """
+        return await self._call(
+            self.liquidite.analyser,
+            cartographie,
+            current_price,
         )
 
     # ============================================================
@@ -260,6 +272,7 @@ class Moteur2:
         current_price: float,
     ) -> Any:
 
+        # IMPORTANT : méthode réelle de la classe = analyser()
         return await self._call(
             self.zones.analyser,
             cartographie,
@@ -276,6 +289,8 @@ class Moteur2:
         zones: Any,
     ) -> Any:
 
+        # Signature réelle :
+        # analyser(candles_by_timeframe, zones_result)
         return await self._call(
             self.contexte.analyser,
             donnees,
@@ -294,6 +309,8 @@ class Moteur2:
         cartographie: Any,
     ) -> Any:
 
+        # Signature réelle :
+        # analyser(candles, zones, context, market_map)
         return await self._call(
             self.confluences.analyser,
             donnees,
@@ -334,6 +351,8 @@ class Moteur2:
         current_price: float,
     ) -> Any:
 
+        # Signature réelle :
+        # analyser_setups(setups, zones, candles, current_price)
         return await self._call(
             self.risk.analyser_setups,
             setups,
@@ -353,6 +372,8 @@ class Moteur2:
         risk_plan: Any,
     ) -> Any:
 
+        # Signature réelle :
+        # analyser(setup, candles, risk_plan)
         return await self._call(
             self.confirmation.analyser,
             setup,
@@ -374,6 +395,9 @@ class Moteur2:
         risk_plan: Any,
     ) -> Any:
 
+        # Signature réelle :
+        # analyser(setup, zones, context, confluences,
+        #          confirmation, risk_plan)
         return await self._call(
             self.score.analyser,
             setup=setup,
@@ -462,6 +486,10 @@ class Moteur2:
             )
         ).upper()
 
+        # --------------------------------------------------------
+        # SETUP NON VALIDÉ
+        # --------------------------------------------------------
+
         if not validated:
 
             return {
@@ -472,6 +500,14 @@ class Moteur2:
                 "score": score_result,
                 "validation": validation,
             }
+
+        # --------------------------------------------------------
+        # SETUP VALIDÉ MAIS M5/M1 EN ATTENTE
+        #
+        # IMPORTANT :
+        # aucun anti-spam, aucun enregistrement actif,
+        # aucun signal Telegram envoyé à ce stade.
+        # --------------------------------------------------------
 
         if validation_status != "READY_FOR_SIGNAL":
 
@@ -484,6 +520,10 @@ class Moteur2:
                 "validation": validation,
                 "signal": None,
             }
+
+        # --------------------------------------------------------
+        # ANTI-SPAM UNIQUEMENT AU MOMENT DU SIGNAL
+        # --------------------------------------------------------
 
         antispam = self.antispam.verifier(
             setup=setup,
@@ -509,6 +549,10 @@ class Moteur2:
                 "antispam": antispam,
                 "signal": None,
             }
+
+        # --------------------------------------------------------
+        # CONSTRUCTION SIGNAL
+        # --------------------------------------------------------
 
         setup_id = self._get(
             antispam,
@@ -538,6 +582,10 @@ class Moteur2:
                 "signal": None,
             }
 
+        # --------------------------------------------------------
+        # ENREGISTREMENT APRÈS CONSTRUCTION DU SIGNAL
+        # --------------------------------------------------------
+
         self.antispam.enregistrer_signal(
             setup=setup,
             risk_plan=risk_plan,
@@ -565,25 +613,18 @@ class Moteur2:
 
             await self.rafraichir_cache()
 
+            # Le cache est déjà lié à self.symbol. On tente néanmoins
+            # la forme explicite si une implémentation multi-symboles
+            # de Moteur2Cache l'accepte, avec fallback rétrocompatible.
             try:
-
-                current_price = (
-                    self.cache.get_current_price(
-                        self.symbol
-                    )
-                )
-
+                current_price = self.cache.get_current_price(self.symbol)
             except TypeError:
-
-                current_price = (
-                    self.cache.get_current_price()
-                )
+                current_price = self.cache.get_current_price()
 
             if current_price is None:
 
                 return {
                     "status": "NO_PRICE",
-                    "symbol": self.symbol,
                     "reason": (
                         "Aucun prix live BiQuote disponible."
                     ),
@@ -601,12 +642,19 @@ class Moteur2:
 
                 return {
                     "status": "INSUFFICIENT_DATA",
-                    "symbol": self.symbol,
                     "missing_timeframes": missing,
                 }
 
             cartographie = await self.analyser_marche(
                 donnees
+            )
+
+            # Couche liquidité : calculée immédiatement après la
+            # cartographie, avant les zones, sans modifier les règles
+            # de validation existantes.
+            liquidite = await self.analyser_liquidite(
+                cartographie,
+                current_price,
             )
 
             zones = await self.analyser_zones(
@@ -634,22 +682,14 @@ class Moteur2:
             )
 
             if isinstance(setups_result, dict):
-
                 setups = (
                     setups_result.get("setups")
                     or setups_result.get("detected_setups")
                     or []
                 )
-
-            elif isinstance(
-                setups_result,
-                (list, tuple),
-            ):
-
+            elif isinstance(setups_result, (list, tuple)):
                 setups = list(setups_result)
-
             else:
-
                 setups = (
                     [setups_result]
                     if setups_result is not None
@@ -663,6 +703,7 @@ class Moteur2:
                     "symbol": self.symbol,
                     "current_price": current_price,
                     "cartographie": cartographie,
+                    "liquidite": liquidite,
                     "zones": zones,
                     "contexte": contexte,
                     "confluences": confluences,
@@ -672,7 +713,6 @@ class Moteur2:
                 }
 
                 self.last_analysis = result
-
                 return result
 
             risk_result = await self.analyser_risque(
@@ -683,23 +723,15 @@ class Moteur2:
             )
 
             if isinstance(risk_result, dict):
-
                 risk_plans = (
                     risk_result.get("plans")
                     or risk_result.get("risk_plans")
                     or risk_result.get("valid_plans")
                     or []
                 )
-
-            elif isinstance(
-                risk_result,
-                (list, tuple),
-            ):
-
+            elif isinstance(risk_result, (list, tuple)):
                 risk_plans = list(risk_result)
-
             else:
-
                 risk_plans = []
 
             results = []
@@ -726,15 +758,10 @@ class Moteur2:
                             candidate_id
                             and candidate_id == setup_id
                         ):
-
                             risk_plan = candidate
                             break
 
-                if (
-                    risk_plan is None
-                    and index < len(risk_plans)
-                ):
-
+                if risk_plan is None and index < len(risk_plans):
                     risk_plan = risk_plans[index]
 
                 if risk_plan is None:
@@ -766,20 +793,14 @@ class Moteur2:
             waiting = [
                 item
                 for item in results
-                if item.get("status")
-                == "WAITING_CONFIRMATION"
+                if item.get("status") == "WAITING_CONFIRMATION"
             ]
 
             if ready:
-
                 overall_status = "SIGNAL_READY"
-
             elif waiting:
-
                 overall_status = "WAITING_CONFIRMATION"
-
             else:
-
                 overall_status = "ANALYZED"
 
             result = {
@@ -787,6 +808,7 @@ class Moteur2:
                 "symbol": self.symbol,
                 "current_price": current_price,
                 "cartographie": cartographie,
+                "liquidite": liquidite,
                 "zones": zones,
                 "contexte": contexte,
                 "confluences": confluences,
@@ -803,8 +825,7 @@ class Moteur2:
             self.last_analysis = result
 
             logger.info(
-                "Engine 2 terminé : %s | %s",
-                self.symbol,
+                "Engine 2 terminé : %s",
                 overall_status,
             )
 
@@ -815,7 +836,6 @@ class Moteur2:
     # ============================================================
 
     async def demarrer_stream(self) -> None:
-
         await self._call(
             self.stream.start
         )
@@ -834,7 +854,6 @@ class Moteur2:
             init = await self.initialiser()
 
             if not init["success"]:
-
                 raise RuntimeError(
                     "Impossible d'initialiser Engine 2."
                 )
@@ -850,11 +869,8 @@ class Moteur2:
             while self.running:
 
                 try:
-
                     await self.analyser()
-
                 except Exception as exc:
-
                     logger.exception(
                         "Erreur analyse Engine 2 : %s",
                         exc,
@@ -874,11 +890,8 @@ class Moteur2:
             stream_task.cancel()
 
             try:
-
                 await stream_task
-
             except asyncio.CancelledError:
-
                 pass
 
     # ============================================================
@@ -894,7 +907,6 @@ class Moteur2:
             result = self.stream.stop()
 
             if inspect.isawaitable(result):
-
                 await result
 
         except Exception as exc:
@@ -909,69 +921,31 @@ class Moteur2:
     # ============================================================
 
     def _cache_accepts_symbol_price(self) -> bool:
-
+        """Détecte si get_current_price accepte un symbole explicite."""
         try:
-
-            signature = inspect.signature(
-                self.cache.get_current_price
-            )
-
-            parameters = list(
-                signature.parameters.values()
-            )
-
+            import inspect as _inspect
+            signature = _inspect.signature(self.cache.get_current_price)
+            parameters = list(signature.parameters.values())
             return any(
-                p.kind in (
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.VAR_POSITIONAL,
-                )
+                p.kind in (_inspect.Parameter.POSITIONAL_ONLY,
+                           _inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                           _inspect.Parameter.VAR_POSITIONAL)
                 for p in parameters
             )
-
         except Exception:
-
             return False
 
     def get_status(self) -> Dict[str, Any]:
 
         try:
-
             cache_status = self.cache.get_status()
-
         except Exception:
-
             cache_status = {}
 
         try:
-
-            antispam_status = (
-                self.antispam.get_status()
-            )
-
+            antispam_status = self.antispam.get_status()
         except Exception:
-
             antispam_status = {}
-
-        try:
-
-            if self._cache_accepts_symbol_price():
-
-                current_price = (
-                    self.cache.get_current_price(
-                        self.symbol
-                    )
-                )
-
-            else:
-
-                current_price = (
-                    self.cache.get_current_price()
-                )
-
-        except Exception:
-
-            current_price = None
 
         return {
             "engine": ENGINE_NAME,
@@ -979,8 +953,14 @@ class Moteur2:
             "source": "BiQuote",
             "running": self.running,
             "initialized": self.initialized,
-            "current_price": current_price,
+            "current_price": (
+                self.cache.get_current_price(self.symbol)
+                if self._cache_accepts_symbol_price()
+                else self.cache.get_current_price()
+            ),
             "timeframes": list(TIMEFRAMES),
+            "liquidity_layer": True,
+            "liquidity_blocking": False,
             "cache": cache_status,
             "antispam": antispam_status,
         }
@@ -995,13 +975,11 @@ async def analyser_xauusd() -> Dict[str, Any]:
         init = await moteur.initialiser()
 
         if not init["success"]:
-
             return init
 
         return await moteur.analyser()
 
     finally:
-
         await moteur.stop()
 
 
@@ -1016,7 +994,6 @@ async def main() -> None:
         print(init)
 
         if not init["success"]:
-
             return
 
         result = await moteur.analyser()
@@ -1035,595 +1012,279 @@ async def main() -> None:
 class Moteur2Global:
     """Orchestrateur global multi-actifs d'Engine 2."""
 
-    def __init__(
-        self,
-        symbols=None,
-        max_signals: int = 3,
-        parallel: bool = True,
-        analysis_interval_seconds: int = 900,
-    ) -> None:
-
+    def __init__(self, symbols=None, max_signals: int = 3, parallel: bool = True,
+                 analysis_interval_seconds: int = 900) -> None:
         from moteur2_multi_actifs import Moteur2MultiActifs
         from moteur2_ranking import Moteur2Ranking
 
         if symbols is None:
-
-            symbols = list(
-                SUPPORTED_SYMBOLS
-            )
+            symbols = list(SUPPORTED_SYMBOLS)
 
         self.symbols = tuple(
-            str(symbol)
-            .strip()
-            .upper()
-            .replace("/", "")
-            .replace(" ", "")
-            .replace("-", "")
-            .replace("_", "")
+            str(symbol).strip().upper().replace('/', '').replace(' ', '')
+            .replace('-', '').replace('_', '')
             for symbol in symbols
         )
-
-        invalid = [
-            s
-            for s in self.symbols
-            if s not in SUPPORTED_SYMBOLS
-        ]
-
+        invalid = [s for s in self.symbols if s not in SUPPORTED_SYMBOLS]
         if invalid:
-
-            raise ValueError(
-                f"Symboles non supportés : "
-                f"{', '.join(invalid)}"
-            )
+            raise ValueError(f"Symboles non supportés : {', '.join(invalid)}")
 
         self.max_signals = min(
             MAX_SIGNALS_PER_CYCLE,
             max(1, int(max_signals)),
         )
-
         self.parallel = bool(parallel)
-
-        self.analysis_interval_seconds = max(
-            1,
-            int(analysis_interval_seconds),
-        )
-
+        self.analysis_interval_seconds = max(1, int(analysis_interval_seconds))
         self.multi_actifs = Moteur2MultiActifs(
             symbols=self.symbols,
-            analysis_interval_seconds=(
-                self.analysis_interval_seconds
-            ),
+            analysis_interval_seconds=self.analysis_interval_seconds,
             parallel=self.parallel,
         )
-
-        self.ranking = Moteur2Ranking(
-            max_signals=self.max_signals
-        )
-
+        self.ranking = Moteur2Ranking(max_signals=self.max_signals)
         self.initialized = False
         self.running = False
-        self.last_cycle: Optional[
-            Dict[str, Any]
-        ] = None
-
-        self.last_ranking: Optional[
-            Dict[str, Any]
-        ] = None
-
+        self.last_cycle: Optional[Dict[str, Any]] = None
+        self.last_ranking: Optional[Dict[str, Any]] = None
         self.analysis_lock = asyncio.Lock()
 
     async def initialiser(self) -> Dict[str, Any]:
-
         try:
-
-            result = (
-                await self.multi_actifs.initialiser()
-            )
-
-            initialized_symbols = (
-                result.get(
-                    "initialized_symbols",
-                    [],
-                )
-            )
-
-            self.initialized = bool(
-                initialized_symbols
-            )
-
+            result = await self.multi_actifs.initialiser()
+            initialized_symbols = result.get('initialized_symbols', [])
+            self.initialized = bool(initialized_symbols)
             return {
-                "success": self.initialized,
-                "engine": ENGINE_NAME,
-                "module": "moteur2_global",
-                "symbols": list(self.symbols),
-                "initialized_symbols": (
-                    initialized_symbols
-                ),
-                "failed_symbols": result.get(
-                    "failed_symbols",
-                    [],
-                ),
-                "max_signals": self.max_signals,
-                "analysis_interval_seconds": (
-                    self.analysis_interval_seconds
-                ),
-                "forced_signal": False,
-                "ranking_is_decision_maker": False,
-                "quality_is_blocking": False,
-                "results": result.get(
-                    "results",
-                    {},
-                ),
+                'success': self.initialized,
+                'engine': ENGINE_NAME,
+                'module': 'moteur2_global',
+                'symbols': list(self.symbols),
+                'initialized_symbols': initialized_symbols,
+                'failed_symbols': result.get('failed_symbols', []),
+                'max_signals': self.max_signals,
+                'analysis_interval_seconds': self.analysis_interval_seconds,
+                'forced_signal': False,
+                'ranking_is_decision_maker': False,
+                'quality_is_blocking': False,
+                'results': result.get('results', {}),
             }
-
         except Exception as exc:
-
-            logger.exception(
-                "Erreur initialisation Engine 2 Global : %s",
-                exc,
-            )
-
+            logger.exception('Erreur initialisation Engine 2 Global : %s', exc)
             self.initialized = False
+            return {'success': False, 'engine': ENGINE_NAME,
+                    'module': 'moteur2_global', 'symbols': list(self.symbols),
+                    'error': str(exc)}
 
-            return {
-                "success": False,
-                "engine": ENGINE_NAME,
-                "module": "moteur2_global",
-                "symbols": list(self.symbols),
-                "error": str(exc),
-            }
-
-    async def demarrer_streams(
-        self,
-    ) -> Dict[str, Any]:
-
+    async def demarrer_streams(self) -> Dict[str, Any]:
         try:
-
-            return await (
-                self.multi_actifs.demarrer_streams()
-            )
-
+            return await self.multi_actifs.demarrer_streams()
         except Exception as exc:
-
-            logger.exception(
-                "Erreur démarrage streams globaux : %s",
-                exc,
-            )
-
-            return {
-                "success": False,
-                "error": str(exc),
-            }
+            logger.exception('Erreur démarrage streams globaux : %s', exc)
+            return {'success': False, 'error': str(exc)}
 
     async def analyser(self) -> Dict[str, Any]:
-
         async with self.analysis_lock:
-
             if not self.initialized:
-
                 init = await self.initialiser()
-
-                if not init.get(
-                    "success",
-                    False,
-                ):
-
-                    return {
-                        "status":
-                            "INITIALIZATION_ERROR",
-                        "engine": ENGINE_NAME,
-                        "signals": [],
-                        "error": init.get(
-                            "error",
-                            "Initialisation impossible.",
-                        ),
-                    }
-
+                if not init.get('success', False):
+                    return {'status': 'INITIALIZATION_ERROR', 'engine': ENGINE_NAME,
+                            'signals': [], 'error': init.get('error', 'Initialisation impossible.')}
             try:
-
-                cycle = (
-                    await self.multi_actifs.analyser_tous()
-                )
-
+                cycle = await self.multi_actifs.analyser_tous()
                 self.last_cycle = cycle
-
-                ranking = self.ranking.ranker(
-                    cycle
-                )
-
+                ranking = self.ranking.ranker(cycle)
                 self.last_ranking = ranking
-
-                signals = ranking.get(
-                    "signals",
-                    [],
-                )
-
+                signals = ranking.get('signals', [])
                 return {
-                    "status": (
-                        "SIGNALS_AVAILABLE"
-                        if signals
-                        else "NO_GLOBAL_SIGNAL"
-                    ),
-                    "engine": ENGINE_NAME,
-                    "module": "moteur2_global",
-                    "symbols": list(self.symbols),
-                    "max_signals": self.max_signals,
-                    "daily_signal_target": (
-                        DAILY_SIGNAL_TARGET
-                    ),
-                    "signals": signals,
-                    "signal_count": len(signals),
-                    "candidates_count": ranking.get(
-                        "candidate_count",
-                        0,
-                    ),
-                    "selected_count": ranking.get(
-                        "selected_count",
-                        0,
-                    ),
-                    "cycle": cycle,
-                    "ranking": ranking,
-                    "forced_signal": False,
-                    "quality_is_blocking": False,
-                    "ranking_is_decision_maker": False,
-                    "auto_execution": False,
-                    "decision_owner":
-                        "moteur2_decision.py",
-                    "risk_owner":
-                        "moteur2_risk.py",
-                    "validation_owner":
-                        "moteur2_validation.py",
-                    "ranking_owner":
-                        "moteur2_ranking.py",
+                    'status': 'SIGNALS_AVAILABLE' if signals else 'NO_GLOBAL_SIGNAL',
+                    'engine': ENGINE_NAME,
+                    'module': 'moteur2_global',
+                    'symbols': list(self.symbols),
+                    'max_signals': self.max_signals,
+                    'daily_signal_target': DAILY_SIGNAL_TARGET,
+                    'signals': signals,
+                    'signal_count': len(signals),
+                    'candidates_count': ranking.get('candidate_count', 0),
+                    'selected_count': ranking.get('selected_count', 0),
+                    'cycle': cycle,
+                    'ranking': ranking,
+                    'forced_signal': False,
+                    'quality_is_blocking': False,
+                    'ranking_is_decision_maker': False,
+                    'auto_execution': False,
+                    'decision_owner': 'moteur2_decision.py',
+                    'risk_owner': 'moteur2_risk.py',
+                    'validation_owner': 'moteur2_validation.py',
+                    'ranking_owner': 'moteur2_ranking.py',
                 }
-
             except Exception as exc:
+                logger.exception('Erreur analyse Engine 2 Global : %s', exc)
+                return {'status': 'GLOBAL_ENGINE_ERROR', 'engine': ENGINE_NAME,
+                        'module': 'moteur2_global', 'signals': [], 'signal_count': 0,
+                        'error': str(exc), 'forced_signal': False, 'auto_execution': False}
 
-                logger.exception(
-                    "Erreur analyse Engine 2 Global : %s",
-                    exc,
-                )
+    async def analyser_symbol(self, symbol: str) -> Dict[str, Any]:
+        """Analyse l'actif demandé via le moteur global multi-actifs.
 
-                return {
-                    "status":
-                        "GLOBAL_ENGINE_ERROR",
-                    "engine": ENGINE_NAME,
-                    "module": "moteur2_global",
-                    "signals": [],
-                    "signal_count": 0,
-                    "error": str(exc),
-                    "forced_signal": False,
-                    "auto_execution": False,
-                }
-
-    async def analyser_symbol(
-        self,
-        symbol: str,
-    ) -> Dict[str, Any]:
-
+        Cette méthode est une compatibilité pour l'interface Telegram :
+        le moteur global analyse toujours le portefeuille des 4 actifs, puis
+        retourne uniquement le résultat de l'actif demandé.
+        Elle ne modifie ni la stratégie, ni le ranking, ni les critères de validation.
+        """
         normalized = (
-            str(symbol)
-            .strip()
-            .upper()
-            .replace("/", "")
-            .replace(" ", "")
-            .replace("-", "")
-            .replace("_", "")
+            str(symbol).strip().upper()
+            .replace('/', '')
+            .replace(' ', '')
+            .replace('-', '')
+            .replace('_', '')
         )
 
         if normalized not in self.symbols:
-
             return {
-                "status":
-                    "UNSUPPORTED_SYMBOL",
-                "engine": ENGINE_NAME,
-                "symbol": normalized,
-                "signals": [],
-                "error": (
-                    f"Symbole non supporté : "
-                    f"{normalized}"
-                ),
+                'status': 'UNSUPPORTED_SYMBOL',
+                'engine': ENGINE_NAME,
+                'symbol': normalized,
+                'signals': [],
+                'error': f'Symbole non supporté : {normalized}',
             }
 
         global_result = await self.analyser()
+        cycle = global_result.get('cycle') or self.last_cycle or {}
+        results = cycle.get('results') or {}
 
-        cycle = (
-            global_result.get("cycle")
-            or self.last_cycle
-            or {}
-        )
-
-        results = (
-            cycle.get("results")
-            or {}
-        )
-
-        result = results.get(
-            normalized
-        )
-
+        # Compatibilité avec les deux formes possibles de stockage.
+        result = results.get(normalized)
         if result is None:
-
             for key, value in results.items():
-
                 key_normalized = (
-                    str(key)
-                    .strip()
-                    .upper()
-                    .replace("/", "")
-                    .replace(" ", "")
-                    .replace("-", "")
-                    .replace("_", "")
+                    str(key).strip().upper()
+                    .replace('/', '')
+                    .replace(' ', '')
+                    .replace('-', '')
+                    .replace('_', '')
                 )
-
                 if key_normalized == normalized:
-
                     result = value
                     break
 
         if result is None:
-
             return {
-                "status":
-                    "SYMBOL_RESULT_UNAVAILABLE",
-                "engine": ENGINE_NAME,
-                "symbol": normalized,
-                "signals": [],
-                "global_status": (
-                    global_result.get(
-                        "status"
-                    )
-                ),
-                "error": (
-                    f"Aucun résultat disponible "
-                    f"pour {normalized}."
-                ),
+                'status': 'SYMBOL_RESULT_UNAVAILABLE',
+                'engine': ENGINE_NAME,
+                'symbol': normalized,
+                'signals': [],
+                'global_status': global_result.get('status'),
+                'error': f'Aucun résultat disponible pour {normalized}.',
             }
 
         return result
 
-    def obtenir_top_signaux(
-        self,
-    ) -> List[Any]:
-
+    def obtenir_top_signaux(self) -> List[Any]:
         if not self.last_ranking:
-
             return []
+        return self.last_ranking.get('signals', [])
 
-        return self.last_ranking.get(
-            "signals",
-            [],
-        )
-
-    def get_status(
-        self,
-    ) -> Dict[str, Any]:
-
+    def get_status(self) -> Dict[str, Any]:
         try:
-
-            multi_status = (
-                self.multi_actifs.get_status()
-            )
-
+            multi_status = self.multi_actifs.get_status()
         except Exception as exc:
-
-            multi_status = {
-                "status": "ERROR",
-                "error": str(exc),
-            }
-
+            multi_status = {'status': 'ERROR', 'error': str(exc)}
         try:
-
-            ranking_status = (
-                self.ranking.get_status()
-            )
-
+            ranking_status = self.ranking.get_status()
         except Exception as exc:
-
-            ranking_status = {
-                "status": "ERROR",
-                "error": str(exc),
-            }
-
+            ranking_status = {'status': 'ERROR', 'error': str(exc)}
         return {
-            "engine": ENGINE_NAME,
-            "module": "moteur2_global",
-            "symbols": list(self.symbols),
-            "symbol_count": len(self.symbols),
-            "initialized": self.initialized,
-            "running": self.running,
-            "max_signals": self.max_signals,
-            "daily_signal_target": (
-                DAILY_SIGNAL_TARGET
-            ),
-            "analysis_interval_seconds": (
-                self.analysis_interval_seconds
-            ),
-            "forced_signal": False,
-            "quality_is_blocking": False,
-            "ranking_is_decision_maker": False,
-            "auto_execution": False,
-            "multi_actifs": multi_status,
-            "ranking": ranking_status,
-            "last_signal_count": len(
-                self.obtenir_top_signaux()
-            ),
+            'engine': ENGINE_NAME, 'module': 'moteur2_global',
+            'symbols': list(self.symbols), 'symbol_count': len(self.symbols),
+            'initialized': self.initialized, 'running': self.running,
+            'max_signals': self.max_signals,
+            'daily_signal_target': DAILY_SIGNAL_TARGET,
+            'analysis_interval_seconds': self.analysis_interval_seconds,
+            'forced_signal': False, 'quality_is_blocking': False,
+            'ranking_is_decision_maker': False, 'auto_execution': False,
+            'multi_actifs': multi_status, 'ranking': ranking_status,
+            'last_signal_count': len(self.obtenir_top_signaux()),
         }
 
-    async def run(
-        self,
-        analysis_interval_seconds: Optional[int] = None,
-        start_streams: bool = True,
-    ) -> None:
-
+    async def run(self, analysis_interval_seconds: Optional[int] = None,
+                  start_streams: bool = True) -> None:
         if not self.initialized:
-
             init = await self.initialiser()
-
-            if not init.get(
-                "success",
-                False,
-            ):
-
-                raise RuntimeError(
-                    "Impossible d'initialiser "
-                    "Engine 2 Global."
-                )
-
+            if not init.get('success', False):
+                raise RuntimeError('Impossible d\'initialiser Engine 2 Global.')
         self.running = True
-
-        interval = (
-            self.analysis_interval_seconds
-            if analysis_interval_seconds is None
-            else max(
-                1,
-                int(
-                    analysis_interval_seconds
-                ),
-            )
-        )
-
+        interval = self.analysis_interval_seconds if analysis_interval_seconds is None else max(1, int(analysis_interval_seconds))
         stream_task = None
-
         try:
-
             if start_streams:
-
-                stream_task = asyncio.create_task(
-                    self.demarrer_streams()
-                )
-
+                stream_task = asyncio.create_task(self.demarrer_streams())
             while self.running:
-
                 try:
-
                     await self.analyser()
-
                 except Exception as exc:
-
-                    logger.exception(
-                        "Erreur cycle global : %s",
-                        exc,
-                    )
-
-                await asyncio.sleep(
-                    interval
-                )
-
+                    logger.exception('Erreur cycle global : %s', exc)
+                await asyncio.sleep(interval)
         finally:
-
             self.running = False
-
             if stream_task is not None:
-
                 stream_task.cancel()
-
                 try:
-
                     await stream_task
-
                 except asyncio.CancelledError:
-
                     pass
 
     async def stop(self) -> None:
-
         self.running = False
-
         try:
-
             await self.multi_actifs.stop()
-
         except Exception as exc:
-
-            logger.warning(
-                "Erreur arrêt Engine 2 Global : %s",
-                exc,
-            )
+            logger.warning('Erreur arrêt Engine 2 Global : %s', exc)
 
 
 # ============================================================================
 # INSTANCE GLOBALE LAZY
 # ============================================================================
 
-_moteur2_global: Optional[
-    Moteur2Global
-] = None
+_moteur2_global: Optional[Moteur2Global] = None
 
 
 def obtenir_moteur2_global() -> Moteur2Global:
-
     global _moteur2_global
-
     if _moteur2_global is None:
-
         _moteur2_global = Moteur2Global(
             symbols=SUPPORTED_SYMBOLS,
             max_signals=3,
             parallel=True,
             analysis_interval_seconds=900,
         )
-
     return _moteur2_global
 
 
-async def initialiser_engine2_global(
-) -> Dict[str, Any]:
-
-    return await (
-        obtenir_moteur2_global()
-        .initialiser()
-    )
+async def initialiser_engine2_global() -> Dict[str, Any]:
+    return await obtenir_moteur2_global().initialiser()
 
 
-async def demarrer_streams_engine2_global(
-) -> Dict[str, Any]:
-
-    return await (
-        obtenir_moteur2_global()
-        .demarrer_streams()
-    )
+async def demarrer_streams_engine2_global() -> Dict[str, Any]:
+    return await obtenir_moteur2_global().demarrer_streams()
 
 
-async def analyser_engine2_global(
-) -> Dict[str, Any]:
-
-    return await (
-        obtenir_moteur2_global()
-        .analyser()
-    )
+async def analyser_engine2_global() -> Dict[str, Any]:
+    return await obtenir_moteur2_global().analyser()
 
 
 async def arreter_engine2_global() -> None:
-
-    await (
-        obtenir_moteur2_global()
-        .stop()
-    )
+    await obtenir_moteur2_global().stop()
 
 
-def statut_engine2_global(
-) -> Dict[str, Any]:
-
-    return (
-        obtenir_moteur2_global()
-        .get_status()
-    )
+def statut_engine2_global() -> Dict[str, Any]:
+    return obtenir_moteur2_global().get_status()
 
 
-def top_signaux_engine2_global(
-) -> List[Any]:
-
-    return (
-        obtenir_moteur2_global()
-        .obtenir_top_signaux()
-    )
+def top_signaux_engine2_global() -> List[Any]:
+    return obtenir_moteur2_global().obtenir_top_signaux()
 
 
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
 
-if __name__ == "__main__":
-
+if __name__ == '__main__':
     asyncio.run(main())
