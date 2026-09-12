@@ -10,11 +10,13 @@ Actifs surveillés :
     BTCUSD
     EURUSD
     GBPUSD
-Principe :
-    Chaque actif possède son propre Moteur2,
-    son propre cache,
-    son propre stream BiQuote
-    et son propre état d'analyse.
+Ce module :
+    - initialise les 4 moteurs ;
+    - démarre leurs streams ;
+    - lance les analyses ;
+    - récupère les résultats ;
+    - rassemble les opportunités ;
+    - prépare les résultats pour moteur2_ranking.py.
 IMPORTANT
 ---------
 Ce module ne décide PAS quel signal envoyer.
@@ -26,13 +28,9 @@ Il ne :
     - force aucun signal.
 Le classement TOP 3 est effectué ensuite par :
     moteur2_ranking.py
-Cette version ajoute uniquement un traçage détaillé
-du cycle multi-actifs afin d'identifier précisément
-un éventuel blocage d'analyse.
 """
 from __future__ import annotations
 import asyncio
-import inspect
 import logging
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -51,9 +49,8 @@ DEFAULT_SYMBOLS = (
     "GBPUSD",
 )
 DEFAULT_ANALYSIS_INTERVAL = 900
-# Temps maximal autorisé pour une analyse individuelle.
-# Ce n'est PAS un délai de signal.
-# C'est uniquement une sécurité anti-blocage.
+# Sécurité contre une analyse individuelle qui resterait bloquée.
+# Ce timeout ne crée et ne force aucun signal.
 ANALYSIS_TIMEOUT_SECONDS = 120
 # ============================================================================
 # UTILITAIRES
@@ -64,6 +61,7 @@ def _normaliser_symbole(symbol: Any) -> str:
     Exemples :
         XAU/USD -> XAUUSD
         xauusd  -> XAUUSD
+        BTC-USD -> BTCUSD
     """
     value = str(symbol or "").strip().upper()
     value = (
@@ -87,18 +85,6 @@ def _get(
     if isinstance(data, dict):
         return data.get(key, default)
     return getattr(data, key, default)
-async def _call(
-    function: Any,
-    *args: Any,
-    **kwargs: Any,
-) -> Any:
-    """
-    Appelle une fonction sync ou async.
-    """
-    result = function(*args, **kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
 # ============================================================================
 # MOTEUR MULTI-ACTIFS
 # ============================================================================
@@ -208,7 +194,7 @@ class Moteur2MultiActifs:
                     Exception,
                 ):
                     logger.error(
-                        "❌ Erreur initialisation %s : %s",
+                        "Erreur initialisation %s : %s",
                         symbol,
                         result,
                     )
@@ -248,7 +234,9 @@ class Moteur2MultiActifs:
                 )
             )
         ]
-        self.initialized = bool(successful)
+        self.initialized = bool(
+            successful
+        )
         logger.info(
             "Initialisation terminée : %s/%s actifs prêts",
             len(successful),
@@ -272,7 +260,7 @@ class Moteur2MultiActifs:
         symbol: str,
     ) -> Dict[str, Any]:
         logger.info(
-            "→ Initialisation moteur individuel : %s",
+            "Initialisation moteur individuel : %s",
             symbol,
         )
         started = time.monotonic()
@@ -280,7 +268,7 @@ class Moteur2MultiActifs:
         result = await moteur.initialiser()
         elapsed = time.monotonic() - started
         logger.info(
-            "✓ Initialisation %s terminée en %.2fs",
+            "Initialisation %s terminée en %.2fs",
             symbol,
             elapsed,
         )
@@ -315,7 +303,7 @@ class Moteur2MultiActifs:
                     Exception,
                 ):
                     logger.error(
-                        "❌ Erreur stream %s : %s",
+                        "Erreur stream %s : %s",
                         symbol,
                         result,
                     )
@@ -355,13 +343,13 @@ class Moteur2MultiActifs:
         symbol: str,
     ) -> None:
         logger.info(
-            "→ Démarrage stream : %s",
+            "Démarrage stream : %s",
             symbol,
         )
         moteur = self.moteurs[symbol]
         await moteur.demarrer_stream()
         logger.info(
-            "✓ Stream démarré : %s",
+            "Stream démarré : %s",
             symbol,
         )
     # =========================================================================
@@ -376,7 +364,7 @@ class Moteur2MultiActifs:
         )
         if normalized not in self.moteurs:
             logger.warning(
-                "⚠️ Symbole non enregistré : %s",
+                "Symbole non enregistré : %s",
                 normalized,
             )
             return {
@@ -387,21 +375,17 @@ class Moteur2MultiActifs:
         moteur = self.moteurs[normalized]
         started = time.monotonic()
         logger.info(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            "--------------------------------------------------"
         )
         logger.info(
-            "▶️ DÉBUT ANALYSE : %s",
+            "DEBUT ANALYSE : %s",
             normalized,
         )
         logger.info(
-            "   Moteur individuel prêt : %s",
+            "Appel moteur2.analyser() : %s",
             normalized,
         )
         try:
-            logger.info(
-                "   Appel de moteur2.analyser() : %s",
-                normalized,
-            )
             result = await asyncio.wait_for(
                 moteur.analyser(),
                 timeout=ANALYSIS_TIMEOUT_SECONDS,
@@ -444,23 +428,20 @@ class Moteur2MultiActifs:
             ):
                 signals = [signals]
             logger.info(
-                "✓ FIN ANALYSE : %s | "
-                "status=%s | signals=%s | durée=%.2fs",
+                "FIN ANALYSE : %s | status=%s | signals=%s | duree=%.2fs",
                 normalized,
                 status,
                 len(signals),
                 elapsed,
             )
             logger.info(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                "--------------------------------------------------"
             )
             return result
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - started
             logger.error(
-                "⏱️ TIMEOUT ANALYSE : %s | "
-                "bloquée depuis %.2fs | "
-                "timeout=%ss",
+                "TIMEOUT ANALYSE : %s | duree=%.2fs | timeout=%ss",
                 normalized,
                 elapsed,
                 ANALYSIS_TIMEOUT_SECONDS,
@@ -482,19 +463,19 @@ class Moteur2MultiActifs:
                 normalized
             ] = result
             logger.info(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                "--------------------------------------------------"
             )
             return result
         except asyncio.CancelledError:
             logger.warning(
-                "⚠️ Analyse annulée : %s",
+                "Analyse annulée : %s",
                 normalized,
             )
             raise
         except Exception as exc:
             elapsed = time.monotonic() - started
             logger.exception(
-                "❌ ERREUR ANALYSE : %s | durée=%.2fs",
+                "ERREUR ANALYSE : %s | duree=%.2fs",
                 normalized,
                 elapsed,
             )
@@ -512,11 +493,11 @@ class Moteur2MultiActifs:
                 normalized
             ] = result
             logger.info(
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                "--------------------------------------------------"
             )
             return result
     # =========================================================================
-    # ANALYSE DES 4 ACTIFS
+    # ANALYSE DE TOUS LES ACTIFS
     # =========================================================================
     async def analyser_tous(
         self,
@@ -536,7 +517,7 @@ class Moteur2MultiActifs:
             )
             logger.info(
                 "MODE : %s",
-                "PARALLÈLE" if self.parallel else "SÉQUENTIEL",
+                "PARALLELE" if self.parallel else "SEQUENTIEL",
             )
             logger.info(
                 "TIMEOUT PAR ACTIF : %ss",
@@ -549,36 +530,36 @@ class Moteur2MultiActifs:
                 str,
                 Dict[str, Any],
             ] = {}
-            # ---------------------------------------------------------------
-            # MODE PARALLÈLE
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
+            # MODE PARALLELE
+            # -----------------------------------------------------------------
             if self.parallel:
                 logger.info(
-                    "🚀 Lancement des %s analyses simultanées...",
+                    "Lancement des %s analyses simultanees...",
                     len(self.symbols),
                 )
                 tasks = {}
                 for symbol in self.symbols:
                     logger.info(
-                        "   → Création tâche : %s",
+                        "Creation tache : %s",
                         symbol,
                     )
                     tasks[symbol] = asyncio.create_task(
                         self.analyser_symbol(symbol)
                     )
                 logger.info(
-                    "✓ %s tâches créées.",
+                    "%s taches creees.",
                     len(tasks),
                 )
                 logger.info(
-                    "⏳ Attente des résultats des 4 moteurs..."
+                    "Attente des resultats des moteurs..."
                 )
                 completed = await asyncio.gather(
                     *tasks.values(),
                     return_exceptions=True,
                 )
                 logger.info(
-                    "✓ asyncio.gather() terminé."
+                    "asyncio.gather() termine."
                 )
                 for symbol, result in zip(
                     tasks.keys(),
@@ -589,7 +570,7 @@ class Moteur2MultiActifs:
                         Exception,
                     ):
                         logger.error(
-                            "❌ Exception retournée pour %s : %s",
+                            "Exception retournee pour %s : %s",
                             symbol,
                             result,
                         )
@@ -605,16 +586,16 @@ class Moteur2MultiActifs:
                         }
                     else:
                         results[symbol] = result
-            # ---------------------------------------------------------------
-            # MODE SÉQUENTIEL
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
+            # MODE SEQUENTIEL
+            # -----------------------------------------------------------------
             else:
                 logger.info(
-                    "▶️ Analyse séquentielle activée."
+                    "Analyse sequentielle activee."
                 )
                 for symbol in self.symbols:
                     logger.info(
-                        "→ Passage à l'actif : %s",
+                        "Passage a l'actif : %s",
                         symbol,
                     )
                     results[symbol] = (
@@ -622,9 +603,9 @@ class Moteur2MultiActifs:
                             symbol
                         )
                     )
-            # ---------------------------------------------------------------
-            # EXTRACTION DES SIGNAUX EXISTANTS
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
+            # EXTRACTION DES SIGNAUX
+            # -----------------------------------------------------------------
             all_signals: List[Any] = []
             status_by_symbol: Dict[
                 str,
@@ -659,7 +640,7 @@ class Moteur2MultiActifs:
                     symbol
                 ] = signals
                 logger.info(
-                    "RÉSULTAT %s : status=%s | signals=%s",
+                    "RESULTAT %s : status=%s | signals=%s",
                     symbol,
                     status,
                     len(signals),
@@ -675,9 +656,9 @@ class Moteur2MultiActifs:
                                 signal,
                         }
                     )
-            # ---------------------------------------------------------------
-            # RÉSUMÉ DU CYCLE
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
+            # RESUME DU CYCLE
+            # -----------------------------------------------------------------
             cycle_elapsed = (
                 time.monotonic()
                 - cycle_started
@@ -710,22 +691,22 @@ class Moteur2MultiActifs:
                 "=================================================="
             )
             logger.info(
-                "✅ CYCLE MULTI-ACTIFS TERMINÉ"
+                "CYCLE MULTI-ACTIFS TERMINE"
             )
             logger.info(
-                "   Actifs analysés : %s",
+                "Actifs analyses : %s",
                 len(self.symbols),
             )
             logger.info(
-                "   Signaux existants : %s",
+                "Signaux existants : %s",
                 len(all_signals),
             )
             logger.info(
-                "   Durée totale : %.2fs",
+                "Duree totale : %.2fs",
                 cycle_elapsed,
             )
             logger.info(
-                "   États : %s",
+                "Etats : %s",
                 status_by_symbol,
             )
             logger.info(
@@ -765,7 +746,7 @@ class Moteur2MultiActifs:
             ):
                 raise RuntimeError(
                     "Aucun moteur Engine 2 "
-                    "n'a pu être initialisé."
+                    "n'a pu etre initialise."
                 )
         # ---------------------------------------------------------------------
         # STREAMS
@@ -776,7 +757,7 @@ class Moteur2MultiActifs:
         self.running = True
         if start_streams:
             logger.info(
-                "RUN ENGINE 2 : démarrage des streams..."
+                "RUN ENGINE 2 : demarrage des streams..."
             )
             for symbol in self.symbols:
                 moteur = self.moteurs[
@@ -824,7 +805,7 @@ class Moteur2MultiActifs:
     ) -> None:
         try:
             logger.info(
-                "▶️ Stream sécurisé démarrage : %s",
+                "Stream securise demarrage : %s",
                 symbol,
             )
             await moteur.demarrer_stream()
@@ -832,7 +813,7 @@ class Moteur2MultiActifs:
             raise
         except Exception as exc:
             logger.exception(
-                "Stream %s arrêté avec erreur : %s",
+                "Stream %s arrete avec erreur : %s",
                 symbol,
                 exc,
             )
@@ -844,7 +825,7 @@ class Moteur2MultiActifs:
     ) -> None:
         self.running = False
         logger.info(
-            "Arrêt des moteurs multi-actifs..."
+            "Arret des moteurs multi-actifs..."
         )
         tasks = [
             asyncio.create_task(
@@ -858,7 +839,7 @@ class Moteur2MultiActifs:
                 return_exceptions=True,
             )
         logger.info(
-            "Moteurs multi-actifs arrêtés."
+            "Moteurs multi-actifs arretes."
         )
     async def _stop_symbol(
         self,
@@ -873,7 +854,7 @@ class Moteur2MultiActifs:
             await moteur.stop()
         except Exception as exc:
             logger.warning(
-                "Erreur arrêt %s : %s",
+                "Erreur arret %s : %s",
                 symbol,
                 exc,
             )
@@ -928,7 +909,7 @@ class Moteur2MultiActifs:
                 self.last_cycle,
         }
 # ============================================================================
-# INSTANCE PAR DÉFAUT
+# INSTANCE PAR DEFAUT
 # ============================================================================
 multi_actifs = Moteur2MultiActifs()
 # ============================================================================
@@ -998,34 +979,3 @@ __all__ = [
     "arreter_multi_actifs",
     "statut_multi_actifs",
 ]
-
-Ce que tu fais maintenant
-
-1. Ouvre moteur2_multi_actifs.py.
-2. Supprime tout son contenu.
-3. Colle entièrement le fichier ci-dessus.
-4. Enregistre.
-5. Railway va redéployer.
-6. Attends le nouveau cycle.
-
-Cette fois, les logs devraient nous dire exactement où ça s’arrête.
-
-On cherche notamment une séquence comme :
-
-NOVA ENGINE 2 — CYCLE MULTI-ACTIFS
-ACTIFS : XAUUSD, BTCUSD, EURUSD, GBPUSD
-🚀 Lancement des 4 analyses simultanées...
-→ Création tâche : XAUUSD
-→ Création tâche : BTCUSD
-→ Création tâche : EURUSD
-→ Création tâche : GBPUSD
-✓ 4 tâches créées.
-⏳ Attente des résultats des 4 moteurs...
-▶️ DÉBUT ANALYSE : XAUUSD
-▶️ DÉBUT ANALYSE : BTCUSD
-▶️ DÉBUT ANALYSE : EURUSD
-▶️ DÉBUT ANALYSE : GBPUSD
-
-Puis nous verrons le ou les moteurs qui arrivent à ✓ FIN ANALYSE et celui qui reste bloqué.
-
-Le timeout de 120 secondes est uniquement une sécurité de diagnostic : il ne fabrique aucun signal et ne change aucune règle de validation.
