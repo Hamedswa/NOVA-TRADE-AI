@@ -1,34 +1,27 @@
 """
-NOVA TRADE AI - ENGINE 2
+NOVA TRADE AI — ENGINE 2
 moteur2_signal.py
 
-CONSTRUCTEUR DU SIGNAL FINAL
+Construction du signal final.
+Ce module ne crée aucune nouvelle décision stratégique.
+Il transforme uniquement une validation finale READY_FOR_SIGNAL
+et un plan de risque déjà construit en objet Signal + message Telegram.
 
-IMPORTANT :
-    Ce module ne prend aucune décision stratégique.
+Responsabilités :
+    Validation READY_FOR_SIGNAL
+        -> extraction des données
+        -> contrôle de cohérence minimale
+        -> construction du signal
+        -> formatage Telegram
 
-    La décision appartient à :
-        moteur2_decision.py
-
-    Le Risk Engine construit :
-        Entry / SL / TP
-
-    La Validation vérifie :
-        cohérence technique
-
-    L'AntiSpam vérifie :
-        doublon / cooldown
-
-    Ce module assemble simplement les informations validées
-    dans un objet SignalMoteur2 exploitable par Telegram.
-
-Règles :
-    - aucun seuil SCORE bloquant
-    - aucun seuil RR bloquant
-    - M5/M1 non bloquants
-    - pas de signal forcé
-    - pas de décision BUY/SELL ici
-    - TP2/TP3 peuvent être absents
+Ne fait PAS :
+    - calcul Entry / SL / TP / RR
+    - modification du RiskPlan
+    - nouvelle analyse du marché
+    - nouveau scoring
+    - nouvelle validation
+    - décision BUY / SELL
+    - exécution d'ordre
 """
 
 from __future__ import annotations
@@ -38,415 +31,190 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 
-ENGINE_NAME = "NOVA TRADE AI - ENGINE 2"
+# ============================================================================
+# OUTILS COMPATIBLES DICT / DATACLASS
+# ============================================================================
 
 
-# ======================================================================
-# OUTILS
-# ======================================================================
-
-def _get(
-    data: Any,
-    key: str,
-    default: Any = None,
-) -> Any:
-
+def _get(data: Any, key: str, default: Any = None) -> Any:
     if data is None:
         return default
-
     if isinstance(data, dict):
         return data.get(key, default)
-
     return getattr(data, key, default)
 
 
-def _float(
-    value: Any,
-    default: Optional[float] = None,
-) -> Optional[float]:
-
+def _float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
-        if value is None:
-            return default
-
-        return float(value)
-
+        return default if value is None else float(value)
     except (TypeError, ValueError):
         return default
 
 
-def _text(value: Any) -> str:
-
-    if value is None:
-        return ""
-
-    return str(value).strip()
-
-
-def _upper(value: Any) -> str:
-
-    return _text(value).upper()
-
-
 def _direction(value: Any) -> str:
-
-    value = _upper(value)
-
-    aliases = {
+    value = str(value or "").strip().upper()
+    return {
         "LONG": "BUY",
         "HAUSSIER": "BUY",
         "HAUSSIERE": "BUY",
         "BULLISH": "BUY",
-        "UP": "BUY",
-
         "SHORT": "SELL",
         "BAISSIER": "SELL",
         "BAISSIERE": "SELL",
         "BEARISH": "SELL",
-        "DOWN": "SELL",
-    }
-
-    return aliases.get(value, value)
+    }.get(value, value)
 
 
 def _symbol(value: Any) -> str:
-
-    return (
-        _text(value or "XAUUSD")
-        .upper()
-        .replace("/", "")
-        .replace(" ", "")
-    )
+    return str(value or "XAUUSD").strip().upper().replace("/", "")
 
 
 def _price(value: Any) -> str:
-
     number = _float(value)
-
-    if number is None:
-        return "N/A"
-
-    return f"{number:.2f}"
+    return "N/A" if number is None else f"{number:.2f}"
 
 
-def _timestamp() -> str:
+# ============================================================================
+# OBJET FINAL
+# ============================================================================
 
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-# ======================================================================
-# SIGNAL
-# ======================================================================
 
 @dataclass
 class SignalMoteur2:
-
     signal_id: str
     setup_id: str
-
     symbol: str
     direction: str
     setup_type: str
-
     entry: float
     sl: float
     tp1: float
-
-    tp2: Optional[float] = None
-    tp3: Optional[float] = None
-
-    rr: float = 0.0
-    score: float = 0.0
-
-    quality: str = "UNKNOWN"
-
-    decision_confidence: float = 0.0
-    decision: str = ""
-
-    validation_status: str = ""
-    confirmation_status: str = ""
-
-    timestamp: str = ""
-
+    tp2: Optional[float]
+    tp3: Optional[float]
+    rr: float
+    score: float
+    quality: str
+    validation_status: str
+    confirmation_status: str
+    timestamp: str
     reason: str = ""
-
     waiting_confirmation: bool = False
-
-    metadata: Dict[str, Any] = field(
-        default_factory=dict
-    )
-
+    metadata: Dict[str, Any] = field(default_factory=dict)
     telegram_message: str = ""
 
 
-# ======================================================================
-# CONSTRUCTEUR
-# ======================================================================
+# ============================================================================
+# MOTEUR SIGNAL
+# ============================================================================
+
 
 class Moteur2Signal:
+    """Construit exclusivement le signal issu d'une validation finale."""
 
-    """
-    Assemble le signal final.
+    FINAL_VALIDATION_STATUS = "READY_FOR_SIGNAL"
 
-    Aucune nouvelle décision stratégique n'est prise ici.
-    """
+    def generer_signal_id(self, setup_id: str) -> str:
+        """Identifiant technique unique du message construit."""
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        return f"{setup_id}-{timestamp}"
 
-    def __init__(self) -> None:
-
-        self.engine_name = ENGINE_NAME
-
-        self.signals_created = 0
-        self.last_signal: Optional[
-            SignalMoteur2
-        ] = None
-
-    # ==================================================================
-    # ID
-    # ==================================================================
-
-    def generer_signal_id(
-        self,
-        setup_id: str,
-    ) -> str:
-
-        timestamp = datetime.now(
-            timezone.utc
-        ).strftime("%Y%m%d%H%M%S%f")
-
-        return (
-            f"{setup_id}-{timestamp}"
-        )
-
-    # ==================================================================
-    # EXTRACTION RISK
-    # ==================================================================
-
-    def _extraire_risk(
-        self,
-        risk_plan: Any,
-    ) -> Dict[str, Optional[float]]:
+    def _extraire_risk(self, risk_plan: Any) -> Dict[str, Optional[float]]:
+        rr = _float(_get(risk_plan, "primary_rr"))
+        if rr is None:
+            rr = _float(_get(risk_plan, "rr"))
+        if rr is None:
+            rr = _float(_get(risk_plan, "rr_tp1"))
 
         return {
-            "entry": _float(
-                _get(
-                    risk_plan,
-                    "entry",
-                )
-            ),
-
-            "sl": _float(
-                _get(
-                    risk_plan,
-                    "sl",
-                )
-            ),
-
-            "tp1": _float(
-                _get(
-                    risk_plan,
-                    "tp1",
-                )
-            ),
-
-            "tp2": _float(
-                _get(
-                    risk_plan,
-                    "tp2",
-                )
-            ),
-
-            "tp3": _float(
-                _get(
-                    risk_plan,
-                    "tp3",
-                )
-            ),
-
-            "rr": _float(
-                _get(
-                    risk_plan,
-                    "rr",
-                    _get(
-                        risk_plan,
-                        "primary_rr",
-                        _get(
-                            risk_plan,
-                            "rr_tp1",
-                        ),
-                    ),
-                )
-            ),
+            "entry": _float(_get(risk_plan, "entry")),
+            "sl": _float(_get(risk_plan, "sl")),
+            "tp1": _float(_get(risk_plan, "tp1")),
+            "tp2": _float(_get(risk_plan, "tp2")),
+            "tp3": _float(_get(risk_plan, "tp3")),
+            "rr": rr,
         }
 
-    # ==================================================================
-    # EXTRACTION SCORE
-    # ==================================================================
-
-    def _extraire_score(
-        self,
-        score_result: Any,
-    ) -> Dict[str, Any]:
-
+    def _extraire_score(self, score_result: Any) -> Dict[str, Any]:
         return {
-            "score": _float(
-                _get(
-                    score_result,
-                    "score",
-                    0.0,
-                ),
-                0.0,
-            ),
-
-            "quality": _upper(
-                _get(
-                    score_result,
-                    "quality",
-                    "UNKNOWN",
-                )
-            ),
+            "score": _float(_get(score_result, "score"), 0.0),
+            "quality": str(_get(score_result, "quality", "N/A")).upper(),
         }
 
-    # ==================================================================
-    # EXTRACTION DECISION
-    # ==================================================================
+    def _extraire_validation(self, validation: Any) -> Dict[str, Any]:
+        status = str(_get(validation, "status", "UNKNOWN")).strip().upper()
+        validated = bool(_get(validation, "validated", False))
 
-    def _extraire_decision(
-        self,
-        decision_result: Any,
-    ) -> Dict[str, Any]:
-
-        decision = _direction(
-            _get(
-                decision_result,
-                "decision",
-                "",
-            )
-        )
-
-        confidence = _float(
-            _get(
-                decision_result,
-                "confidence",
-                0.0,
-            ),
-            0.0,
-        )
+        # Compatibilité avec d'anciennes conventions éventuelles.
+        if not validated:
+            validated = bool(_get(validation, "valid", False))
 
         return {
-            "decision": decision,
-            "confidence": confidence,
-        }
-
-    # ==================================================================
-    # EXTRACTION VALIDATION
-    # ==================================================================
-
-    def _extraire_validation(
-        self,
-        validation: Any,
-    ) -> Dict[str, Any]:
-
-        status = _upper(
-            _get(
-                validation,
-                "status",
-                "",
-            )
-        )
-
-        valid = bool(
-            _get(
-                validation,
-                "valid",
-                False,
-            )
-        )
-
-        return {
-            "valid": valid,
+            "validated": validated,
             "status": status,
-            "reason": _text(
-                _get(
-                    validation,
-                    "reason",
-                    "",
-                )
-            ),
+            "reason": str(_get(validation, "reason", "")),
         }
 
-    # ==================================================================
-    # EXTRACTION CONFIRMATION
-    # ==================================================================
-
-    def _extraire_confirmation(
-        self,
-        confirmation: Any,
-    ) -> Dict[str, Any]:
-
-        status = _upper(
+    def _extraire_confirmation(self, confirmation: Any) -> Dict[str, Any]:
+        status = str(
             _get(
                 confirmation,
-                "status",
-                _get(
-                    confirmation,
-                    "confirmation_status",
-                    "UNKNOWN",
-                ),
+                "confirmation_status",
+                _get(confirmation, "status", "UNKNOWN"),
             )
-        )
+        ).strip().upper()
 
-        entry_triggered = bool(
-            _get(
-                confirmation,
-                "entry_triggered",
-                False,
-            )
-        )
+        entry_triggered = bool(_get(confirmation, "entry_triggered", False))
 
         return {
             "status": status,
             "entry_triggered": entry_triggered,
         }
 
-    # ==================================================================
-    # EXTRACTION ANTISPAM
-    # ==================================================================
-
-    def _extraire_antispam(
+    def _resolve_setup_id(
         self,
-        antispam_result: Any,
-    ) -> Dict[str, Any]:
+        setup: Any,
+        risk_plan: Any,
+        symbol: str,
+        direction: str,
+        setup_type: str,
+    ) -> str:
+        setup_id = str(
+            _get(setup, "setup_id")
+            or _get(setup, "id")
+            or _get(risk_plan, "setup_id")
+            or ""
+        ).strip()
 
-        if antispam_result is None:
+        if setup_id:
+            return setup_id
 
-            return {
-                "allowed": True,
-                "reason": "",
-            }
+        entry = _price(_get(risk_plan, "entry"))
+        sl = _price(_get(risk_plan, "sl"))
+        return f"M2-{symbol}-{direction}-{setup_type}-{entry}-{sl}"
 
-        return {
-            "allowed": bool(
-                _get(
-                    antispam_result,
-                    "allowed",
-                    True,
-                )
-            ),
+    def _controle_minimal(
+        self,
+        direction: str,
+        risk: Dict[str, Optional[float]],
+    ) -> bool:
+        """Contrôle de sécurité de forme, sans recalcul ni décision stratégique."""
+        entry = risk["entry"]
+        sl = risk["sl"]
+        tp1 = risk["tp1"]
+        rr = risk["rr"]
 
-            "reason": _text(
-                _get(
-                    antispam_result,
-                    "reason",
-                    "",
-                )
-            ),
-        }
+        if entry is None or sl is None or tp1 is None or rr is None:
+            return False
+        if entry <= 0 or sl <= 0 or tp1 <= 0 or rr <= 0:
+            return False
 
-    # ==================================================================
-    # CONSTRUCTION
-    # ==================================================================
+        # Simple cohérence de données déjà produites par Risk/Validation.
+        if direction == "BUY" and not (sl < entry < tp1):
+            return False
+        if direction == "SELL" and not (tp1 < entry < sl):
+            return False
+
+        return True
 
     def construire_signal(
         self,
@@ -457,406 +225,131 @@ class Moteur2Signal:
         validation: Any,
         antispam_result: Any = None,
         setup_id: Optional[str] = None,
-        decision_result: Any = None,
-        intelligence: Any = None,
-        scenarios: Any = None,
     ) -> Optional[SignalMoteur2]:
+        """
+        Construit un signal UNIQUEMENT si la chaîne précédente est terminée.
 
-        # --------------------------------------------------------------
-        # VALIDATION TECHNIQUE DE BASE
-        # --------------------------------------------------------------
+        Point important : VALIDATED_WAITING_CONFIRMATION ne devient jamais
+        un signal Telegram. Il reste dans les étapes précédentes jusqu'à ce
+        que la validation finale passe à READY_FOR_SIGNAL.
+        """
 
-        validation_data = (
-            self._extraire_validation(
-                validation
-            )
-        )
+        validation_data = self._extraire_validation(validation)
 
-        if not validation_data["valid"]:
+        if not validation_data["validated"]:
             return None
 
-        # --------------------------------------------------------------
-        # ANTISPAM
-        # --------------------------------------------------------------
-
-        antispam_data = (
-            self._extraire_antispam(
-                antispam_result
-            )
-        )
-
-        if not antispam_data["allowed"]:
+        # Le module Signal n'autorise que la validation finale.
+        if validation_data["status"] != self.FINAL_VALIDATION_STATUS:
             return None
 
-        # --------------------------------------------------------------
-        # DIRECTION
-        # --------------------------------------------------------------
-
-        direction = _direction(
-            _get(
-                decision_result,
-                "decision",
-                _get(
-                    setup,
-                    "direction",
-                    "",
-                ),
-            )
-        )
-
-        if direction not in {
-            "BUY",
-            "SELL",
-        }:
-            return None
-
-        # --------------------------------------------------------------
-        # SYMBOL
-        # --------------------------------------------------------------
-
-        symbol = _symbol(
-            _get(
-                setup,
-                "symbol",
-                "XAUUSD",
-            )
-        )
-
-        # --------------------------------------------------------------
-        # SETUP TYPE
-        # --------------------------------------------------------------
-
-        setup_type = _upper(
-            _get(
-                setup,
-                "setup_type",
-                "UNKNOWN",
-            )
-        )
-
-        # --------------------------------------------------------------
-        # SETUP ID
-        # --------------------------------------------------------------
-
-        if setup_id is None:
-
-            setup_id = _text(
-                _get(
-                    setup,
-                    "setup_id",
-                    "",
-                )
-            )
-
-        if not setup_id:
-
-            setup_id = (
-                f"M2-{symbol}-"
-                f"{direction}-"
-                f"{setup_type}"
-            )
-
-        # --------------------------------------------------------------
-        # RISK
-        # --------------------------------------------------------------
-
-        risk = self._extraire_risk(
-            risk_plan
-        )
-
-        # Entry / SL / TP1 sont nécessaires
-        # car le signal final doit être exploitable.
-
-        if (
-            risk["entry"] is None
-            or risk["sl"] is None
-            or risk["tp1"] is None
+        if antispam_result is not None and not bool(
+            _get(antispam_result, "allowed", False)
         ):
             return None
 
-        # RR doit être présent mais n'est PAS comparé
-        # à une valeur minimale ici.
-
-        rr = risk["rr"]
-
-        if rr is None:
-            rr = 0.0
-
-        # --------------------------------------------------------------
-        # SCORE
-        # --------------------------------------------------------------
-
-        score_data = (
-            self._extraire_score(
-                score_result
-            )
+        symbol = _symbol(
+            _get(setup, "symbol")
+            or _get(risk_plan, "symbol")
+            or "XAUUSD"
         )
 
-        score = (
-            score_data["score"]
-            or 0.0
+        direction = _direction(
+            _get(setup, "direction")
+            or _get(risk_plan, "direction")
         )
 
-        quality = (
-            score_data["quality"]
+        setup_type = str(
+            _get(setup, "setup_type")
+            or _get(risk_plan, "setup_type")
             or "UNKNOWN"
-        )
+        ).strip().upper()
 
-        # --------------------------------------------------------------
-        # DECISION
-        # --------------------------------------------------------------
+        if direction not in {"BUY", "SELL"}:
+            return None
 
-        decision_data = (
-            self._extraire_decision(
-                decision_result
-            )
-        )
+        risk = self._extraire_risk(risk_plan)
 
-        decision_confidence = (
-            decision_data["confidence"]
-            or 0.0
-        )
+        # TP1 est obligatoire. TP2 / TP3 restent réellement facultatifs.
+        if not self._controle_minimal(direction, risk):
+            return None
 
-        # --------------------------------------------------------------
-        # CONFIRMATION
-        # --------------------------------------------------------------
+        score_data = self._extraire_score(score_result)
+        confirmation_data = self._extraire_confirmation(confirmation)
 
-        confirmation_data = (
-            self._extraire_confirmation(
-                confirmation
-            )
-        )
+        # Une validation finale READY_FOR_SIGNAL implique une confirmation
+        # effectivement déclenchée. On ne reconstruit pas la décision ici.
+        if not confirmation_data["entry_triggered"]:
+            return None
 
-        # M5/M1 ne constituent pas un veto.
-        waiting_confirmation = (
-            not confirmation_data[
-                "entry_triggered"
-            ]
-        )
-
-        # --------------------------------------------------------------
-        # TIMESTAMP
-        # --------------------------------------------------------------
-
-        timestamp = _timestamp()
-
-        signal_id = (
-            self.generer_signal_id(
-                setup_id
-            )
-        )
-
-        # --------------------------------------------------------------
-        # RAISON
-        # --------------------------------------------------------------
-
-        reason = validation_data[
-            "reason"
-        ]
-
-        if not reason:
-
-            reason = (
-                _text(
-                    _get(
-                        decision_result,
-                        "reasons",
-                        "",
-                    )
-                )
+        if setup_id is None:
+            setup_id = self._resolve_setup_id(
+                setup,
+                risk_plan,
+                symbol,
+                direction,
+                setup_type,
             )
 
-        # --------------------------------------------------------------
-        # METADATA
-        # --------------------------------------------------------------
+        signal_id = self.generer_signal_id(setup_id)
+        timestamp = datetime.now(timezone.utc).isoformat()
 
         metadata = {
-
             "engine": "MOTEUR_2",
-
             "data_source": "BIQUOTE",
-
             "instrument": symbol,
-
-            "decision": direction,
-
-            "decision_confidence": (
-                decision_confidence
-            ),
-
-            "decision_owner": (
-                "moteur2_decision.py"
-            ),
-
-            "validation_status": (
-                validation_data["status"]
-            ),
-
-            "confirmation_status": (
-                confirmation_data["status"]
-            ),
-
-            "entry_triggered": (
-                confirmation_data[
-                    "entry_triggered"
-                ]
-            ),
-
-            "waiting_confirmation": (
-                waiting_confirmation
-            ),
-
-            "score": score,
-
-            "score_is_blocking": False,
-
-            "rr": rr,
-
-            "rr_is_blocking": False,
-
-            "m5_is_blocking": False,
-
-            "m1_is_blocking": False,
-
-            "risk_decides_trade": False,
-
-            "signal_engine_decides_trade": False,
-
-            "signal_quota": None,
-
-            "forced_signal": False,
-
+            "validation_status": validation_data["status"],
+            "confirmation_status": confirmation_data["status"],
+            "entry_triggered": True,
             "created_at": timestamp,
+            "signal_layer_is_decisive": False,
+            "risk_modified": False,
+            "score_recomputed": False,
+            "validation_recomputed": False,
+            "tp2_optional": risk["tp2"] is None,
+            "tp3_optional": risk["tp3"] is None,
         }
-
-        if intelligence is not None:
-            metadata[
-                "intelligence_available"
-            ] = True
-
-        if scenarios is not None:
-            metadata[
-                "scenarios_available"
-            ] = True
-
-        # --------------------------------------------------------------
-        # MESSAGE TELEGRAM
-        # --------------------------------------------------------------
 
         message = self.formater_telegram(
             symbol=symbol,
             direction=direction,
             setup_type=setup_type,
-            entry=risk["entry"],
-            sl=risk["sl"],
-            tp1=risk["tp1"],
+            entry=float(risk["entry"]),
+            sl=float(risk["sl"]),
+            tp1=float(risk["tp1"]),
             tp2=risk["tp2"],
             tp3=risk["tp3"],
-            rr=rr,
-            score=score,
-            quality=quality,
-            validation_status=(
-                validation_data["status"]
-            ),
-            confirmation_status=(
-                confirmation_data["status"]
-            ),
-            entry_triggered=(
-                confirmation_data[
-                    "entry_triggered"
-                ]
-            ),
+            rr=float(risk["rr"]),
+            score=float(score_data["score"] or 0.0),
+            quality=score_data["quality"],
+            validation_status=validation_data["status"],
+            confirmation_status=confirmation_data["status"],
+            entry_triggered=True,
             setup_id=setup_id,
-            decision_confidence=(
-                decision_confidence
-            ),
         )
 
-        # --------------------------------------------------------------
-        # SIGNAL FINAL
-        # --------------------------------------------------------------
-
-        signal = SignalMoteur2(
-
+        return SignalMoteur2(
             signal_id=signal_id,
-
             setup_id=setup_id,
-
             symbol=symbol,
-
             direction=direction,
-
             setup_type=setup_type,
-
-            entry=float(
-                risk["entry"]
-            ),
-
-            sl=float(
-                risk["sl"]
-            ),
-
-            tp1=float(
-                risk["tp1"]
-            ),
-
-            tp2=(
-                float(risk["tp2"])
-                if risk["tp2"] is not None
-                else None
-            ),
-
-            tp3=(
-                float(risk["tp3"])
-                if risk["tp3"] is not None
-                else None
-            ),
-
-            rr=float(rr),
-
-            score=float(score),
-
-            quality=quality,
-
-            decision_confidence=float(
-                decision_confidence
-            ),
-
-            decision=direction,
-
-            validation_status=(
-                validation_data["status"]
-            ),
-
-            confirmation_status=(
-                confirmation_data["status"]
-            ),
-
+            entry=float(risk["entry"]),
+            sl=float(risk["sl"]),
+            tp1=float(risk["tp1"]),
+            tp2=risk["tp2"],
+            tp3=risk["tp3"],
+            rr=float(risk["rr"]),
+            score=float(score_data["score"] or 0.0),
+            quality=score_data["quality"],
+            validation_status=validation_data["status"],
+            confirmation_status=confirmation_data["status"],
             timestamp=timestamp,
-
-            reason=reason,
-
-            waiting_confirmation=(
-                waiting_confirmation
-            ),
-
+            reason=validation_data["reason"],
+            waiting_confirmation=False,
             metadata=metadata,
-
             telegram_message=message,
         )
-
-        self.signals_created += 1
-        self.last_signal = signal
-
-        return signal
-
-    # Alias
-    generer_signal = construire_signal
-    build_signal = construire_signal
-
-    # ==================================================================
-    # TELEGRAM
-    # ==================================================================
 
     def formater_telegram(
         self,
@@ -875,222 +368,173 @@ class Moteur2Signal:
         confirmation_status: str,
         entry_triggered: bool,
         setup_id: str,
-        decision_confidence: float = 0.0,
     ) -> str:
-
         display_symbol = symbol
-
         if symbol == "XAUUSD":
             display_symbol = "XAU/USD"
-
-        elif symbol == "BTCUSD":
-            display_symbol = "BTC/USD"
-
-        elif symbol == "EURUSD":
-            display_symbol = "EUR/USD"
-
-        elif symbol == "GBPUSD":
-            display_symbol = "GBP/USD"
 
         title = (
             f"🟢 {display_symbol} — BUY"
             if direction == "BUY"
-            else
-            f"🔴 {display_symbol} — SELL"
+            else f"🔴 {display_symbol} — SELL"
         )
 
-        if entry_triggered:
+        timing = (
+            "⚡ ENTRÉE CONFIRMÉE"
+            if entry_triggered
+            else "⏳ EN ATTENTE DE CONFIRMATION"
+        )
 
-            timing = (
-                "⚡ ENTRÉE CONFIRMÉE"
-            )
+        tp2_text = _price(tp2) if tp2 is not None else "—"
+        tp3_text = _price(tp3) if tp3 is not None else "—"
 
-        else:
+        return (
+            f"{title}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 Setup : {setup_type}\n"
+            f"📊 Statut : {timing}\n\n"
+            f"🎯 ENTRY : {_price(entry)}\n"
+            f"🛑 SL : {_price(sl)}\n"
+            f"🥇 TP1 : {_price(tp1)}\n"
+            f"🥈 TP2 : {tp2_text}\n"
+            f"🥉 TP3 : {tp3_text}\n\n"
+            f"📐 RR : {rr:.2f}\n"
+            f"⭐ Score : {score:.0f}/100\n"
+            f"🏷️ Qualité : {quality}\n\n"
+            f"🔎 Validation : {validation_status}\n"
+            f"⏱️ Confirmation : {confirmation_status}\n\n"
+            f"🆔 Setup : {setup_id}\n"
+            f"⚙️ Moteur : NOVA TRADE AI — Engine 2\n"
+            f"📡 Source : BiQuote"
+        )
 
-            timing = (
-                "👁️ OPPORTUNITÉ IDENTIFIÉE"
-            )
-
-        lines = [
-
-            title,
-
-            "━━━━━━━━━━━━━━━━━━",
-
-            f"📌 Setup : {setup_type}",
-
-            f"📊 Statut : {timing}",
-
-            "",
-
-            f"🎯 ENTRY : {_price(entry)}",
-
-            f"🛑 SL : {_price(sl)}",
-
-            f"🥇 TP1 : {_price(tp1)}",
-        ]
-
-        if tp2 is not None:
-
-            lines.append(
-                f"🥈 TP2 : {_price(tp2)}"
-            )
-
-        if tp3 is not None:
-
-            lines.append(
-                f"🥉 TP3 : {_price(tp3)}"
-            )
-
-        lines.extend([
-
-            "",
-
-            f"📐 RR : {rr:.2f}",
-
-            f"⭐ Score indicatif : {score:.0f}/100",
-
-            f"🏷️ Qualité : {quality}",
-
-            f"🧠 Confiance décision : "
-            f"{decision_confidence:.1f}/100",
-
-            "",
-
-            f"🔎 Validation : "
-            f"{validation_status}",
-
-            f"⏱️ Confirmation : "
-            f"{confirmation_status}",
-
-            "",
-
-            f"🆔 Setup : {setup_id}",
-
-            f"⚙️ Moteur : "
-            f"NOVA TRADE AI — Engine 2",
-
-            "📡 Source : BiQuote",
-        ])
-
-        return "\n".join(lines)
-
-    # ==================================================================
-    # DICTIONNAIRE
-    # ==================================================================
-
-    def to_dict(
-        self,
-        signal: SignalMoteur2,
-    ) -> Dict[str, Any]:
-
+    def to_dict(self, signal: SignalMoteur2) -> Dict[str, Any]:
         return {
-
             "signal_id": signal.signal_id,
-
             "setup_id": signal.setup_id,
-
             "symbol": signal.symbol,
-
             "direction": signal.direction,
-
             "setup_type": signal.setup_type,
-
             "entry": signal.entry,
-
             "sl": signal.sl,
-
             "tp1": signal.tp1,
-
             "tp2": signal.tp2,
-
             "tp3": signal.tp3,
-
             "rr": signal.rr,
-
             "score": signal.score,
-
             "quality": signal.quality,
-
-            "decision_confidence": (
-                signal.decision_confidence
-            ),
-
-            "decision": signal.decision,
-
-            "validation_status": (
-                signal.validation_status
-            ),
-
-            "confirmation_status": (
-                signal.confirmation_status
-            ),
-
+            "validation_status": signal.validation_status,
+            "confirmation_status": signal.confirmation_status,
             "timestamp": signal.timestamp,
-
             "reason": signal.reason,
-
-            "waiting_confirmation": (
-                signal.waiting_confirmation
-            ),
-
-            "metadata": signal.metadata,
-
-            "telegram_message": (
-                signal.telegram_message
-            ),
-        }
-
-    # ==================================================================
-    # STATUS
-    # ==================================================================
-
-    def get_status(self) -> Dict[str, Any]:
-
-        return {
-
-            "engine": self.engine_name,
-
-            "module": "SIGNAL_BUILDER",
-
-            "signals_created": (
-                self.signals_created
-            ),
-
-            "decision_owner": (
-                "moteur2_decision.py"
-            ),
-
-            "makes_trade_decision": False,
-
-            "blocks_trade": False,
-
-            "score_is_blocking": False,
-
-            "rr_is_blocking": False,
-
-            "m5_is_blocking": False,
-
-            "m1_is_blocking": False,
-
-            "multiple_signals_allowed": True,
-
-            "signal_quota": None,
-
-            "forced_signal": False,
-
-            "last_signal": (
-                self.to_dict(
-                    self.last_signal
-                )
-                if self.last_signal
-                else None
-            ),
+            "waiting_confirmation": signal.waiting_confirmation,
+            "metadata": dict(signal.metadata),
+            "telegram_message": signal.telegram_message,
         }
 
 
-# ======================================================================
-# ALIAS
-# ======================================================================
+# ============================================================================
+# FONCTION PUBLIQUE COMPATIBLE
+# ============================================================================
 
-SignalEngine = Moteur2Signal
+
+def construire_signal(
+    setup: Any,
+    risk_plan: Any,
+    confirmation: Any,
+    score_result: Any,
+    validation: Any,
+    antispam_result: Any = None,
+    setup_id: Optional[str] = None,
+) -> Optional[SignalMoteur2]:
+    return Moteur2Signal().construire_signal(
+        setup=setup,
+        risk_plan=risk_plan,
+        confirmation=confirmation,
+        score_result=score_result,
+        validation=validation,
+        antispam_result=antispam_result,
+        setup_id=setup_id,
+    )
+
+
+# ============================================================================
+# TEST LOCAL
+# ============================================================================
+
+
+if __name__ == "__main__":
+    moteur = Moteur2Signal()
+
+    setup = {
+        "setup_id": "XAUUSD_BUY_TEST",
+        "direction": "BUY",
+        "setup_type": "CONTINUATION",
+        "symbol": "XAUUSD",
+    }
+
+    risk = {
+        "symbol": "XAUUSD",
+        "setup_id": "XAUUSD_BUY_TEST",
+        "direction": "BUY",
+        "entry": 4650.0,
+        "sl": 4640.0,
+        "tp1": 4680.0,
+        "tp2": None,
+        "tp3": None,
+        "primary_rr": 3.0,
+    }
+
+    confirmation = {
+        "confirmation_status": "CONFIRMED_M5_M1",
+        "entry_triggered": True,
+    }
+
+    score = {
+        "score": 72.0,
+        "quality": "A",
+    }
+
+    validation = {
+        "validated": True,
+        "status": "READY_FOR_SIGNAL",
+        "reason": "Validation finale réussie.",
+    }
+
+    antispam = {
+        "allowed": True,
+    }
+
+    signal = moteur.construire_signal(
+        setup=setup,
+        risk_plan=risk,
+        confirmation=confirmation,
+        score_result=score,
+        validation=validation,
+        antispam_result=antispam,
+    )
+
+    assert signal is not None
+    assert signal.tp2 is None
+    assert signal.tp3 is None
+    assert signal.validation_status == "READY_FOR_SIGNAL"
+    assert signal.waiting_confirmation is False
+
+    waiting_validation = {
+        "validated": True,
+        "status": "VALIDATED_WAITING_CONFIRMATION",
+    }
+    assert (
+        moteur.construire_signal(
+            setup,
+            risk,
+            confirmation,
+            score,
+            waiting_validation,
+            antispam,
+        )
+        is None
+    )
+
+    print("OK moteur2_signal")
+    print(signal.telegram_message)
