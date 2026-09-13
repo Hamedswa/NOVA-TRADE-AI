@@ -239,8 +239,9 @@ class Moteur2:
     ) -> Any:
 
         return await self._call(
-            self.marche.cartographier_marche,
+            self.marche.analyser,
             donnees,
+            symbol=self.symbol,
         )
 
     # ============================================================
