@@ -1,1413 +1,1356 @@
 """
-NOVA TRADE AI — ENGINE 2
-moteur2.py
-
-Orchestrateur Engine 2 multi-actifs.
-
-Actifs : XAUUSD, BTCUSD, EURUSD, GBPUSD.
-Source marché : BiQuote uniquement.
-
-Pipeline :
-BiQuote → Cache → Cartographie → Zones → Contexte →
-Confluences → Setups → Risk → Confirmation M5/M1 →
-Score → Validation technique → Decision Engine → Anti-spam → Signal.
+NOVA TRADE AI - Moteur 2
+moteur2_marche.py
+Cartographie descriptive du marché pour :
+    XAUUSD
+    BTCUSD
+    EURUSD
+    GBPUSD
+Timeframes :
+    H4
+    H1
+    M15
+    M5
+    M1
+Rôle du module :
+    Ce module décrit le comportement du prix.
+Il identifie notamment :
+    - highs importants
+    - lows importants
+    - supports
+    - résistances
+    - zones de réaction
+    - mouvements impulsifs
+    - mouvements correctifs
+    - ranges éventuels
+    - état général du prix
+IMPORTANT :
+    Ce module ne prend aucune décision de trading.
+Il ne :
+    - valide aucun setup
+    - ne calcule aucun Entry
+    - ne calcule aucun SL
+    - ne calcule aucun TP
+    - ne calcule aucun RR
+    - ne produit aucun READY_FOR_SIGNAL
+Les décisions sont prises plus loin dans le pipeline.
 """
-
 from __future__ import annotations
-
-import asyncio
-import inspect
-import logging
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
-
-from biquote_client import BiQuoteClient
-from biquote_stream import BiQuoteStream
-from moteur2_cache import Moteur2Cache
-from moteur2_marche import Moteur2Marche
-from moteur2_liquidite import Moteur2Liquidite
-from moteur2_zones import Moteur2Zones
-from moteur2_contexte import Moteur2Contexte
-from moteur2_confluences import Moteur2Confluences
-from moteur2_setups import Moteur2Setups
-from moteur2_risk import Moteur2Risk
-from moteur2_confirmation import Moteur2Confirmation
-from moteur2_score import Moteur2Score
-from moteur2_validation import Moteur2Validation
-from moteur2_antispam import Moteur2AntiSpam
-from moteur2_signal import Moteur2Signal
-from moteur2_decision import Moteur2Decision
-
-
-SYMBOL = "XAUUSD"
-
-# Les quatre actifs surveillés en permanence par Engine 2.
-# L'ordre est volontaire : XAUUSD, BTCUSD, EURUSD, GBPUSD.
-SUPPORTED_SYMBOLS = (
-    "XAUUSD",
-    "BTCUSD",
-    "EURUSD",
-    "GBPUSD",
-)
-
-# Objectif opérationnel : rechercher activement les meilleures
-# opportunités de la journée. Ce nombre n'est PAS un quota forcé.
-DAILY_SIGNAL_TARGET = 3
-MAX_SIGNALS_PER_CYCLE = 3
-
-TIMEFRAMES = (
+from biquote_client import Candle
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+SUPPORTED_TIMEFRAMES = (
     "H4",
     "H1",
     "M15",
     "M5",
     "M1",
 )
-
-ENGINE_NAME = "NOVA TRADE AI - ENGINE 2"
-
-logger = logging.getLogger("NOVA_ENGINE_2")
-
-
-class Moteur2:
-
-    def __init__(self, symbol: str = SYMBOL) -> None:
-
-        self.symbol = (
-            symbol.strip().upper().replace("/", "")
+# Nombre de bougies utilisées autour d'un point
+# pour identifier un haut/bas local.
+SWING_LOOKBACK = {
+    "H4": 3,
+    "H1": 3,
+    "M15": 3,
+    "M5": 2,
+    "M1": 2,
+}
+# Fenêtre utilisée pour examiner un éventuel range.
+RANGE_LOOKBACK = {
+    "H4": 20,
+    "H1": 30,
+    "M15": 30,
+    "M5": 30,
+    "M1": 30,
+}
+# Fenêtres de mouvement.
+MOVEMENT_LOOKBACK = {
+    "H4": 8,
+    "H1": 10,
+    "M15": 12,
+    "M5": 12,
+    "M1": 15,
+}
+# Nombre minimum de bougies nécessaires.
+MINIMUM_CANDLES = 5
+# Multiplicateurs basés sur l'amplitude moyenne des bougies.
+#
+# Ils remplacent les anciens seuils fixes en pourcentage.
+IMPULSE_RANGE_MULTIPLIER = {
+    "H4": 2.2,
+    "H1": 2.2,
+    "M15": 2.0,
+    "M5": 1.9,
+    "M1": 1.8,
+}
+CORRECTION_RANGE_MULTIPLIER = {
+    "H4": 1.2,
+    "H1": 1.2,
+    "M15": 1.15,
+    "M5": 1.1,
+    "M1": 1.0,
+}
+# Un range est considéré comme relativement compact
+# lorsque sa largeur reste inférieure à plusieurs
+# amplitudes moyennes de bougie.
+RANGE_WIDTH_ATR_MULTIPLIER = {
+    "H4": 6.0,
+    "H1": 7.0,
+    "M15": 8.0,
+    "M5": 9.0,
+    "M1": 10.0,
+}
+# ============================================================================
+# STRUCTURES
+# ============================================================================
+@dataclass
+class PriceLevel:
+    """
+    Niveau important détecté sur le marché.
+    """
+    price: float
+    kind: str
+    timeframe: str
+    strength: float = 0.0
+    touches: int = 1
+@dataclass
+class MarketZone:
+    """
+    Zone de prix intéressante.
+    Cette zone est descriptive.
+    Elle ne constitue pas une décision de trading.
+    """
+    low: float
+    high: float
+    center: float
+    kind: str
+    timeframe: str
+    strength: float
+    reason: str
+@dataclass
+class MarketImpulse:
+    """
+    Mouvement directionnel significatif.
+    """
+    direction: str
+    start_price: float
+    end_price: float
+    amplitude: float
+    percentage: float
+    timeframe: str
+@dataclass
+class MarketCorrection:
+    """
+    Mouvement correctif descriptif.
+    """
+    direction: str
+    start_price: float
+    end_price: float
+    amplitude: float
+    percentage: float
+    timeframe: str
+# ============================================================================
+# CARTOGRAPHIE PRINCIPALE
+# ============================================================================
+class Moteur2Marche:
+    """
+    Analyse descriptive du marché.
+    Aucun signal n'est généré ici.
+    """
+    def __init__(
+        self,
+        level_tolerance: Optional[float] = None,
+    ):
+        """
+        level_tolerance :
+            Tolérance relative facultative.
+        Si elle n'est pas fournie, les regroupements
+        de niveaux utilisent une tolérance adaptative
+        basée sur l'amplitude moyenne des bougies.
+        """
+        self.level_tolerance = level_tolerance
+    # =========================================================================
+    # ANALYSE PRINCIPALE
+    # =========================================================================
+    def analyser(
+        self,
+        candles_by_timeframe: Dict[str, List[Candle]],
+        symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Construit la cartographie globale.
+        symbol est purement descriptif.
+        Il n'est jamais utilisé pour imposer une valeur
+        par défaut au marché.
+        """
+        normalized_symbol = (
+            self._normalize_symbol(symbol)
+            if symbol
+            else None
         )
-
-        if self.symbol not in SUPPORTED_SYMBOLS:
-            raise ValueError(
-                f"Engine 2 ne supporte pas {self.symbol}. "
-                f"Symboles supportés : {', '.join(SUPPORTED_SYMBOLS)}."
+        result: Dict[str, Any] = {
+            "symbol": normalized_symbol,
+            "timeframes": {},
+            "global": {
+                "supports": [],
+                "resistances": [],
+                "important_highs": [],
+                "important_lows": [],
+                "zones": [],
+                "impulses": [],
+                "corrections": [],
+                "ranges": [],
+                "market_states": [],
+                "trend_summary": {},
+                "multi_timeframe": {},
+            },
+        }
+        for timeframe in SUPPORTED_TIMEFRAMES:
+            candles = candles_by_timeframe.get(
+                timeframe,
+                [],
             )
-
-        self.biquote = BiQuoteClient()
-
-        self.stream = BiQuoteStream(
-            symbol=self.symbol,
-            on_tick=self._on_tick,
+            if not candles:
+                continue
+            tf_map = self._analyser_timeframe(
+                candles,
+                timeframe,
+            )
+            result["timeframes"][
+                timeframe
+            ] = tf_map
+            result["global"][
+                "supports"
+            ].extend(
+                tf_map["supports"]
+            )
+            result["global"][
+                "resistances"
+            ].extend(
+                tf_map["resistances"]
+            )
+            result["global"][
+                "important_highs"
+            ].extend(
+                tf_map["important_highs"]
+            )
+            result["global"][
+                "important_lows"
+            ].extend(
+                tf_map["important_lows"]
+            )
+            result["global"][
+                "zones"
+            ].extend(
+                tf_map["zones"]
+            )
+            result["global"][
+                "impulses"
+            ].extend(
+                tf_map["impulses"]
+            )
+            result["global"][
+                "corrections"
+            ].extend(
+                tf_map["corrections"]
+            )
+            result["global"][
+                "ranges"
+            ].extend(
+                tf_map["ranges"]
+            )
+            result["global"]["market_states"].append({
+                "timeframe": timeframe,
+                "state": tf_map.get("market_state", {}).get("state"),
+                "trend": tf_map.get("market_state", {}).get("trend"),
+                "confidence": tf_map.get("market_state", {}).get("confidence", 0.0),
+            })
+        # ---------------------------------------------------------------------
+        # Regroupement des niveaux proches.
+        # ---------------------------------------------------------------------
+        result["global"][
+            "supports"
+        ] = self._merge_levels(
+            result["global"]["supports"],
+            candles_by_timeframe,
         )
-
-        self.cache = Moteur2Cache(
-            client=self.biquote,
-            symbol=self.symbol,
+        result["global"][
+            "resistances"
+        ] = self._merge_levels(
+            result["global"]["resistances"],
+            candles_by_timeframe,
         )
-
-        self.marche = Moteur2Marche()
-        self.liquidite = Moteur2Liquidite()
-        self.zones = Moteur2Zones()
-        self.contexte = Moteur2Contexte()
-        self.confluences = Moteur2Confluences()
-        self.setups = Moteur2Setups()
-        self.risk = Moteur2Risk()
-        self.confirmation = Moteur2Confirmation()
-        self.score = Moteur2Score()
-        self.validation = Moteur2Validation()
-        self.antispam = Moteur2AntiSpam()
-        self.signal = Moteur2Signal()
-        self.decision = Moteur2Decision()
-
-        self.running = False
-        self.initialized = False
-        self.latest_tick: Optional[Any] = None
-        self.last_analysis: Optional[Dict[str, Any]] = None
-
-        self.analysis_lock = asyncio.Lock()
-
-    # ============================================================
-    # OUTILS
-    # ============================================================
-
-    @staticmethod
-    def _get(
-        data: Any,
-        key: str,
-        default: Any = None,
-    ) -> Any:
-        if data is None:
-            return default
-        if isinstance(data, dict):
-            return data.get(key, default)
-        return getattr(data, key, default)
-
-    @staticmethod
-    async def _call(
-        function: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-
-        result = function(*args, **kwargs)
-
-        if inspect.isawaitable(result):
-            return await result
-
+        result["global"]["trend_summary"] = self._build_trend_summary(result["timeframes"])
+        result["global"]["multi_timeframe"] = self._build_multi_timeframe_summary(result["timeframes"])
         return result
-
-    # ============================================================
-    # TICK LIVE
-    # ============================================================
-
-    async def _on_tick(self, tick: Any) -> None:
-
-        self.latest_tick = tick
-
-        try:
-            await self._call(
-                self.cache.update_tick,
-                tick,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Erreur mise à jour tick BiQuote : %s",
-                exc,
-            )
-
-    # ============================================================
-    # INITIALISATION
-    # ============================================================
-
-    async def initialiser(self) -> Dict[str, Any]:
-
-        try:
-
-            await self._call(
-                self.cache.refresh_all
-            )
-
-            self.initialized = True
-
-            return {
-                "success": True,
-                "symbol": self.symbol,
-                "timeframes": list(TIMEFRAMES),
-                "source": "BiQuote",
-            }
-
-        except Exception as exc:
-
-            self.initialized = False
-
-            logger.exception(
-                "Échec initialisation Engine 2."
-            )
-
-            return {
-                "success": False,
-                "symbol": self.symbol,
-                "error": str(exc),
-            }
-
-    async def rafraichir_cache(self) -> Any:
-        return await self._call(
-            self.cache.refresh_all
+    # =========================================================================
+    # ANALYSE D'UN TIMEFRAME
+    # =========================================================================
+    def _analyser_timeframe(
+        self,
+        candles: List[Candle],
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        candles = self._clean_candles(
+            candles
         )
+        if len(candles) < MINIMUM_CANDLES:
+            return {
+                "timeframe": timeframe,
+                "current_price": None,
+                "important_highs": [],
+                "important_lows": [],
+                "supports": [],
+                "resistances": [],
+                "zones": [],
+                "impulses": [],
+                "corrections": [],
+                "ranges": [],
+            }
+        current_price = float(
+            candles[-1].close
+        )
+        highs = self._detect_swing_highs(
+            candles,
+            timeframe,
+        )
+        lows = self._detect_swing_lows(
+            candles,
+            timeframe,
+        )
+        supports = self._detect_supports(
+            candles,
+            lows,
+            timeframe,
+        )
+        resistances = self._detect_resistances(
+            candles,
+            highs,
+            timeframe,
+        )
+        zones = self._build_reaction_zones(
+            candles,
+            supports,
+            resistances,
+            timeframe,
+        )
+        impulses = self._detect_impulses(
+            candles,
+            timeframe,
+        )
+        corrections = self._detect_corrections(
+            candles,
+            timeframe,
+        )
+        ranges = self._detect_ranges(
+            candles,
+            timeframe,
+        )
+        market_state = self._detect_market_state(
+            candles, timeframe, ranges, impulses, corrections
+        )
+        momentum = self._measure_momentum(candles, timeframe)
+        volatility = self._measure_volatility(candles, timeframe)
+        pressure = self._measure_pressure(candles, timeframe)
+        amplitude = self._measure_amplitude(candles, timeframe)
+        extremes = self._measure_extremes(candles, timeframe)
+        return {
+            "timeframe": timeframe,
+            "current_price": current_price,
+            "important_highs": [
+                asdict(level)
+                for level in highs
+            ],
+            "important_lows": [
+                asdict(level)
+                for level in lows
+            ],
+            "supports": [
+                asdict(level)
+                for level in supports
+            ],
+            "resistances": [
+                asdict(level)
+                for level in resistances
+            ],
+            "zones": [
+                asdict(zone)
+                for zone in zones
+            ],
+            "impulses": [
+                asdict(impulse)
+                for impulse in impulses
+            ],
+            "corrections": [
+                asdict(correction)
+                for correction in corrections
+            ],
+            "ranges": ranges,
+            "market_state": market_state,
+            "momentum": momentum,
+            "volatility": volatility,
+            "pressure": pressure,
+            "amplitude": amplitude,
+            "extremes": extremes,
+        }
+    # =========================================================================
+    # SWINGS
+    # =========================================================================
+    def _detect_swing_highs(
+        self,
+        candles: List[Candle],
+        timeframe: str,
+    ) -> List[PriceLevel]:
+        lookback = SWING_LOOKBACK.get(
+            timeframe,
+            2,
+        )
+        levels: List[PriceLevel] = []
+        if len(candles) < (
+            lookback * 2 + 1
+        ):
+            return levels
+        for i in range(
+            lookback,
+            len(candles) - lookback,
+        ):
+            current = float(
+                candles[i].high
+            )
+            left = [
+                float(candles[j].high)
+                for j in range(
+                    i - lookback,
+                    i,
+                )
+            ]
+            right = [
+                float(candles[j].high)
+                for j in range(
+                    i + 1,
+                    i + lookback + 1,
+                )
+            ]
+            if (
+                current >= max(left)
+                and current >= max(right)
+            ):
+                levels.append(
+                    PriceLevel(
+                        price=current,
+                        kind="SWING_HIGH",
+                        timeframe=timeframe,
+                        strength=1.0,
+                    )
+                )
+        return levels
+    def _detect_swing_lows(
+        self,
+        candles: List[Candle],
+        timeframe: str,
+    ) -> List[PriceLevel]:
+        lookback = SWING_LOOKBACK.get(
+            timeframe,
+            2,
+        )
+        levels: List[PriceLevel] = []
+        if len(candles) < (
+            lookback * 2 + 1
+        ):
+            return levels
+        for i in range(
+            lookback,
+            len(candles) - lookback,
+        ):
+            current = float(
+                candles[i].low
+            )
+            left = [
+                float(candles[j].low)
+                for j in range(
+                    i - lookback,
+                    i,
+                )
+            ]
+            right = [
+                float(candles[j].low)
+                for j in range(
+                    i + 1,
+                    i + lookback + 1,
+                )
+            ]
+            if (
+                current <= min(left)
+                and current <= min(right)
+            ):
+                levels.append(
+                    PriceLevel(
+                        price=current,
+                        kind="SWING_LOW",
+                        timeframe=timeframe,
+                        strength=1.0,
+                    )
+                )
+        return levels
+    # =========================================================================
+    # LECTURE APPROFONDIE DU MARCHÉ
+    # =========================================================================
+    def _detect_market_state(
+        self,
+        candles: List[Candle],
+        timeframe: str,
+        ranges: List[Dict[str, Any]],
+        impulses: List[MarketImpulse],
+        corrections: List[MarketCorrection],
+    ) -> Dict[str, Any]:
+        closes = [float(c.close) for c in candles]
+        if len(closes) < 6:
+            return {"state": "INDETERMINE", "trend": "NEUTRE", "confidence": 0.0}
+        short = closes[-min(5, len(closes)):]
+        mid_n = min(12, len(closes))
+        mid = closes[-mid_n:]
+        short_move = short[-1] - short[0]
+        mid_move = mid[-1] - mid[0]
+        avg = self._average_candle_range(candles[-min(20, len(candles)):])
+        if avg <= 0:
+            avg = max(abs(closes[-1]) * 0.0001, 1e-12)
+        strength = min(abs(mid_move) / avg / 3.0, 1.0)
+        trend = "HAUSSIER" if mid_move > avg * 0.8 else "BAISSIER" if mid_move < -avg * 0.8 else "NEUTRE"
+        if ranges:
+            state = "RANGE"
+        elif impulses and abs(short_move) >= avg * 1.2:
+            state = "IMPULSION"
+        elif corrections:
+            state = "CORRECTION"
+        elif trend != "NEUTRE" and ((short_move > 0) == (mid_move > 0)):
+            state = "TENDANCE"
+        elif trend != "NEUTRE":
+            state = "TRANSITION"
+        else:
+            state = "TRANSITION"
+        return {
+            "state": state,
+            "trend": trend,
+            "confidence": round(strength, 3),
+            "short_move": short_move,
+            "medium_move": mid_move,
+        }
 
-    # ============================================================
-    # DONNÉES
-    # ============================================================
+    def _measure_momentum(self, candles: List[Candle], timeframe: str) -> Dict[str, Any]:
+        n = min(MOVEMENT_LOOKBACK.get(timeframe, 10), len(candles))
+        if n < 3:
+            return {"direction": "NEUTRE", "strength": 0.0, "rate": 0.0}
+        start = float(candles[-n].close); end = float(candles[-1].close)
+        avg = self._average_candle_range(candles[-n:])
+        move = end - start
+        strength = min(abs(move) / max(avg * 3.0, 1e-12), 1.0)
+        return {"direction": "HAUSSIER" if move > 0 else "BAISSIER" if move < 0 else "NEUTRE", "strength": round(strength, 3), "rate": round(move / max(abs(start), 1e-12) * 100, 5)}
 
-    def obtenir_donnees(self) -> Dict[str, Any]:
+    def _measure_volatility(self, candles: List[Candle], timeframe: str) -> Dict[str, Any]:
+        n = min(20, len(candles)); recent = candles[-n:]
+        avg = self._average_candle_range(recent)
+        if len(candles) >= n * 2:
+            previous = self._average_candle_range(candles[-n*2:-n])
+        else:
+            previous = avg
+        ratio = avg / max(previous, 1e-12)
+        state = "ELEVEE" if ratio >= 1.35 else "EN_HAUSSE" if ratio >= 1.10 else "FAIBLE" if ratio <= 0.75 else "NORMALE"
+        return {"average_range": avg, "relative_ratio": round(ratio, 3), "state": state}
 
-        donnees: Dict[str, Any] = {}
+    def _measure_pressure(self, candles: List[Candle], timeframe: str) -> Dict[str, Any]:
+        recent = candles[-min(12, len(candles)):]
+        buy = sell = 0.0
+        for c in recent:
+            o,h,l,cl = map(float, (c.open,c.high,c.low,c.close))
+            span = max(h-l, 1e-12)
+            body = cl-o
+            location = ((cl-l) - (h-cl)) / span
+            if body > 0: buy += 0.6 + max(location,0)*0.4
+            elif body < 0: sell += 0.6 + max(-location,0)*0.4
+        total = buy + sell
+        balance = (buy-sell)/total if total else 0.0
+        return {"buy": round(buy,3), "sell": round(sell,3), "balance": round(balance,3), "dominance": "ACHAT" if balance > 0.12 else "VENTE" if balance < -0.12 else "EQUILIBRE"}
 
-        for timeframe in TIMEFRAMES:
+    def _measure_amplitude(self, candles: List[Candle], timeframe: str) -> Dict[str, Any]:
+        n = min(20, len(candles)); recent = candles[-n:]
+        high=max(float(c.high) for c in recent); low=min(float(c.low) for c in recent)
+        avg=self._average_candle_range(recent); width=high-low
+        return {"range_high": high, "range_low": low, "width": width, "width_in_avg_ranges": round(width/max(avg,1e-12),3)}
 
+    def _measure_extremes(self, candles: List[Candle], timeframe: str) -> Dict[str, Any]:
+        recent=candles[-min(30,len(candles)):]; price=float(candles[-1].close)
+        high=max(float(c.high) for c in recent); low=min(float(c.low) for c in recent)
+        span=max(high-low,1e-12)
+        position=(price-low)/span
+        return {"recent_high": high, "recent_low": low, "position": round(position,3), "near_high": position >= 0.85, "near_low": position <= 0.15}
+
+    def _build_trend_summary(self, timeframes: Dict[str, Any]) -> Dict[str, Any]:
+        weights={"H4":4,"H1":3,"M15":2,"M5":1,"M1":1}; score=0; total=0
+        details={}
+        for tf,w in weights.items():
+            item=timeframes.get(tf,{}).get("market_state",{})
+            trend=item.get("trend","NEUTRE"); conf=float(item.get("confidence",0) or 0)
+            value=1 if trend=="HAUSSIER" else -1 if trend=="BAISSIER" else 0
+            score += value*w*max(conf,0.25); total += w*max(conf,0.25) if trend!="NEUTRE" else w*0.25
+            details[tf]=trend
+        normalized=score/max(total,1e-12)
+        return {"direction":"HAUSSIER" if normalized>0.20 else "BAISSIER" if normalized<-0.20 else "NEUTRE", "strength":round(abs(normalized),3), "by_timeframe":details}
+
+    def _build_multi_timeframe_summary(self, timeframes: Dict[str, Any]) -> Dict[str, Any]:
+        trends=[timeframes.get(tf,{}).get("market_state",{}).get("trend") for tf in ("H4","H1","M15")]
+        valid=[t for t in trends if t in ("HAUSSIER","BAISSIER")]
+        coherence=(len(valid)==3 and len(set(valid))==1)
+        return {"primary_timeframes":["H4","H1","M15"], "trends":dict(zip(("H4","H1","M15"),trends)), "coherent":coherence, "alignment":"HAUSSIERE" if coherence and valid[0]=="HAUSSIER" else "BAISSIERE" if coherence else "MIXTE"}
+
+    # =========================================================================
+    # SUPPORTS
+    # =========================================================================
+    def _detect_supports(
+        self,
+        candles: List[Candle],
+        lows: List[PriceLevel],
+        timeframe: str,
+    ) -> List[PriceLevel]:
+        supports: List[PriceLevel] = []
+        for level in lows:
+            touches = self._count_reactions(
+                candles,
+                level.price,
+                side="support",
+            )
+            strength = min(
+                1.0
+                + touches * 0.25,
+                3.0,
+            )
+            supports.append(
+                PriceLevel(
+                    price=level.price,
+                    kind="SUPPORT",
+                    timeframe=timeframe,
+                    strength=strength,
+                    touches=touches,
+                )
+            )
+        return supports
+    # =========================================================================
+    # RESISTANCES
+    # =========================================================================
+    def _detect_resistances(
+        self,
+        candles: List[Candle],
+        highs: List[PriceLevel],
+        timeframe: str,
+    ) -> List[PriceLevel]:
+        resistances: List[PriceLevel] = []
+        for level in highs:
+            touches = self._count_reactions(
+                candles,
+                level.price,
+                side="resistance",
+            )
+            strength = min(
+                1.0
+                + touches * 0.25,
+                3.0,
+            )
+            resistances.append(
+                PriceLevel(
+                    price=level.price,
+                    kind="RESISTANCE",
+                    timeframe=timeframe,
+                    strength=strength,
+                    touches=touches,
+                )
+            )
+        return resistances
+    # =========================================================================
+    # ZONES
+    # =========================================================================
+    def _build_reaction_zones(
+        self,
+        candles: List[Candle],
+        supports: List[PriceLevel],
+        resistances: List[PriceLevel],
+        timeframe: str,
+    ) -> List[MarketZone]:
+        zones: List[MarketZone] = []
+        for support in supports:
+            width = self._zone_width(
+                candles,
+                support.price,
+            )
+            zones.append(
+                MarketZone(
+                    low=max(
+                        support.price - width,
+                        0.00000001,
+                    ),
+                    high=(
+                        support.price
+                        + width
+                    ),
+                    center=support.price,
+                    kind="SUPPORT_ZONE",
+                    timeframe=timeframe,
+                    strength=support.strength,
+                    reason=(
+                        "swing low + "
+                        "réactions du prix"
+                    ),
+                )
+            )
+        for resistance in resistances:
+            width = self._zone_width(
+                candles,
+                resistance.price,
+            )
+            zones.append(
+                MarketZone(
+                    low=max(
+                        resistance.price - width,
+                        0.00000001,
+                    ),
+                    high=(
+                        resistance.price
+                        + width
+                    ),
+                    center=resistance.price,
+                    kind="RESISTANCE_ZONE",
+                    timeframe=timeframe,
+                    strength=resistance.strength,
+                    reason=(
+                        "swing high + "
+                        "réactions du prix"
+                    ),
+                )
+            )
+        return zones
+    # =========================================================================
+    # IMPULSIONS
+    # =========================================================================
+    def _detect_impulses(
+        self,
+        candles: List[Candle],
+        timeframe: str,
+    ) -> List[MarketImpulse]:
+        lookback = MOVEMENT_LOOKBACK.get(
+            timeframe,
+            10,
+        )
+        if len(candles) < (
+            lookback + 2
+        ):
+            return []
+        recent = candles[
+            -lookback:
+        ]
+        start = float(
+            recent[0].close
+        )
+        end = float(
+            recent[-1].close
+        )
+        if start <= 0:
+            return []
+        amplitude = end - start
+        percentage = (
+            abs(amplitude)
+            / start
+            * 100.0
+        )
+        average_range = (
+            self._average_candle_range(
+                recent
+            )
+        )
+        if average_range <= 0:
+            return []
+        movement_size = abs(
+            amplitude
+        )
+        multiplier = (
+            IMPULSE_RANGE_MULTIPLIER.get(
+                timeframe,
+                2.0,
+            )
+        )
+        # Le mouvement doit être suffisamment
+        # significatif par rapport à l'activité
+        # récente de l'actif.
+        if (
+            movement_size
+            < average_range * multiplier
+        ):
+            return []
+        direction = (
+            "HAUSSIER"
+            if amplitude > 0
+            else "BAISSIER"
+        )
+        return [
+            MarketImpulse(
+                direction=direction,
+                start_price=start,
+                end_price=end,
+                amplitude=movement_size,
+                percentage=percentage,
+                timeframe=timeframe,
+            )
+        ]
+    # =========================================================================
+    # CORRECTIONS
+    # =========================================================================
+    def _detect_corrections(
+        self,
+        candles: List[Candle],
+        timeframe: str,
+    ) -> List[MarketCorrection]:
+        lookback = MOVEMENT_LOOKBACK.get(
+            timeframe,
+            10,
+        )
+        if len(candles) < (
+            lookback + 5
+        ):
+            return []
+        # On examine un mouvement récent
+        # et sa direction dominante.
+        recent = candles[
+            -lookback:
+        ]
+        previous = candles[
+            -(lookback * 2):
+            -lookback
+        ]
+        if not previous:
+            return []
+        previous_start = float(
+            previous[0].close
+        )
+        previous_end = float(
+            previous[-1].close
+        )
+        recent_start = float(
+            recent[0].close
+        )
+        recent_end = float(
+            recent[-1].close
+        )
+        if (
+            previous_start <= 0
+            or recent_start <= 0
+        ):
+            return []
+        previous_move = (
+            previous_end
+            - previous_start
+        )
+        recent_move = (
+            recent_end
+            - recent_start
+        )
+        # Il faut d'abord avoir eu un mouvement
+        # antérieur identifiable.
+        if previous_move == 0:
+            return []
+        average_range = (
+            self._average_candle_range(
+                recent
+            )
+        )
+        if average_range <= 0:
+            return []
+        # Une correction doit avoir une direction
+        # opposée au mouvement précédent.
+        opposite_direction = (
+            previous_move > 0
+            and recent_move < 0
+        ) or (
+            previous_move < 0
+            and recent_move > 0
+        )
+        if not opposite_direction:
+            return []
+        correction_size = abs(
+            recent_move
+        )
+        multiplier = (
+            CORRECTION_RANGE_MULTIPLIER.get(
+                timeframe,
+                1.0,
+            )
+        )
+        if (
+            correction_size
+            < average_range * multiplier
+        ):
+            return []
+        percentage = (
+            correction_size
+            / recent_start
+            * 100.0
+        )
+        direction = (
+            "BAISSIERE"
+            if recent_move < 0
+            else "HAUSSIERE"
+        )
+        return [
+            MarketCorrection(
+                direction=direction,
+                start_price=recent_start,
+                end_price=recent_end,
+                amplitude=correction_size,
+                percentage=percentage,
+                timeframe=timeframe,
+            )
+        ]
+    # =========================================================================
+    # RANGES
+    # =========================================================================
+    def _detect_ranges(
+        self,
+        candles: List[Candle],
+        timeframe: str,
+    ) -> List[Dict[str, Any]]:
+        lookback = RANGE_LOOKBACK.get(
+            timeframe,
+            20,
+        )
+        if len(candles) < lookback:
+            return []
+        recent = candles[
+            -lookback:
+        ]
+        highest = max(
+            float(c.high)
+            for c in recent
+        )
+        lowest = min(
+            float(c.low)
+            for c in recent
+        )
+        if lowest <= 0:
+            return []
+        width = (
+            highest
+            - lowest
+        )
+        average_range = (
+            self._average_candle_range(
+                recent
+            )
+        )
+        if average_range <= 0:
+            return []
+        multiplier = (
+            RANGE_WIDTH_ATR_MULTIPLIER.get(
+                timeframe,
+                8.0,
+            )
+        )
+        width_percent = (
+            width
+            / lowest
+            * 100.0
+        )
+        # Range compact relativement à
+        # l'activité récente.
+        if width <= (
+            average_range * multiplier
+        ):
+            return [
+                {
+                    "timeframe": timeframe,
+                    "low": lowest,
+                    "high": highest,
+                    "width": width,
+                    "width_percent": (
+                        width_percent
+                    ),
+                    "average_candle_range": (
+                        average_range
+                    ),
+                    "type": "RANGE_POTENTIEL",
+                }
+            ]
+        return []
+    # =========================================================================
+    # RÉACTIONS SUR LES NIVEAUX
+    # =========================================================================
+    def _count_reactions(
+        self,
+        candles: List[Candle],
+        price: float,
+        side: str,
+    ) -> int:
+        if price <= 0:
+            return 0
+        tolerance = (
+            self._level_tolerance(
+                candles,
+                price,
+            )
+        )
+        count = 0
+        for candle in candles:
             try:
-                donnees[timeframe] = (
-                    self.cache.get_closed_candles(
+                high = float(
+                    candle.high
+                )
+                low = float(
+                    candle.low
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+            if side == "support":
+                distance = abs(
+                    low - price
+                )
+            else:
+                distance = abs(
+                    high - price
+                )
+            if distance <= tolerance:
+                count += 1
+        return count
+    # =========================================================================
+    # LARGEUR DES ZONES
+    # =========================================================================
+    def _zone_width(
+        self,
+        candles: List[Candle],
+        price: float,
+    ) -> float:
+        recent = candles[-20:]
+        average_range = (
+            self._average_candle_range(
+                recent
+            )
+        )
+        if average_range <= 0:
+            return max(
+                price * 0.0003,
+                0.00000001,
+            )
+        # Zone proportionnelle à la volatilité
+        # récente du timeframe.
+        return max(
+            average_range * 0.35,
+            price * 0.0001,
+        )
+    # =========================================================================
+    # TOLÉRANCE DES NIVEAUX
+    # =========================================================================
+    def _level_tolerance(
+        self,
+        candles: List[Candle],
+        price: float,
+    ) -> float:
+        """
+        Calcule une tolérance adaptée à l'actif.
+        Une tolérance fixe en pourcentage n'est pas
+        idéale pour BTCUSD, XAUUSD et les paires FX.
+        On utilise donc l'amplitude moyenne récente.
+        """
+        if (
+            self.level_tolerance
+            is not None
+        ):
+            return max(
+                price
+                * self.level_tolerance,
+                0.00000001,
+            )
+        average_range = (
+            self._average_candle_range(
+                candles[-30:]
+            )
+        )
+        if average_range <= 0:
+            return max(
+                price * 0.0002,
+                0.00000001,
+            )
+        return max(
+            average_range * 0.25,
+            price * 0.00005,
+        )
+    # =========================================================================
+    # MOYENNE D'AMPLITUDE
+    # =========================================================================
+    @staticmethod
+    def _average_candle_range(
+        candles: List[Candle],
+    ) -> float:
+        ranges: List[float] = []
+        for candle in candles:
+            try:
+                high = float(
+                    candle.high
+                )
+                low = float(
+                    candle.low
+                )
+                if (
+                    high > 0
+                    and low > 0
+                    and high >= low
+                ):
+                    ranges.append(
+                        high - low
+                    )
+            except (
+                TypeError,
+                ValueError,
+                AttributeError,
+            ):
+                continue
+        if not ranges:
+            return 0.0
+        return (
+            sum(ranges)
+            / len(ranges)
+        )
+    # =========================================================================
+    # NETTOYAGE
+    # =========================================================================
+    @staticmethod
+    def _clean_candles(
+        candles: List[Candle],
+    ) -> List[Candle]:
+        valid: List[Candle] = []
+        for candle in candles:
+            try:
+                open_price = float(
+                    candle.open
+                )
+                high = float(
+                    candle.high
+                )
+                low = float(
+                    candle.low
+                )
+                close = float(
+                    candle.close
+                )
+                if (
+                    open_price > 0
+                    and high > 0
+                    and low > 0
+                    and close > 0
+                    and high >= low
+                    and high >= open_price
+                    and high >= close
+                    and low <= open_price
+                    and low <= close
+                ):
+                    valid.append(
+                        candle
+                    )
+            except (
+                TypeError,
+                ValueError,
+                AttributeError,
+            ):
+                continue
+        return valid
+    # =========================================================================
+    # FUSION DES NIVEAUX
+    # =========================================================================
+    def _merge_levels(
+        self,
+        levels: List[Dict[str, Any]],
+        candles_by_timeframe: Dict[
+            str,
+            List[Candle],
+        ],
+    ) -> List[Dict[str, Any]]:
+        if not levels:
+            return []
+        sorted_levels = sorted(
+            levels,
+            key=lambda item: item[
+                "price"
+            ],
+        )
+        merged: List[
+            Dict[str, Any]
+        ] = []
+        for level in sorted_levels:
+            if not merged:
+                merged.append(
+                    dict(level)
+                )
+                continue
+            previous = merged[-1]
+            timeframe = level.get(
+                "timeframe"
+            )
+            candles = (
+                candles_by_timeframe.get(
+                    timeframe,
+                    [],
+                )
+            )
+            tolerance = (
+                self._level_tolerance(
+                    candles,
+                    float(
+                        previous["price"]
+                    ),
+                )
+                if candles
+                else max(
+                    float(
+                        previous["price"]
+                    )
+                    * 0.0002,
+                    0.00000001,
+                )
+            )
+            if abs(
+                float(level["price"])
+                - float(previous["price"])
+            ) <= tolerance:
+                previous_touches = (
+                    previous.get(
+                        "touches",
+                        1,
+                    )
+                )
+                level_touches = (
+                    level.get(
+                        "touches",
+                        1,
+                    )
+                )
+                total_touches = (
+                    previous_touches
+                    + level_touches
+                )
+                # Moyenne pondérée par le nombre
+                # de réactions.
+                previous_price = float(
+                    previous["price"]
+                )
+                level_price = float(
+                    level["price"]
+                )
+                previous["price"] = (
+                    (
+                        previous_price
+                        * previous_touches
+                    )
+                    + (
+                        level_price
+                        * level_touches
+                    )
+                ) / max(
+                    total_touches,
+                    1,
+                )
+                previous["touches"] = (
+                    total_touches
+                )
+                previous["strength"] = min(
+                    float(
+                        previous.get(
+                            "strength",
+                            0.0,
+                        )
+                    )
+                    + float(
+                        level.get(
+                            "strength",
+                            0.0,
+                        )
+                    )
+                    * 0.5,
+                    5.0,
+                )
+                # Conservation des timeframes
+                # ayant contribué au niveau.
+                existing_timeframes = (
+                    previous.get(
+                        "timeframes"
+                    )
+                )
+                if existing_timeframes is None:
+                    existing_timeframes = [
+                        previous.get(
+                            "timeframe"
+                        )
+                    ]
+                if timeframe not in (
+                    existing_timeframes
+                ):
+                    existing_timeframes.append(
                         timeframe
                     )
+                previous[
+                    "timeframes"
+                ] = [
+                    item
+                    for item
+                    in existing_timeframes
+                    if item
+                ]
+            else:
+                merged.append(
+                    dict(level)
                 )
-
-            except TypeError:
-                donnees[timeframe] = (
-                    self.cache.get_closed_candles(
-                        timeframe=timeframe
-                    )
-                )
-
-        return donnees
-
-    # ============================================================
-    # CARTOGRAPHIE
-    # ============================================================
-
-    async def analyser_marche(
-        self,
-        donnees: Dict[str, Any],
-    ) -> Any:
-
-        return await self._call(
-            self.marche.analyser,
-            donnees,
-            symbol=self.symbol,
-        )
-
-    # ============================================================
-    # LIQUIDITÉ
-    # ============================================================
-
-    async def analyser_liquidite(
-        self,
-        cartographie: Any,
-        current_price: float,
-    ) -> Any:
-        """
-        Analyse descriptive de la liquidité après la cartographie.
-
-        Cette couche est contributive et non bloquante : elle ne décide
-        jamais BUY/SELL et ne remplace aucune validation existante.
-        """
-        return await self._call(
-            self.liquidite.analyser,
-            cartographie,
-            current_price,
-        )
-
-    # ============================================================
-    # ZONES
-    # ============================================================
-
-    async def analyser_zones(
-        self,
-        cartographie: Any,
-        current_price: float,
-        liquidite: Any = None,
-    ) -> Any:
-
-        # IMPORTANT : méthode réelle de la classe = analyser()
-        return await self._call(
-            self.zones.analyser,
-            cartographie,
-            current_price,
-            liquidite,
-        )
-
-    # ============================================================
-    # CONTEXTE
-    # ============================================================
-
-    async def analyser_contexte(
-        self,
-        donnees: Dict[str, Any],
-        zones: Any,
-        cartographie: Any = None,
-        liquidite: Any = None,
-    ) -> Any:
-
-        # Contexte enrichi : données + zones + cartographie + liquidité.
-        # Cette couche reste descriptive et non bloquante.
-        return await self._call(
-            self.contexte.analyser,
-            donnees,
-            zones,
-            symbol=self.symbol,
-            cartographie=cartographie,
-            liquidite=liquidite,
-        )
-
-    # ============================================================
-    # CONFLUENCES
-    # ============================================================
-
-    async def analyser_confluences(
-        self,
-        donnees: Dict[str, Any],
-        zones: Any,
-        contexte: Any,
-        cartographie: Any,
-        liquidite: Any = None,
-    ) -> Any:
-
-        # Confluences enrichies : données + zones + contexte +
-        # cartographie + liquidité. Couche descriptive et non bloquante.
-        return await self._call(
-            self.confluences.analyser,
-            donnees,
-            zones,
-            contexte,
-            cartographie,
-            symbol=self.symbol,
-            liquidity_result=liquidite,
-        )
-
-    # ============================================================
-    # SETUPS
-    # ============================================================
-
-    async def analyser_setups(
-        self,
-        zones: Any,
-        confluences: Any,
-        contexte: Any,
-        donnees: Dict[str, Any],
-    ) -> Any:
-
-        return await self._call(
-            self.setups.analyser,
-            zones,
-            confluences,
-            contexte,
-            donnees,
-        )
-
-    # ============================================================
-    # RISK
-    # ============================================================
-
-    async def analyser_risque(
-        self,
-        setups: Any,
-        zones: Any,
-        donnees: Dict[str, Any],
-        current_price: float,
-    ) -> Any:
-
-        # Signature réelle :
-        # analyser_setups(setups, zones, candles, current_price)
-        return await self._call(
-            self.risk.analyser_setups,
-            setups,
-            zones,
-            donnees,
-            current_price,
-        )
-
-    # ============================================================
-    # CONFIRMATION
-    # ============================================================
-
-    async def analyser_confirmation(
-        self,
-        setup: Any,
-        donnees: Dict[str, Any],
-        risk_plan: Any,
-    ) -> Any:
-
-        # Signature réelle :
-        # analyser(setup, candles, risk_plan)
-        return await self._call(
-            self.confirmation.analyser,
-            setup,
-            donnees,
-            risk_plan,
-        )
-
-    # ============================================================
-    # SCORE
-    # ============================================================
-
-    async def calculer_score(
-        self,
-        setup: Any,
-        zones: Any,
-        contexte: Any,
-        confluences: Any,
-        confirmation: Any,
-        risk_plan: Any,
-    ) -> Any:
-
-        # Signature réelle :
-        # analyser(setup, zones, context, confluences,
-        #          confirmation, risk_plan)
-        return await self._call(
-            self.score.analyser,
-            setup=setup,
-            zones=zones,
-            context=contexte,
-            confluences=confluences,
-            confirmation=confirmation,
-            risk_plan=risk_plan,
-        )
-
-    # ============================================================
-    # VALIDATION
-    # ============================================================
-
-    async def valider(
-        self,
-        setup: Any,
-        risk_plan: Any,
-        confirmation: Any,
-        score_result: Any,
-        contexte: Any,
-        confluences: Any,
-    ) -> Any:
-
-        return await self._call(
-            self.validation.valider,
-            setup=setup,
-            risk_plan=risk_plan,
-            confirmation=confirmation,
-            score_result=score_result,
-            contexte=contexte,
-            confluences=confluences,
-        )
-
-    # ============================================================
-    # SETUP COMPLET
-    # ============================================================
-
-    async def traiter_setup(
-        self,
-        setup: Any,
-        risk_plan: Any,
-        zones: Any,
-        contexte: Any,
-        confluences: Any,
-        donnees: Dict[str, Any],
-        cartographie: Any = None,
-        liquidite: Any = None,
-    ) -> Dict[str, Any]:
-
-        confirmation = await self.analyser_confirmation(
-            setup,
-            donnees,
-            risk_plan,
-        )
-
-        score_result = await self.calculer_score(
-            setup=setup,
-            zones=zones,
-            contexte=contexte,
-            confluences=confluences,
-            confirmation=confirmation,
-            risk_plan=risk_plan,
-        )
-
-        validation = await self.valider(
-            setup=setup,
-            risk_plan=risk_plan,
-            confirmation=confirmation,
-            score_result=score_result,
-            contexte=contexte,
-            confluences=confluences,
-        )
-
-        validated = bool(
-            self._get(
-                validation,
-                "validated",
-                False,
-            )
-        )
-
-        validation_status = str(
-            self._get(
-                validation,
-                "status",
-                "UNKNOWN",
-            )
-        ).upper()
-
-        # --------------------------------------------------------
-        # SETUP NON VALIDÉ
-        # --------------------------------------------------------
-
-        if not validated:
-
-            return {
-                "status": "REJECTED",
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation,
-                "score": score_result,
-                "validation": validation,
-                "decision": None,
-            }
-
-        # --------------------------------------------------------
-        # DECISION ENGINE
-        # --------------------------------------------------------
-        # Le Decision Engine est le propriétaire de la décision
-        # stratégique BUY / SELL / WAIT.
-        # Il ne fabrique aucun prix et ne remplace ni Risk, ni Validation.
-        # La cartographie sert de structure/marché et la liquidité
-        # d'intelligence de marché descriptive.
-        try:
-            decision_result = await self._call(
-                self.decision.analyser,
-                setup=setup,
-                contexte=contexte,
-                zones=zones,
-                structure=cartographie,
-                confluences=confluences,
-                risk_plan=risk_plan,
-                score_result=score_result,
-                validation_result=validation,
-                confirmation_result=confirmation,
-                market_intelligence={
-                    "cartographie": cartographie,
-                    "liquidite": liquidite,
-                },
-            )
-        except TypeError:
-            # Compatibilité avec une version du Decision Engine
-            # n'acceptant pas encore tous les champs optionnels.
-            decision_result = await self._call(
-                self.decision.analyser,
-                setup=setup,
-                contexte=contexte,
-                zones=zones,
-                structure=cartographie,
-                confluences=confluences,
-                risk_plan=risk_plan,
-                score_result=score_result,
-                validation_result=validation,
-                confirmation_result=confirmation,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Decision Engine erreur pour %s: %s",
-                self.symbol,
-                exc,
-            )
-            return {
-                "status": "DECISION_ENGINE_ERROR",
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation,
-                "score": score_result,
-                "validation": validation,
-                "decision": None,
-                "error": str(exc),
-            }
-
-        decision = str(
-            self._get(decision_result, "decision", "WAIT")
-        ).upper()
-        setup_direction = str(
-            self._get(setup, "direction", "")
-        ).upper()
-
-        if decision not in {"BUY", "SELL", "WAIT"}:
-            decision = "WAIT"
-
-        decision_confidence = self._get(
-            decision_result, "confidence", None
-        )
-        logger.info(
-            "DECISION ENGINE : %s | setup=%s | decision=%s | confidence=%s",
-            self.symbol,
-            self._get(setup, "setup_id", "SETUP"),
-            decision,
-            decision_confidence,
-        )
-
-        # Le moteur stratégique doit rester cohérent avec le sens du setup.
-        # Une divergence devient WAIT, jamais un retournement artificiel.
-        if decision in {"BUY", "SELL"} and setup_direction in {"BUY", "SELL"}:
-            if decision != setup_direction:
-                return {
-                    "status": "DECISION_WAIT",
-                    "setup": setup,
-                    "risk": risk_plan,
-                    "confirmation": confirmation,
-                    "score": score_result,
-                    "validation": validation,
-                    "decision": decision_result,
-                    "signal": None,
-                }
-
-        if decision == "WAIT":
-            return {
-                "status": "DECISION_WAIT",
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation,
-                "score": score_result,
-                "validation": validation,
-                "decision": decision_result,
-                "signal": None,
-            }
-
-        # --------------------------------------------------------
-        # SETUP VALIDÉ MAIS M5/M1 EN ATTENTE
-        #
-        # IMPORTANT :
-        # aucun anti-spam, aucun enregistrement actif,
-        # aucun signal Telegram envoyé à ce stade.
-        # --------------------------------------------------------
-
-        if validation_status != "READY_FOR_SIGNAL":
-
-            return {
-                "status": "WAITING_CONFIRMATION",
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation,
-                "score": score_result,
-                "validation": validation,
-                "decision": decision_result,
-                "signal": None,
-            }
-
-        # --------------------------------------------------------
-        # ANTI-SPAM UNIQUEMENT AU MOMENT DU SIGNAL
-        # --------------------------------------------------------
-
-        antispam = self.antispam.verifier(
-            setup=setup,
-            risk_plan=risk_plan,
-            validation=validation,
-        )
-
-        if not bool(
-            self._get(
-                antispam,
-                "allowed",
-                False,
-            )
+        return merged
+    # =========================================================================
+    # NORMALISATION SYMBOLE
+    # =========================================================================
+    @staticmethod
+    def _normalize_symbol(
+        symbol: Any,
+    ) -> Optional[str]:
+        if not isinstance(
+            symbol,
+            str,
         ):
-
-            return {
-                "status": "ANTISPAM_BLOCKED",
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation,
-                "score": score_result,
-                "validation": validation,
-                "decision": decision_result,
-                "antispam": antispam,
-                "signal": None,
-            }
-
-        # --------------------------------------------------------
-        # CONSTRUCTION SIGNAL
-        # --------------------------------------------------------
-
-        setup_id = self._get(
-            antispam,
-            "setup_id",
-        )
-
-        signal = self.signal.construire_signal(
-            setup=setup,
-            risk_plan=risk_plan,
-            confirmation=confirmation,
-            score_result=score_result,
-            validation=validation,
-            antispam_result=antispam,
-            setup_id=setup_id,
-        )
-
-        if signal is None:
-
-            return {
-                "status": "SIGNAL_NOT_BUILT",
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation,
-                "score": score_result,
-                "validation": validation,
-                "decision": decision_result,
-                "antispam": antispam,
-                "signal": None,
-            }
-
-        # --------------------------------------------------------
-        # ENREGISTREMENT APRÈS CONSTRUCTION DU SIGNAL
-        # --------------------------------------------------------
-
-        self.antispam.enregistrer_signal(
-            setup=setup,
-            risk_plan=risk_plan,
-            setup_id=setup_id,
-        )
-
-        return {
-            "status": "SIGNAL_READY",
-            "signal": signal,
-            "setup": setup,
-            "risk": risk_plan,
-            "confirmation": confirmation,
-            "score": score_result,
-            "validation": validation,
-            "decision": decision_result,
-            "antispam": antispam,
-        }
-
-    # ============================================================
-    # ANALYSE COMPLÈTE
-    # ============================================================
-
-    async def analyser(self) -> Dict[str, Any]:
-
-        async with self.analysis_lock:
-
-            await self.rafraichir_cache()
-
-            # Le cache est déjà lié à self.symbol. On tente néanmoins
-            # la forme explicite si une implémentation multi-symboles
-            # de Moteur2Cache l'accepte, avec fallback rétrocompatible.
-            try:
-                current_price = self.cache.get_current_price(self.symbol)
-            except TypeError:
-                current_price = self.cache.get_current_price()
-
-            if current_price is None:
-
-                return {
-                    "status": "NO_PRICE",
-                    "reason": (
-                        "Aucun prix live BiQuote disponible."
-                    ),
-                }
-
-            donnees = self.obtenir_donnees()
-
-            missing = [
-                tf
-                for tf in TIMEFRAMES
-                if not donnees.get(tf)
-            ]
-
-            if missing:
-
-                return {
-                    "status": "INSUFFICIENT_DATA",
-                    "missing_timeframes": missing,
-                }
-
-            cartographie = await self.analyser_marche(
-                donnees
-            )
-
-            # Couche liquidité : calculée immédiatement après la
-            # cartographie, avant les zones, sans modifier les règles
-            # de validation existantes.
-            liquidite = await self.analyser_liquidite(
-                cartographie,
-                current_price,
-            )
-
-            zones = await self.analyser_zones(
-                cartographie,
-                current_price,
-                liquidite,
-            )
-
-            contexte = await self.analyser_contexte(
-                donnees,
-                zones,
-                cartographie,
-                liquidite,
-            )
-
-            confluences = await self.analyser_confluences(
-                donnees,
-                zones,
-                contexte,
-                cartographie,
-                liquidite,
-            )
-
-            setups_result = await self.analyser_setups(
-                zones,
-                confluences,
-                contexte,
-                donnees,
-            )
-
-            if isinstance(setups_result, dict):
-                setups = (
-                    setups_result.get("setups")
-                    or setups_result.get("detected_setups")
-                    or []
-                )
-            elif isinstance(setups_result, (list, tuple)):
-                setups = list(setups_result)
-            else:
-                setups = (
-                    [setups_result]
-                    if setups_result is not None
-                    else []
-                )
-
-            if not setups:
-
-                result = {
-                    "status": "NO_SETUP",
-                    "symbol": self.symbol,
-                    "current_price": current_price,
-                    "cartographie": cartographie,
-                    "liquidite": liquidite,
-                    "zones": zones,
-                    "contexte": contexte,
-                    "confluences": confluences,
-                    "setups": [],
-                    "results": [],
-                    "signals": [],
-                }
-
-                self.last_analysis = result
-                return result
-
-            risk_result = await self.analyser_risque(
-                setups,
-                zones,
-                donnees,
-                current_price,
-            )
-
-            if isinstance(risk_result, dict):
-                risk_plans = (
-                    risk_result.get("plans")
-                    or risk_result.get("risk_plans")
-                    or risk_result.get("valid_plans")
-                    or []
-                )
-            elif isinstance(risk_result, (list, tuple)):
-                risk_plans = list(risk_result)
-            else:
-                risk_plans = []
-
-            results = []
-
-            for index, setup in enumerate(setups):
-
-                setup_id = self._get(
-                    setup,
-                    "setup_id",
-                )
-
-                risk_plan = None
-
-                if setup_id:
-
-                    for candidate in risk_plans:
-
-                        candidate_id = self._get(
-                            candidate,
-                            "setup_id",
-                        )
-
-                        if (
-                            candidate_id
-                            and candidate_id == setup_id
-                        ):
-                            risk_plan = candidate
-                            break
-
-                if risk_plan is None and index < len(risk_plans):
-                    risk_plan = risk_plans[index]
-
-                if risk_plan is None:
-
-                    results.append({
-                        "status": "NO_RISK_PLAN",
-                        "setup": setup,
-                    })
-
-                    continue
-
-                results.append(
-                    await self.traiter_setup(
-                        setup=setup,
-                        risk_plan=risk_plan,
-                        zones=zones,
-                        contexte=contexte,
-                        confluences=confluences,
-                        donnees=donnees,
-                        cartographie=cartographie,
-                        liquidite=liquidite,
-                    )
-                )
-
-            ready = [
-                item
-                for item in results
-                if item.get("status") == "SIGNAL_READY"
-            ]
-
-            waiting = [
-                item
-                for item in results
-                if item.get("status") == "WAITING_CONFIRMATION"
-            ]
-
-            if ready:
-                overall_status = "SIGNAL_READY"
-            elif waiting:
-                overall_status = "WAITING_CONFIRMATION"
-            else:
-                overall_status = "ANALYZED"
-
-            result = {
-                "status": overall_status,
-                "symbol": self.symbol,
-                "current_price": current_price,
-                "cartographie": cartographie,
-                "liquidite": liquidite,
-                "zones": zones,
-                "contexte": contexte,
-                "confluences": confluences,
-                "setups": setups,
-                "risk": risk_result,
-                "results": results,
-                "signals": [
-                    item["signal"]
-                    for item in ready
-                    if item.get("signal") is not None
-                ],
-            }
-
-            self.last_analysis = result
-
-            logger.info(
-                "Engine 2 terminé : %s",
-                overall_status,
-            )
-
-            return result
-
-    # ============================================================
-    # STREAM
-    # ============================================================
-
-    async def demarrer_stream(self) -> None:
-        await self._call(
-            self.stream.start
-        )
-
-    # ============================================================
-    # RUN
-    # ============================================================
-
-    async def run(
-        self,
-        analyse_interval_seconds: int = 10,
-    ) -> None:
-
-        if not self.initialized:
-
-            init = await self.initialiser()
-
-            if not init["success"]:
-                raise RuntimeError(
-                    "Impossible d'initialiser Engine 2."
-                )
-
-        self.running = True
-
-        stream_task = asyncio.create_task(
-            self.demarrer_stream()
-        )
-
-        try:
-
-            while self.running:
-
-                try:
-                    await self.analyser()
-                except Exception as exc:
-                    logger.exception(
-                        "Erreur analyse Engine 2 : %s",
-                        exc,
-                    )
-
-                await asyncio.sleep(
-                    max(
-                        1,
-                        int(analyse_interval_seconds),
-                    )
-                )
-
-        finally:
-
-            self.running = False
-
-            stream_task.cancel()
-
-            try:
-                await stream_task
-            except asyncio.CancelledError:
-                pass
-
-    # ============================================================
-    # STOP
-    # ============================================================
-
-    async def stop(self) -> None:
-
-        self.running = False
-
-        try:
-
-            result = self.stream.stop()
-
-            if inspect.isawaitable(result):
-                await result
-
-        except Exception as exc:
-
-            logger.warning(
-                "Erreur arrêt stream : %s",
-                exc,
-            )
-
-    # ============================================================
-    # STATUS
-    # ============================================================
-
-    def _cache_accepts_symbol_price(self) -> bool:
-        """Détecte si get_current_price accepte un symbole explicite."""
-        try:
-            import inspect as _inspect
-            signature = _inspect.signature(self.cache.get_current_price)
-            parameters = list(signature.parameters.values())
-            return any(
-                p.kind in (_inspect.Parameter.POSITIONAL_ONLY,
-                           _inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                           _inspect.Parameter.VAR_POSITIONAL)
-                for p in parameters
-            )
-        except Exception:
-            return False
-
-    def get_status(self) -> Dict[str, Any]:
-
-        try:
-            cache_status = self.cache.get_status()
-        except Exception:
-            cache_status = {}
-
-        try:
-            antispam_status = self.antispam.get_status()
-        except Exception:
-            antispam_status = {}
-
-        return {
-            "engine": ENGINE_NAME,
-            "symbol": self.symbol,
-            "source": "BiQuote",
-            "running": self.running,
-            "initialized": self.initialized,
-            "current_price": (
-                self.cache.get_current_price(self.symbol)
-                if self._cache_accepts_symbol_price()
-                else self.cache.get_current_price()
-            ),
-            "timeframes": list(TIMEFRAMES),
-            "liquidity_layer": True,
-            "liquidity_blocking": False,
-            "cache": cache_status,
-            "antispam": antispam_status,
-        }
-
-
-async def analyser_xauusd() -> Dict[str, Any]:
-
-    moteur = Moteur2()
-
-    try:
-
-        init = await moteur.initialiser()
-
-        if not init["success"]:
-            return init
-
-        return await moteur.analyser()
-
-    finally:
-        await moteur.stop()
-
-
-async def main() -> None:
-    """Point d'entrée principal : analyse globale des 4 actifs."""
-    moteur = obtenir_moteur2_global()
-    try:
-        init = await moteur.initialiser()
-        print(init)
-        if not init.get("success", False):
-            return
-        result = await moteur.analyser()
-        print(result)
-    finally:
-        await moteur.stop()
-
-
-# ============================================================================
-# NOVA ENGINE 2 — ORCHESTRATEUR GLOBAL MULTI-ACTIFS
-# ============================================================================
-
-class Moteur2Global:
-    """Orchestrateur global multi-actifs d'Engine 2."""
-
-    def __init__(self, symbols=None, max_signals: int = 3, parallel: bool = True,
-                 analysis_interval_seconds: int = 900) -> None:
-        from moteur2_multi_actifs import Moteur2MultiActifs
-        from moteur2_ranking import Moteur2Ranking
-
-        if symbols is None:
-            symbols = list(SUPPORTED_SYMBOLS)
-
-        self.symbols = tuple(
-            str(symbol).strip().upper().replace('/', '').replace(' ', '')
-            .replace('-', '').replace('_', '')
-            for symbol in symbols
-        )
-        invalid = [s for s in self.symbols if s not in SUPPORTED_SYMBOLS]
-        if invalid:
-            raise ValueError(f"Symboles non supportés : {', '.join(invalid)}")
-
-        self.max_signals = min(
-            MAX_SIGNALS_PER_CYCLE,
-            max(1, int(max_signals)),
-        )
-        self.parallel = bool(parallel)
-        self.analysis_interval_seconds = max(1, int(analysis_interval_seconds))
-        self.multi_actifs = Moteur2MultiActifs(
-            symbols=self.symbols,
-            analysis_interval_seconds=self.analysis_interval_seconds,
-            parallel=self.parallel,
-        )
-        self.ranking = Moteur2Ranking(max_signals=self.max_signals)
-        self.initialized = False
-        self.running = False
-        self.last_cycle: Optional[Dict[str, Any]] = None
-        self.last_ranking: Optional[Dict[str, Any]] = None
-        self.analysis_lock = asyncio.Lock()
-
-    async def initialiser(self) -> Dict[str, Any]:
-        try:
-            result = await self.multi_actifs.initialiser()
-            initialized_symbols = result.get('initialized_symbols', [])
-            self.initialized = bool(initialized_symbols)
-            return {
-                'success': self.initialized,
-                'engine': ENGINE_NAME,
-                'module': 'moteur2_global',
-                'symbols': list(self.symbols),
-                'initialized_symbols': initialized_symbols,
-                'failed_symbols': result.get('failed_symbols', []),
-                'max_signals': self.max_signals,
-                'analysis_interval_seconds': self.analysis_interval_seconds,
-                'forced_signal': False,
-                'ranking_is_decision_maker': False,
-                'quality_is_blocking': False,
-                'results': result.get('results', {}),
-            }
-        except Exception as exc:
-            logger.exception('Erreur initialisation Engine 2 Global : %s', exc)
-            self.initialized = False
-            return {'success': False, 'engine': ENGINE_NAME,
-                    'module': 'moteur2_global', 'symbols': list(self.symbols),
-                    'error': str(exc)}
-
-    async def demarrer_streams(self) -> Dict[str, Any]:
-        try:
-            return await self.multi_actifs.demarrer_streams()
-        except Exception as exc:
-            logger.exception('Erreur démarrage streams globaux : %s', exc)
-            return {'success': False, 'error': str(exc)}
-
-    async def analyser(self) -> Dict[str, Any]:
-        async with self.analysis_lock:
-            if not self.initialized:
-                init = await self.initialiser()
-                if not init.get('success', False):
-                    return {'status': 'INITIALIZATION_ERROR', 'engine': ENGINE_NAME,
-                            'signals': [], 'error': init.get('error', 'Initialisation impossible.')}
-            try:
-                cycle = await self.multi_actifs.analyser_tous()
-                self.last_cycle = cycle
-                ranking = self.ranking.ranker(cycle)
-                self.last_ranking = ranking
-                signals = ranking.get('signals', [])
-                return {
-                    'status': 'SIGNALS_AVAILABLE' if signals else 'NO_GLOBAL_SIGNAL',
-                    'engine': ENGINE_NAME,
-                    'module': 'moteur2_global',
-                    'symbols': list(self.symbols),
-                    'max_signals': self.max_signals,
-                    'daily_signal_target': DAILY_SIGNAL_TARGET,
-                    'signals': signals,
-                    'signal_count': len(signals),
-                    'candidates_count': ranking.get('candidate_count', 0),
-                    'selected_count': ranking.get('selected_count', 0),
-                    'cycle': cycle,
-                    'ranking': ranking,
-                    'forced_signal': False,
-                    'quality_is_blocking': False,
-                    'ranking_is_decision_maker': False,
-                    'auto_execution': False,
-                    'decision_owner': 'moteur2_decision.py',
-                    'risk_owner': 'moteur2_risk.py',
-                    'validation_owner': 'moteur2_validation.py',
-                    'ranking_owner': 'moteur2_ranking.py',
-                }
-            except Exception as exc:
-                logger.exception('Erreur analyse Engine 2 Global : %s', exc)
-                return {'status': 'GLOBAL_ENGINE_ERROR', 'engine': ENGINE_NAME,
-                        'module': 'moteur2_global', 'signals': [], 'signal_count': 0,
-                        'error': str(exc), 'forced_signal': False, 'auto_execution': False}
-
-    async def analyser_symbol(self, symbol: str) -> Dict[str, Any]:
-        """Analyse l'actif demandé via le moteur global multi-actifs.
-
-        Cette méthode est une compatibilité pour l'interface Telegram :
-        le moteur global analyse toujours le portefeuille des 4 actifs, puis
-        retourne uniquement le résultat de l'actif demandé.
-        Elle ne modifie ni la stratégie, ni le ranking, ni les critères de validation.
-        """
+            return None
         normalized = (
-            str(symbol).strip().upper()
-            .replace('/', '')
-            .replace(' ', '')
-            .replace('-', '')
-            .replace('_', '')
+            symbol.upper()
+            .replace("/", "")
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+            .strip()
         )
-
-        if normalized not in self.symbols:
-            return {
-                'status': 'UNSUPPORTED_SYMBOL',
-                'engine': ENGINE_NAME,
-                'symbol': normalized,
-                'signals': [],
-                'error': f'Symbole non supporté : {normalized}',
-            }
-
-        global_result = await self.analyser()
-        cycle = global_result.get('cycle') or self.last_cycle or {}
-        results = cycle.get('results') or {}
-
-        # Compatibilité avec les deux formes possibles de stockage.
-        result = results.get(normalized)
-        if result is None:
-            for key, value in results.items():
-                key_normalized = (
-                    str(key).strip().upper()
-                    .replace('/', '')
-                    .replace(' ', '')
-                    .replace('-', '')
-                    .replace('_', '')
-                )
-                if key_normalized == normalized:
-                    result = value
-                    break
-
-        if result is None:
-            return {
-                'status': 'SYMBOL_RESULT_UNAVAILABLE',
-                'engine': ENGINE_NAME,
-                'symbol': normalized,
-                'signals': [],
-                'global_status': global_result.get('status'),
-                'error': f'Aucun résultat disponible pour {normalized}.',
-            }
-
-        return result
-
-    def obtenir_top_signaux(self) -> List[Any]:
-        if not self.last_ranking:
-            return []
-        return self.last_ranking.get('signals', [])
-
-    def get_status(self) -> Dict[str, Any]:
-        try:
-            multi_status = self.multi_actifs.get_status()
-        except Exception as exc:
-            multi_status = {'status': 'ERROR', 'error': str(exc)}
-        try:
-            ranking_status = self.ranking.get_status()
-        except Exception as exc:
-            ranking_status = {'status': 'ERROR', 'error': str(exc)}
-        return {
-            'engine': ENGINE_NAME, 'module': 'moteur2_global',
-            'symbols': list(self.symbols), 'symbol_count': len(self.symbols),
-            'initialized': self.initialized, 'running': self.running,
-            'max_signals': self.max_signals,
-            'daily_signal_target': DAILY_SIGNAL_TARGET,
-            'analysis_interval_seconds': self.analysis_interval_seconds,
-            'forced_signal': False, 'quality_is_blocking': False,
-            'ranking_is_decision_maker': False, 'auto_execution': False,
-            'multi_actifs': multi_status, 'ranking': ranking_status,
-            'last_signal_count': len(self.obtenir_top_signaux()),
-        }
-
-    async def run(self, analysis_interval_seconds: Optional[int] = None,
-                  start_streams: bool = True) -> None:
-        if not self.initialized:
-            init = await self.initialiser()
-            if not init.get('success', False):
-                raise RuntimeError('Impossible d\'initialiser Engine 2 Global.')
-        self.running = True
-        interval = self.analysis_interval_seconds if analysis_interval_seconds is None else max(1, int(analysis_interval_seconds))
-        stream_task = None
-        try:
-            if start_streams:
-                stream_task = asyncio.create_task(self.demarrer_streams())
-            while self.running:
-                try:
-                    await self.analyser()
-                except Exception as exc:
-                    logger.exception('Erreur cycle global : %s', exc)
-                await asyncio.sleep(interval)
-        finally:
-            self.running = False
-            if stream_task is not None:
-                stream_task.cancel()
-                try:
-                    await stream_task
-                except asyncio.CancelledError:
-                    pass
-
-    async def stop(self) -> None:
-        self.running = False
-        try:
-            await self.multi_actifs.stop()
-        except Exception as exc:
-            logger.warning('Erreur arrêt Engine 2 Global : %s', exc)
-
-
+        if not normalized:
+            return None
+        return normalized
 # ============================================================================
-# INSTANCE GLOBALE LAZY
+# FONCTION SIMPLE
 # ============================================================================
-
-_moteur2_global: Optional[Moteur2Global] = None
-
-
-def obtenir_moteur2_global() -> Moteur2Global:
-    global _moteur2_global
-    if _moteur2_global is None:
-        _moteur2_global = Moteur2Global(
-            symbols=SUPPORTED_SYMBOLS,
-            max_signals=3,
-            parallel=True,
-            analysis_interval_seconds=900,
+def cartographier_marche(
+    candles_by_timeframe: Dict[
+        str,
+        List[Candle],
+    ],
+    symbol: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Fonction pratique.
+    Exemple :
+        cartographier_marche(
+            candles_by_timeframe,
+            symbol="EURUSD",
         )
-    return _moteur2_global
-
-
-async def initialiser_engine2_global() -> Dict[str, Any]:
-    return await obtenir_moteur2_global().initialiser()
-
-
-async def demarrer_streams_engine2_global() -> Dict[str, Any]:
-    return await obtenir_moteur2_global().demarrer_streams()
-
-
-async def analyser_engine2_global() -> Dict[str, Any]:
-    return await obtenir_moteur2_global().analyser()
-
-
-async def arreter_engine2_global() -> None:
-    await obtenir_moteur2_global().stop()
-
-
-def statut_engine2_global() -> Dict[str, Any]:
-    return obtenir_moteur2_global().get_status()
-
-
-def top_signaux_engine2_global() -> List[Any]:
-    return obtenir_moteur2_global().obtenir_top_signaux()
-
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
-if __name__ == '__main__':
-    asyncio.run(main())
+    """
+    moteur = Moteur2Marche()
+    return moteur.analyser(
+        candles_by_timeframe,
+        symbol=symbol,
+    )
