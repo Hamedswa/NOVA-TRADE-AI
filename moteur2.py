@@ -10,7 +10,7 @@ Source marché : BiQuote uniquement.
 Pipeline :
 BiQuote → Cache → Cartographie → Zones → Contexte →
 Confluences → Setups → Risk → Confirmation M5/M1 →
-Score → Validation → Anti-spam → Signal.
+Score → Validation technique → Decision Engine → Anti-spam → Signal.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from moteur2_score import Moteur2Score
 from moteur2_validation import Moteur2Validation
 from moteur2_antispam import Moteur2AntiSpam
 from moteur2_signal import Moteur2Signal
+from moteur2_decision import Moteur2Decision
 
 
 SYMBOL = "XAUUSD"
@@ -104,6 +105,7 @@ class Moteur2:
         self.validation = Moteur2Validation()
         self.antispam = Moteur2AntiSpam()
         self.signal = Moteur2Signal()
+        self.decision = Moteur2Decision()
 
         self.running = False
         self.initialized = False
@@ -454,6 +456,8 @@ class Moteur2:
         contexte: Any,
         confluences: Any,
         donnees: Dict[str, Any],
+        cartographie: Any = None,
+        liquidite: Any = None,
     ) -> Dict[str, Any]:
 
         confirmation = await self.analyser_confirmation(
@@ -509,6 +513,112 @@ class Moteur2:
                 "confirmation": confirmation,
                 "score": score_result,
                 "validation": validation,
+                "decision": None,
+            }
+
+        # --------------------------------------------------------
+        # DECISION ENGINE
+        # --------------------------------------------------------
+        # Le Decision Engine est le propriétaire de la décision
+        # stratégique BUY / SELL / WAIT.
+        # Il ne fabrique aucun prix et ne remplace ni Risk, ni Validation.
+        # La cartographie sert de structure/marché et la liquidité
+        # d'intelligence de marché descriptive.
+        try:
+            decision_result = await self._call(
+                self.decision.analyser,
+                setup=setup,
+                contexte=contexte,
+                zones=zones,
+                structure=cartographie,
+                confluences=confluences,
+                risk_plan=risk_plan,
+                score_result=score_result,
+                validation_result=validation,
+                confirmation_result=confirmation,
+                market_intelligence={
+                    "cartographie": cartographie,
+                    "liquidite": liquidite,
+                },
+            )
+        except TypeError:
+            # Compatibilité avec une version du Decision Engine
+            # n'acceptant pas encore tous les champs optionnels.
+            decision_result = await self._call(
+                self.decision.analyser,
+                setup=setup,
+                contexte=contexte,
+                zones=zones,
+                structure=cartographie,
+                confluences=confluences,
+                risk_plan=risk_plan,
+                score_result=score_result,
+                validation_result=validation,
+                confirmation_result=confirmation,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Decision Engine erreur pour %s: %s",
+                self.symbol,
+                exc,
+            )
+            return {
+                "status": "DECISION_ENGINE_ERROR",
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation,
+                "score": score_result,
+                "validation": validation,
+                "decision": None,
+                "error": str(exc),
+            }
+
+        decision = str(
+            self._get(decision_result, "decision", "WAIT")
+        ).upper()
+        setup_direction = str(
+            self._get(setup, "direction", "")
+        ).upper()
+
+        if decision not in {"BUY", "SELL", "WAIT"}:
+            decision = "WAIT"
+
+        decision_confidence = self._get(
+            decision_result, "confidence", None
+        )
+        logger.info(
+            "DECISION ENGINE : %s | setup=%s | decision=%s | confidence=%s",
+            self.symbol,
+            self._get(setup, "setup_id", "SETUP"),
+            decision,
+            decision_confidence,
+        )
+
+        # Le moteur stratégique doit rester cohérent avec le sens du setup.
+        # Une divergence devient WAIT, jamais un retournement artificiel.
+        if decision in {"BUY", "SELL"} and setup_direction in {"BUY", "SELL"}:
+            if decision != setup_direction:
+                return {
+                    "status": "DECISION_WAIT",
+                    "setup": setup,
+                    "risk": risk_plan,
+                    "confirmation": confirmation,
+                    "score": score_result,
+                    "validation": validation,
+                    "decision": decision_result,
+                    "signal": None,
+                }
+
+        if decision == "WAIT":
+            return {
+                "status": "DECISION_WAIT",
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation,
+                "score": score_result,
+                "validation": validation,
+                "decision": decision_result,
+                "signal": None,
             }
 
         # --------------------------------------------------------
@@ -528,6 +638,7 @@ class Moteur2:
                 "confirmation": confirmation,
                 "score": score_result,
                 "validation": validation,
+                "decision": decision_result,
                 "signal": None,
             }
 
@@ -556,6 +667,7 @@ class Moteur2:
                 "confirmation": confirmation,
                 "score": score_result,
                 "validation": validation,
+                "decision": decision_result,
                 "antispam": antispam,
                 "signal": None,
             }
@@ -588,6 +700,7 @@ class Moteur2:
                 "confirmation": confirmation,
                 "score": score_result,
                 "validation": validation,
+                "decision": decision_result,
                 "antispam": antispam,
                 "signal": None,
             }
@@ -610,6 +723,7 @@ class Moteur2:
             "confirmation": confirmation,
             "score": score_result,
             "validation": validation,
+            "decision": decision_result,
             "antispam": antispam,
         }
 
@@ -795,6 +909,8 @@ class Moteur2:
                         contexte=contexte,
                         confluences=confluences,
                         donnees=donnees,
+                        cartographie=cartographie,
+                        liquidite=liquidite,
                     )
                 )
 
