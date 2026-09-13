@@ -2,9 +2,9 @@
 NOVA TRADE AI — ENGINE 2
 moteur2.py
 
-Orchestrateur corrigé.
+Orchestrateur Engine 2 multi-actifs.
 
-XAUUSD uniquement.
+Actifs : XAUUSD, BTCUSD, EURUSD, GBPUSD.
 Source marché : BiQuote uniquement.
 
 Pipeline :
@@ -998,24 +998,16 @@ async def analyser_xauusd() -> Dict[str, Any]:
 
 
 async def main() -> None:
-
-    moteur = Moteur2()
-
+    """Point d'entrée principal : analyse globale des 4 actifs."""
+    moteur = obtenir_moteur2_global()
     try:
-
         init = await moteur.initialiser()
-
         print(init)
-
-        if not init["success"]:
+        if not init.get("success", False):
             return
-
         result = await moteur.analyser()
-
         print(result)
-
     finally:
-
         await moteur.stop()
 
 
