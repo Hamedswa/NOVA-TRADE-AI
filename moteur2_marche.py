@@ -285,6 +285,8 @@ class Moteur2Marche:
         )
         result["global"]["trend_summary"] = self._build_trend_summary(result["timeframes"])
         result["global"]["multi_timeframe"] = self._build_multi_timeframe_summary(result["timeframes"])
+        result["global"]["market_reading"] = self._build_market_reading(result["timeframes"])
+        result["global"]["possibilities"] = self._build_market_possibilities(result)
         return result
     # =========================================================================
     # ANALYSE D'UN TIMEFRAME
@@ -509,6 +511,7 @@ class Moteur2Marche:
         closes = [float(c.close) for c in candles]
         if len(closes) < 6:
             return {"state": "INDETERMINE", "trend": "NEUTRE", "confidence": 0.0}
+
         short = closes[-min(5, len(closes)):]
         mid_n = min(12, len(closes))
         mid = closes[-mid_n:]
@@ -517,8 +520,14 @@ class Moteur2Marche:
         avg = self._average_candle_range(candles[-min(20, len(candles)):])
         if avg <= 0:
             avg = max(abs(closes[-1]) * 0.0001, 1e-12)
+
         strength = min(abs(mid_move) / avg / 3.0, 1.0)
-        trend = "HAUSSIER" if mid_move > avg * 0.8 else "BAISSIER" if mid_move < -avg * 0.8 else "NEUTRE"
+        trend = (
+            "HAUSSIER" if mid_move > avg * 0.8
+            else "BAISSIER" if mid_move < -avg * 0.8
+            else "NEUTRE"
+        )
+
         if ranges:
             state = "RANGE"
         elif impulses and abs(short_move) >= avg * 1.2:
@@ -531,13 +540,102 @@ class Moteur2Marche:
             state = "TRANSITION"
         else:
             state = "TRANSITION"
+
+        recent_avg = self._average_candle_range(candles[-min(6, len(candles)):])
+        previous_slice = candles[-min(12, len(candles)):-min(6, len(candles))]
+        previous_avg = self._average_candle_range(previous_slice) if previous_slice else recent_avg
+        volatility_ratio = recent_avg / max(previous_avg, 1e-12)
+
+        if abs(short_move) < avg * 0.35 and abs(mid_move) < avg * 0.80:
+            phase = "COMPRESSION"
+        elif state == "IMPULSION":
+            phase = "EXPANSION"
+        elif state == "CORRECTION":
+            phase = "CORRECTION"
+        elif state == "RANGE":
+            phase = "ROTATION"
+        elif state == "TENDANCE":
+            phase = "DIRECTIONAL"
+        else:
+            phase = "TRANSITION"
+
+        change = (
+            "ACCELERATION" if volatility_ratio >= 1.20 and abs(short_move) > abs(mid_move) / 2.0
+            else "DECELERATION" if volatility_ratio <= 0.80
+            else "STABLE"
+        )
+
         return {
             "state": state,
             "trend": trend,
             "confidence": round(strength, 3),
             "short_move": short_move,
             "medium_move": mid_move,
+            "phase": phase,
+            "volatility_ratio": round(volatility_ratio, 3),
+            "change": change,
         }
+
+    def _build_market_reading(self, timeframes: Dict[str, Any]) -> Dict[str, Any]:
+        states: Dict[str, Any] = {}
+        phases: Dict[str, Any] = {}
+        momentum: Dict[str, Any] = {}
+        volatility: Dict[str, Any] = {}
+        pressure: Dict[str, Any] = {}
+
+        for tf, item in timeframes.items():
+            states[tf] = item.get("market_state", {}).get("state", "INDETERMINE")
+            phases[tf] = item.get("market_state", {}).get("phase", "INDETERMINE")
+            momentum[tf] = item.get("momentum", {})
+            volatility[tf] = item.get("volatility", {})
+            pressure[tf] = item.get("pressure", {})
+
+        return {
+            "states": states,
+            "phases": phases,
+            "momentum": momentum,
+            "volatility": volatility,
+            "pressure": pressure,
+            "adaptive": True,
+        }
+
+    def _build_market_possibilities(self, result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        possibilities: List[Dict[str, Any]] = []
+
+        for tf, item in result.get("timeframes", {}).items():
+            state = item.get("market_state", {})
+            phase = state.get("phase", "INDETERMINE")
+            trend = state.get("trend", "NEUTRE")
+            change = state.get("change", "STABLE")
+            market_state = state.get("state")
+
+            mapping = {
+                "IMPULSION": "MOMENTUM_EXPANSION",
+                "CORRECTION": "CORRECTION_PHASE",
+                "RANGE": "RANGE_ROTATION",
+                "TRANSITION": "REGIME_TRANSITION",
+                "TENDANCE": "DIRECTIONAL_DEVELOPMENT",
+            }
+            possibility_type = mapping.get(market_state)
+            if possibility_type:
+                possibilities.append({
+                    "type": possibility_type,
+                    "timeframe": tf,
+                    "direction": trend,
+                    "phase": phase,
+                    "change": change,
+                })
+
+            if change in ("ACCELERATION", "DECELERATION"):
+                possibilities.append({
+                    "type": "RHYTHM_CHANGE",
+                    "timeframe": tf,
+                    "direction": trend,
+                    "phase": phase,
+                    "change": change,
+                })
+
+        return possibilities
 
     def _measure_momentum(self, candles: List[Candle], timeframe: str) -> Dict[str, Any]:
         n = min(MOVEMENT_LOOKBACK.get(timeframe, 10), len(candles))
