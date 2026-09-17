@@ -30,8 +30,8 @@ PRIMARY_TIMEFRAMES = ("H4", "H1", "M15")
 # Seuils volontairement souples : ils servent à éviter les scénarios
 # totalement dépourvus d'information, pas à fabriquer un filtre dur.
 MIN_DIRECTIONAL_STRENGTH = 10.0
-MIN_SCENARIO_CONFIDENCE = 42.0
-MAX_SETUPS_PER_ZONE = 4
+MIN_SCENARIO_CONFIDENCE = 0.0
+MAX_SETUPS_PER_ZONE = 8
 
 ZONE_DISTANCE_RANGE_MULTIPLIER = 1.35
 BREAKOUT_BUFFER_RANGE_MULTIPLIER = 0.30
@@ -401,6 +401,10 @@ class Moteur2Setups:
 
         # Une zone peut produire plusieurs lectures : on garde les meilleures
         # sans imposer un seul modèle au marché.
+        # Les scénarios faibles restent observables : cette couche ne doit
+        # pas supprimer une possibilité uniquement parce qu'elle passe sous
+        # un seuil de confiance arbitraire. Le classement ultérieur décidera
+        # de l'attention à lui accorder.
         candidates = [
             item
             for item in candidates
