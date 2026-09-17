@@ -233,7 +233,20 @@ class Moteur2Scenarios:
         )
 
         # --------------------------------------------------------------
-        # 4. TRANSITION / INVERSION
+        # 4. POSSIBILITÉS LIÉES À L'ÉTAT DU MARCHÉ
+        # --------------------------------------------------------------
+
+        scenarios.extend(
+            self._build_state_possibilities(
+                symbol=symbol,
+                intelligence=intelligence_data,
+                contexte=contexte,
+                radar=radar_data,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # 5. TRANSITION / INVERSION
         # --------------------------------------------------------------
 
         scenarios.extend(
@@ -245,7 +258,7 @@ class Moteur2Scenarios:
         )
 
         # --------------------------------------------------------------
-        # 5. SCÉNARIOS EXISTANTS
+        # 6. SCÉNARIOS EXISTANTS
         # --------------------------------------------------------------
 
         scenarios.extend(
@@ -256,7 +269,7 @@ class Moteur2Scenarios:
         )
 
         # --------------------------------------------------------------
-        # 6. SETUPS DÉJÀ DÉTECTÉS
+        # 7. SETUPS DÉJÀ DÉTECTÉS
         # --------------------------------------------------------------
 
         scenarios.extend(
@@ -267,7 +280,7 @@ class Moteur2Scenarios:
         )
 
         # --------------------------------------------------------------
-        # 7. NETTOYAGE
+        # 8. NETTOYAGE
         # --------------------------------------------------------------
 
         scenarios = self._deduplicate(
@@ -554,6 +567,203 @@ class Moteur2Scenarios:
                 ],
             )
         )
+
+        return scenarios
+
+    # ==================================================================
+    # POSSIBILITÉS LIÉES À L'ÉTAT DU MARCHÉ
+    # ==================================================================
+
+    def _build_state_possibilities(
+        self,
+        symbol: str,
+        intelligence: Dict[str, Any],
+        contexte: Dict[str, Any],
+        radar: List[Dict[str, Any]],
+    ) -> List[Scenario]:
+        """
+        Décrit des possibilités directement à partir de l'état observé.
+
+        Cette couche ne demande pas qu'un setup prédéfini existe. Elle
+        conserve donc des hypothèses de marché même lorsqu'aucune famille
+        de setup n'est détectée. Elle reste descriptive et non bloquante.
+        """
+
+        scenarios: List[Scenario] = []
+
+        regime = _text(
+            intelligence.get("market_regime")
+            or contexte.get("market_regime")
+        )
+
+        volatility = _text(
+            intelligence.get("volatility")
+            or contexte.get("volatility")
+        )
+
+        pressure = _text(
+            intelligence.get("pressure")
+            or intelligence.get("market_pressure")
+            or contexte.get("pressure")
+        )
+
+        momentum = _text(
+            intelligence.get("momentum")
+        )
+
+        if regime in ("RANGE", "RANGING", "CONSOLIDATION"):
+            scenarios.append(
+                Scenario(
+                    symbol=symbol,
+                    scenario_id="RANGE_REACTION_POSSIBILITY",
+                    scenario_type="MARKET_STATE",
+                    direction="NEUTRAL",
+                    probability=50.0,
+                    priority=3,
+                    state="OBSERVATION",
+                    trigger_conditions=[
+                        "Observer les réactions aux extrémités et au centre de la zone de marché."
+                    ],
+                    invalidation_conditions=[
+                        "Le régime de marché quitte clairement la phase de range."
+                    ],
+                    evidence=[
+                        f"Régime observé : {regime}."
+                    ],
+                    opportunities=[
+                        {
+                            "type": "RANGE_REACTION",
+                            "direction": "NEUTRAL",
+                        }
+                    ],
+                    metadata={"source": "market_state"},
+                )
+            )
+
+        if regime in ("TRENDING", "TREND") and momentum:
+            direction = "BUY" if momentum == "STRONG" else (
+                "SELL" if momentum == "STRONG_NEGATIVE" else "NEUTRAL"
+            )
+            scenarios.append(
+                Scenario(
+                    symbol=symbol,
+                    scenario_id="TREND_EXPANSION_POSSIBILITY",
+                    scenario_type="MARKET_STATE",
+                    direction=direction,
+                    probability=50.0,
+                    priority=3,
+                    state="OBSERVATION",
+                    trigger_conditions=[
+                        "Observer la capacité du mouvement à poursuivre son expansion."
+                    ],
+                    invalidation_conditions=[
+                        "Perte de cohérence du régime directionnel."
+                    ],
+                    evidence=[
+                        f"Régime : {regime}.",
+                        f"Momentum : {momentum}.",
+                    ],
+                    opportunities=[
+                        {
+                            "type": "TREND_EXPANSION",
+                            "direction": direction,
+                        }
+                    ],
+                    metadata={"source": "market_state"},
+                )
+            )
+
+        if volatility in ("HIGH", "ELEVATED", "EXPANDING"):
+            scenarios.append(
+                Scenario(
+                    symbol=symbol,
+                    scenario_id="VOLATILITY_EXPANSION_POSSIBILITY",
+                    scenario_type="VOLATILITY",
+                    direction="NEUTRAL",
+                    probability=50.0,
+                    priority=4,
+                    state="WATCHING",
+                    trigger_conditions=[
+                        "Observer si l'expansion de volatilité produit une accélération ou une réaction."
+                    ],
+                    invalidation_conditions=[
+                        "Retour durable de la volatilité vers un régime plus calme."
+                    ],
+                    evidence=[
+                        f"Volatilité observée : {volatility}."
+                    ],
+                    opportunities=[
+                        {
+                            "type": "VOLATILITY_EXPANSION",
+                            "direction": "NEUTRAL",
+                        }
+                    ],
+                    metadata={"source": "market_state"},
+                )
+            )
+
+        if pressure in ("BUY", "SELL", "BULLISH", "BEARISH"):
+            pressure_direction = (
+                "BUY" if pressure in ("BUY", "BULLISH") else "SELL"
+            )
+            scenarios.append(
+                Scenario(
+                    symbol=symbol,
+                    scenario_id="PRESSURE_RESPONSE_POSSIBILITY",
+                    scenario_type="PRESSURE",
+                    direction=pressure_direction,
+                    probability=50.0,
+                    priority=4,
+                    state="OBSERVATION",
+                    trigger_conditions=[
+                        "Observer si la pression dominante se maintient ou s'épuise."
+                    ],
+                    invalidation_conditions=[
+                        "Renversement clair de la pression dominante."
+                    ],
+                    evidence=[
+                        f"Pression observée : {pressure}."
+                    ],
+                    opportunities=[
+                        {
+                            "type": "PRESSURE_RESPONSE",
+                            "direction": pressure_direction,
+                        }
+                    ],
+                    metadata={"source": "market_state"},
+                )
+            )
+
+        # Les événements Radar sont utilisés comme éléments d'observation
+        # supplémentaires, sans transformer leur présence en filtre.
+        if radar:
+            scenarios.append(
+                Scenario(
+                    symbol=symbol,
+                    scenario_id="RADAR_EVOLUTION_POSSIBILITY",
+                    scenario_type="OBSERVATION",
+                    direction="NEUTRAL",
+                    probability=50.0,
+                    priority=5,
+                    state="WATCHING",
+                    trigger_conditions=[
+                        "Continuer à observer l'évolution des événements détectés."
+                    ],
+                    invalidation_conditions=[
+                        "Disparition ou neutralisation des événements observés."
+                    ],
+                    evidence=[
+                        f"Événements Radar disponibles : {len(radar)}."
+                    ],
+                    opportunities=[
+                        {
+                            "type": "RADAR_EVOLUTION",
+                            "direction": "NEUTRAL",
+                        }
+                    ],
+                    metadata={"source": "moteur2_radar.py"},
+                )
+            )
 
         return scenarios
 
