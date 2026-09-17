@@ -185,7 +185,7 @@ class Moteur2Intelligence:
     def __init__(
         self,
         reference_score: float = 60.0,
-        reference_rr: float = 3.0,
+        reference_rr: float = 0.0,
     ) -> None:
 
         self.reference_score = float(reference_score)
@@ -340,6 +340,12 @@ class Moteur2Intelligence:
             result=result,
             zones=result.important_zones,
             confluences=confluences_list,
+        )
+
+        # Une possibilité peut exister même sans setup prédéfini.
+        # Cette couche conserve ces observations pour les niveaux supérieurs.
+        result.opportunities.extend(
+            self._build_autonomous_possibilities(result)
         )
 
         # --------------------------------------------------------------
@@ -994,6 +1000,61 @@ class Moteur2Intelligence:
             })
 
         return opportunities
+
+    def _build_autonomous_possibilities(
+        self,
+        result: IntelligenceResult,
+    ) -> List[Dict[str, Any]]:
+        """
+        Décrit des possibilités issues directement de l'état du marché.
+
+        Elles ne dépendent pas d'un setup prédéfini et ne constituent
+        ni un signal ni un filtre. Elles sont conservées comme matière
+        première pour les couches Opportunités/Plan/Decision.
+        """
+        possibilities: List[Dict[str, Any]] = []
+
+        if result.market_regime == "RANGE":
+            possibilities.append({
+                "type": "RANGE_INTERACTION",
+                "direction": "NEUTRAL",
+                "state": "OBSERVE_BOUNDARIES",
+                "reason": "Le régime latéral ouvre plusieurs possibilités autour des zones et bornes observées.",
+            })
+
+        if result.market_regime == "TRENDING" and result.directional_bias in ("BUY", "SELL"):
+            possibilities.append({
+                "type": "TREND_EVOLUTION",
+                "direction": result.directional_bias,
+                "state": "CONTINUATION_OR_CORRECTION",
+                "reason": "La dynamique directionnelle peut poursuivre son mouvement ou entrer en correction selon les nouvelles observations.",
+            })
+
+        if result.market_regime == "TRANSITION":
+            possibilities.append({
+                "type": "REGIME_TRANSITION",
+                "direction": result.directional_bias,
+                "state": "CHANGE_UNDER_OBSERVATION",
+                "reason": "Le comportement du marché évolue ; plusieurs trajectoires restent ouvertes.",
+            })
+
+        if result.volatility in ("HIGH", "EXTREME"):
+            possibilities.append({
+                "type": "VOLATILITY_EXPANSION",
+                "direction": result.directional_bias,
+                "state": "EXPANSION",
+                "reason": "L'augmentation de volatilité peut produire des mouvements rapides dans plusieurs directions.",
+            })
+
+        if result.pressure in ("BUYERS", "SELLERS"):
+            possibilities.append({
+                "type": "PRESSURE_DEVELOPMENT",
+                "direction": "BUY" if result.pressure == "BUYERS" else "SELL",
+                "state": "PRESSURE_DOMINANT",
+                "reason": "Une pression dominante est observée mais reste susceptible d'évoluer avec les nouvelles données.",
+            })
+
+        return possibilities
 
     # ------------------------------------------------------------------
     # RISQUES
