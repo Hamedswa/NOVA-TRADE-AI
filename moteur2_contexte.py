@@ -199,6 +199,12 @@ class Moteur2Contexte:
             zone_context=zone_context,
             liquidity_context=liquidity_context,
         )
+        contextual_possibilities = self._build_contextual_possibilities(
+            global_context=global_context,
+            market_context=market_context,
+            zone_context=zone_context,
+            liquidity_context=liquidity_context,
+        )
         return {
             "symbol": resolved_symbol,
             "timeframes": contexts,
@@ -209,6 +215,7 @@ class Moteur2Contexte:
             "market_context": market_context,
             "liquidity_context": liquidity_context,
             "contextual_environment": contextual_environment,
+            "contextual_possibilities": contextual_possibilities,
             "descriptive_only": True,
             "blocking": False,
         }
@@ -1019,6 +1026,92 @@ class Moteur2Contexte:
             "decision": False,
             "blocking": False,
         }
+
+    # -----------------------------------------------------------------------
+    # POSSIBILITÉS CONTEXTUELLES
+    # -----------------------------------------------------------------------
+    def _build_contextual_possibilities(
+        self,
+        global_context: GlobalContext,
+        market_context: Dict[str, Any],
+        zone_context: Dict[str, Any],
+        liquidity_context: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Décrit plusieurs évolutions plausibles du contexte observé.
+
+        Cette couche ne sélectionne pas un scénario gagnant et ne bloque
+        aucune possibilité. Elle donne simplement aux couches suivantes
+        une représentation plus riche de ce que le marché peut développer.
+        """
+        possibilities: List[Dict[str, Any]] = []
+        state = str(
+            market_context.get("market_state", global_context.state)
+            or ""
+        ).upper()
+        direction = str(global_context.direction or "NEUTRE").upper()
+        alignment = str(global_context.alignment or "NONE").upper()
+
+        if direction in ("HAUSSIER", "BAISSIER"):
+            possibilities.append({
+                "type": "POURSUITE_DIRECTIONNELLE",
+                "direction": direction,
+                "conditions_observees": [
+                    "contexte_directionnel",
+                    alignment,
+                ],
+                "descriptive": True,
+            })
+            possibilities.append({
+                "type": "DECELERATION_OU_CORRECTION",
+                "direction": "BAISSIER" if direction == "HAUSSIER" else "HAUSSIER",
+                "conditions_observees": [
+                    "affaiblissement_possible_du_mouvement",
+                ],
+                "descriptive": True,
+            })
+
+        if state in ("RANGE", "TRANSITION", "NEUTRE"):
+            possibilities.append({
+                "type": "ROTATION_OU_REACTION",
+                "direction": "NEUTRE",
+                "conditions_observees": [state],
+                "descriptive": True,
+            })
+            possibilities.append({
+                "type": "DEVELOPPEMENT_DIRECTIONNEL",
+                "direction": "NEUTRE",
+                "conditions_observees": [
+                    state,
+                    "changement_de_regime_possible",
+                ],
+                "descriptive": True,
+            })
+
+        if zone_context.get("zones"):
+            possibilities.append({
+                "type": "INTERACTION_AVEC_ZONE",
+                "direction": direction,
+                "conditions_observees": [
+                    "zone_suivie",
+                ],
+                "descriptive": True,
+            })
+
+        if (
+            liquidity_context.get("nearest_above") is not None
+            or liquidity_context.get("nearest_below") is not None
+        ):
+            possibilities.append({
+                "type": "INTERACTION_AVEC_LIQUIDITE",
+                "direction": direction,
+                "conditions_observees": [
+                    "liquidite_proche_du_prix",
+                ],
+                "descriptive": True,
+            })
+
+        return possibilities
 
     # -----------------------------------------------------------------------
     # CONTEXTE GLOBAL
