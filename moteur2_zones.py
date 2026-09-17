@@ -179,8 +179,9 @@ class Moteur2Zones:
             )
             if candidate is None:
                 continue
-            if candidate.total_score < self.min_score:
-                continue
+            # Les zones restent observables même lorsqu'elles sont faibles.
+            # La qualification et le classement décrivent leur importance ;
+            # ce module ne transforme pas un seuil en veto analytique.
             candidates.append(candidate)
         # Meilleure zone en premier.
         candidates.sort(
@@ -201,6 +202,10 @@ class Moteur2Zones:
             for item in candidates
             if item.near_current_price
         ]
+        possibilities = self._build_zone_possibilities(
+            candidates=candidates,
+            current_price=current_price,
+        )
         return {
             "symbol": symbol,
             "current_price": current_price,
@@ -216,7 +221,72 @@ class Moteur2Zones:
                 asdict(item)
                 for item in nearby_zones
             ],
+            "possibilities": possibilities,
+            "descriptive_only": True,
+            "blocking": False,
         }
+    # -----------------------------------------------------------------------
+    # POSSIBILITÉS AUTONOMES
+    # -----------------------------------------------------------------------
+    def _build_zone_possibilities(
+        self,
+        candidates: List[ZoneCandidate],
+        current_price: Optional[float],
+    ) -> List[Dict[str, Any]]:
+        """
+        Décrit les possibilités offertes par les zones observées.
+
+        Une zone n'est pas seulement une cible à sélectionner : selon sa
+        position, sa force, ses réactions et sa relation à la liquidité, elle
+        peut représenter une zone d'approche, de réaction, de traversée ou de
+        transition. Ces possibilités sont transmises aux couches suivantes
+        sans créer de décision BUY/SELL et sans filtre obligatoire.
+        """
+        possibilities: List[Dict[str, Any]] = []
+        for index, zone in enumerate(candidates):
+            if current_price is None or current_price <= 0:
+                relation = "POSITION_INCONNUE"
+            elif current_price < zone.low:
+                relation = "ZONE_AU_DESSUS"
+            elif current_price > zone.high:
+                relation = "ZONE_EN_DESSOUS"
+            else:
+                relation = "PRIX_DANS_ZONE"
+
+            if relation == "PRIX_DANS_ZONE":
+                interaction = "INTERACTION_ACTIVE"
+            elif zone.near_current_price:
+                interaction = "APPROCHE_POSSIBLE"
+            else:
+                interaction = "ZONE_DISTANTE"
+
+            if zone.multi_timeframe:
+                nature = "CONFLUENCE_DE_ZONE"
+            elif zone.touches >= 2:
+                nature = "REACTION_HISTORIQUE"
+            elif zone.liquidity_relation != "none":
+                nature = "INTERACTION_LIQUIDITE"
+            else:
+                nature = "ZONE_OBSERVEE"
+
+            possibilities.append({
+                "zone_index": index,
+                "timeframe": zone.timeframe,
+                "kind": zone.kind,
+                "relation_to_price": relation,
+                "interaction": interaction,
+                "nature": nature,
+                "strength": zone.strength,
+                "importance": zone.total_score,
+                "multi_timeframe": zone.multi_timeframe,
+                "liquidity_relation": zone.liquidity_relation,
+                "observation": (
+                    f"Zone {zone.kind.lower()} sur {zone.timeframe}: "
+                    f"{interaction.lower()}, {nature.lower()}."
+                ),
+            })
+        return possibilities
+
     # -----------------------------------------------------------------------
     # SYMBOLE
     # -----------------------------------------------------------------------
