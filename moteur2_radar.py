@@ -261,6 +261,29 @@ class Moteur2Radar:
         )
 
         # --------------------------------------------------------------
+        # 9. CONVERGENCE D'OBSERVATIONS
+        # --------------------------------------------------------------
+
+        events.extend(
+            self._detect_observation_convergence(
+                symbol,
+                current,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # 10. CHANGEMENT DE REGIME OBSERVE
+        # --------------------------------------------------------------
+
+        events.extend(
+            self._detect_market_state_change(
+                symbol,
+                previous,
+                current,
+            )
+        )
+
+        # --------------------------------------------------------------
         # SAUVEGARDE DU SNAPSHOT
         # --------------------------------------------------------------
 
@@ -864,6 +887,152 @@ class Moteur2Radar:
             ]
 
         return []
+
+    # ------------------------------------------------------------------
+    # CONVERGENCE D'OBSERVATIONS
+    # ------------------------------------------------------------------
+
+    def _detect_observation_convergence(
+        self,
+        symbol: str,
+        current: Dict[str, Any],
+    ) -> List[RadarEvent]:
+        """
+        Regroupe les observations qui apparaissent simultanément.
+
+        Cette couche ne crée pas de signal et ne valide aucune entrée.
+        Elle indique seulement qu'un ensemble de phénomènes mérite
+        d'être examiné ensemble par les couches supérieures.
+        """
+
+        direction = _text(current.get("direction"))
+        momentum = _float(current.get("momentum"))
+        buy_pressure = _float(current.get("buy_pressure"), 0.0) or 0.0
+        sell_pressure = _float(current.get("sell_pressure"), 0.0) or 0.0
+        volatility = _float(current.get("volatility"))
+
+        observations: List[str] = []
+
+        if direction in ("BUY", "SELL"):
+            observations.append("direction")
+
+        if momentum is not None and abs(momentum) >= 0.20:
+            observations.append("momentum")
+
+        pressure_balance = buy_pressure - sell_pressure
+        if abs(pressure_balance) >= self.pressure_threshold:
+            observations.append("pressure")
+
+        if volatility is not None and volatility > 0:
+            observations.append("volatility")
+
+        if len(observations) < 2:
+            return []
+
+        observed_direction = direction
+        if observed_direction not in ("BUY", "SELL"):
+            if pressure_balance > 0:
+                observed_direction = "BUY"
+            elif pressure_balance < 0:
+                observed_direction = "SELL"
+
+        return [
+            RadarEvent(
+                symbol=symbol,
+                event_type="OBSERVATION_CONVERGENCE",
+                direction=observed_direction,
+                strength=min(100.0, 40.0 + len(observations) * 12.0),
+                price=current.get("price"),
+                current_value={
+                    "observations": observations,
+                    "count": len(observations),
+                },
+                description=(
+                    "Plusieurs observations de marché apparaissent "
+                    "simultanément et peuvent être étudiées ensemble."
+                ),
+            )
+        ]
+
+    # ------------------------------------------------------------------
+    # CHANGEMENT DE REGIME OBSERVE
+    # ------------------------------------------------------------------
+
+    def _detect_market_state_change(
+        self,
+        symbol: str,
+        previous: Dict[str, Any],
+        current: Dict[str, Any],
+    ) -> List[RadarEvent]:
+        """
+        Signale une évolution du comportement observable du marché.
+
+        Il s'agit d'une observation descriptive, pas d'une classification
+        définitive et encore moins d'un filtre de décision.
+        """
+
+        if not previous:
+            return []
+
+        old_vol = _float(previous.get("volatility"))
+        new_vol = _float(current.get("volatility"))
+        old_momentum = _float(previous.get("momentum"))
+        new_momentum = _float(current.get("momentum"))
+
+        changes: List[str] = []
+
+        if (
+            old_vol is not None
+            and new_vol is not None
+            and old_vol > 0
+        ):
+            vol_ratio = new_vol / old_vol
+            if vol_ratio >= 1.25:
+                changes.append("volatility_expanding")
+            elif vol_ratio <= 0.80:
+                changes.append("volatility_contracting")
+
+        if old_momentum is not None and new_momentum is not None:
+            if abs(new_momentum - old_momentum) >= 0.20:
+                changes.append("momentum_repricing")
+
+        old_direction = _text(previous.get("direction"))
+        new_direction = _text(current.get("direction"))
+        if (
+            old_direction in ("BUY", "SELL")
+            and new_direction in ("BUY", "SELL")
+            and old_direction != new_direction
+        ):
+            changes.append("direction_reversal")
+
+        if not changes:
+            return []
+
+        return [
+            RadarEvent(
+                symbol=symbol,
+                event_type="MARKET_STATE_CHANGE",
+                direction=new_direction if new_direction in ("BUY", "SELL") else "NEUTRAL",
+                strength=min(100.0, 45.0 + len(changes) * 15.0),
+                price=current.get("price"),
+                previous_value={
+                    "direction": old_direction,
+                    "momentum": old_momentum,
+                    "volatility": old_vol,
+                },
+                current_value={
+                    "direction": new_direction,
+                    "momentum": new_momentum,
+                    "volatility": new_vol,
+                    "changes": changes,
+                },
+                description=(
+                    "Évolution du comportement observable du marché : "
+                    + ", ".join(changes)
+                    + "."
+                ),
+            )
+        ]
 
     # ------------------------------------------------------------------
     # DIRECTION
