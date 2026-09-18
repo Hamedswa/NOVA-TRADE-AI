@@ -14,7 +14,7 @@ PRINCIPES
 - Le score ne crée jamais Entry / SL / TP / RR.
 - Le score ne valide jamais un signal et ne déclenche jamais Telegram.
 - La validation finale appartient exclusivement à moteur2_validation.py.
-- RR minimum structurel : 3R.
+- RR : information descriptive uniquement ; il ne filtre et ne pondère pas le score.
 - Aucun BOS / CHoCH / OB / FVG / SMC / ICT.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ import math
 SUPPORTED_SYMBOLS = ("XAUUSD", "BTCUSD", "EURUSD", "GBPUSD")
 MAX_SCORE = 100.0
 SCORE_THRESHOLD = 60.0
-MINIMUM_RR = 3.0
+MINIMUM_RR = 0.0
 EPSILON = 1e-9
 
 # 100 points exactement.
@@ -75,7 +75,8 @@ class Moteur2Score:
         minimum_rr: float = MINIMUM_RR,
     ) -> None:
         self.score_threshold = float(score_threshold)
-        self.minimum_rr = max(float(minimum_rr), MINIMUM_RR)
+        # Conservé pour compatibilité d’API uniquement. Aucun minimum RR ne bloque le score.
+        self.minimum_rr = 0.0
 
     @staticmethod
     def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -335,21 +336,22 @@ class Moteur2Score:
         return m5_component, m1_component, reason, meta
 
     def _rr(self, risk_plan: Any) -> Tuple[float, str, Optional[float]]:
+        """
+        RR purement informatif.
+
+        Il est mesuré et exposé pour information, mais ne contribue pas
+        au score et ne peut jamais rejeter ou dégrader une opportunité.
+        """
         if risk_plan is None:
-            return 0.0, "Plan de risque indisponible.", None
-        rr = self._number(self._get(risk_plan, "primary_rr") or self._get(risk_plan, "rr_tp1") or self._get(risk_plan, "rr"))
+            return 0.0, "RR non disponible (information uniquement).", None
+        rr = self._number(
+            self._get(risk_plan, "primary_rr")
+            or self._get(risk_plan, "rr_tp1")
+            or self._get(risk_plan, "rr")
+        )
         if rr is None:
-            return 0.0, "RR primaire indisponible.", None
-        if rr < self.minimum_rr:
-            return 0.0, f"RR {rr:.2f} inférieur au minimum structurel de {self.minimum_rr:.2f}.", rr
-        # RR sert à départager les plans ; il ne crée ni TP ni SL.
-        if rr >= 5.0:
-            quality = 100.0
-        elif rr >= 4.0:
-            quality = 82.0
-        else:
-            quality = 65.0 + (rr - 3.0) * 17.0
-        return quality / 100.0 * RR_MAX, f"RR primaire {rr:.2f}, compatible avec le minimum.", rr
+            return 0.0, "RR non disponible (information uniquement).", None
+        return 0.0, f"RR primaire {rr:.2f} (information uniquement).", rr
 
     @staticmethod
     def _quality_label(score: float) -> str:
@@ -403,7 +405,6 @@ class Moteur2Score:
             (confluence_score, CONFLUENCE_MAX, "Confluences convergentes.", "Confluences limitées ou contradictoires."),
             (m5_score, M5_MAX, "M5 apporte un bon timing.", "M5 apporte peu de confirmation."),
             (m1_score, M1_MAX, "M1 renforce le timing.", "M1 apporte peu d'information supplémentaire."),
-            (rr_score, RR_MAX, "RR compatible avec le minimum.", "RR insuffisant ou indisponible."),
         ]
         for value, maximum, positive, negative in components:
             if value >= maximum * 0.70:
@@ -426,10 +427,12 @@ class Moteur2Score:
                 "confluence": CONFLUENCE_MAX, "m5": M5_MAX, "m1": M1_MAX, "rr": RR_MAX,
             },
             "total_maximum": TOTAL_MAX,
-            "score_threshold": self.score_threshold,
-            "minimum_rr": self.minimum_rr,
+            "score_threshold": 0.0,
+            "score_threshold_is_blocking": False,
+            "minimum_rr": 0.0,
             "rr_primary": rr_primary,
-            "rr_requirement_met": rr_primary is not None and rr_primary >= self.minimum_rr,
+            "rr_is_informational": True,
+            "rr_contributes_to_score": False,
             "risk_plan_valid": risk_valid,
             "confirmation_valid": confirmation_valid,
             "confirmation_status": self._get(confirmation, "confirmation_status", "UNKNOWN"),
@@ -444,7 +447,7 @@ class Moteur2Score:
             "confluence": confluence_meta,
             "confirmation": confirmation_meta,
             "ranking_ready": True,
-            "ranking_note": "Le score sert à classer les opportunités ; il ne crée aucun quota et ne force aucun signal.",
+            "ranking_note": "Le score sert à décrire et comparer les observations ; il ne bloque pas une opportunité et ne force aucun signal.",
             "reasons": {
                 "zone": zone_reason, "context": context_reason, "setup": setup_reason,
                 "structure": structure_reason, "reaction": reaction_reason,
