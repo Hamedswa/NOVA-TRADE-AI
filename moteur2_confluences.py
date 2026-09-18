@@ -141,11 +141,25 @@ class Moteur2Confluences:
         zones = zones_result.get("zones", [])
         if not isinstance(zones, list):
             zones = []
+
+        # Les confluences peuvent aussi exister comme observations globales,
+        # même lorsqu aucune zone structurée n est disponible. Elles restent
+        # descriptives et servent à enrichir les possibilités en aval.
+        autonomous_possibilities = self._build_autonomous_possibilities(
+            context_result=context_result,
+            market_map=market_map,
+            liquidity_result=liquidity_result,
+            zones=zones,
+        )
+
         if not zones:
             return {
                 "symbol": resolved_symbol,
                 "zones": [],
                 "best_zone": None,
+                "autonomous_possibilities": autonomous_possibilities,
+                "descriptive_only": True,
+                "blocking": False,
             }
         results: List[Dict[str, Any]] = []
         for index, zone in enumerate(zones):
@@ -174,7 +188,101 @@ class Moteur2Confluences:
             "symbol": resolved_symbol,
             "zones": results,
             "best_zone": results[0] if results else None,
+            "autonomous_possibilities": autonomous_possibilities,
+            "descriptive_only": True,
+            "blocking": False,
         }
+
+    # ========================================================================
+    # POSSIBILITES AUTONOMES
+    # ========================================================================
+    def _build_autonomous_possibilities(
+        self,
+        context_result: Dict[str, Any],
+        market_map: Optional[Dict[str, Any]],
+        liquidity_result: Optional[Dict[str, Any]],
+        zones: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Produit des hypothèses de convergence à partir de ce qui est
+        réellement observé, sans imposer une famille de setup prédéfinie.
+        Aucun élément de cette liste ne constitue un veto ou une décision.
+        """
+        possibilities: List[Dict[str, Any]] = []
+
+        global_context = (
+            context_result.get("global", {})
+            if isinstance(context_result, dict)
+            else {}
+        )
+        if not isinstance(global_context, dict):
+            global_context = {}
+        direction = str(
+            global_context.get("direction", "")
+        ).upper()
+        state = str(
+            global_context.get("state",
+                               global_context.get("market_state", ""))
+        ).upper()
+
+        if direction in ("HAUSSIER", "BULLISH", "BUY"):
+            possibilities.append({
+                "type": "CONVERGENCE_DIRECTIONNELLE",
+                "direction": "HAUSSIER",
+                "strength": 1.0,
+                "description": "Le contexte global apporte un appui acheteur à rechercher dans les autres observations.",
+            })
+        elif direction in ("BAISSIER", "BEARISH", "SELL"):
+            possibilities.append({
+                "type": "CONVERGENCE_DIRECTIONNELLE",
+                "direction": "BAISSIER",
+                "strength": 1.0,
+                "description": "Le contexte global apporte un appui vendeur à rechercher dans les autres observations.",
+            })
+
+        if state in ("TRANSITION", "ROTATION", "RANGE", "CONSOLIDATION"):
+            possibilities.append({
+                "type": "TRANSITION_OU_ROTATION",
+                "direction": "NEUTRE",
+                "strength": 0.8,
+                "description": "Le contexte suggère une phase où plusieurs développements restent possibles.",
+            })
+
+        liquidity = liquidity_result if isinstance(liquidity_result, dict) else {}
+        levels = liquidity.get("levels", [])
+        clusters = liquidity.get("clusters", [])
+        if isinstance(levels, list) and levels:
+            possibilities.append({
+                "type": "CONVERGENCE_LIQUIDITE",
+                "direction": "NEUTRE",
+                "strength": min(1.0, len(levels) / 5.0),
+                "description": f"Des niveaux de liquidité observés peuvent interagir avec les autres éléments du marché ({len(levels)} niveaux).",
+            })
+        if isinstance(clusters, list) and clusters:
+            possibilities.append({
+                "type": "CONCENTRATION_LIQUIDITE",
+                "direction": "NEUTRE",
+                "strength": min(1.0, len(clusters) / 3.0),
+                "description": f"Une ou plusieurs concentrations de liquidité sont présentes ({len(clusters)} clusters).",
+            })
+
+        if isinstance(zones, list) and zones:
+            possibilities.append({
+                "type": "CONVERGENCE_ZONE_CONTEXTE",
+                "direction": "NEUTRE",
+                "strength": min(1.0, len(zones) / 4.0),
+                "description": f"Des zones observées peuvent être confrontées au contexte et à la liquidité ({len(zones)} zones).",
+            })
+
+        if isinstance(market_map, dict):
+            possibilities.append({
+                "type": "OBSERVATION_MULTITEMPORELLE",
+                "direction": "NEUTRE",
+                "strength": 0.5,
+                "description": "Les informations multi-unités de temps peuvent confirmer, nuancer ou contredire les autres observations.",
+            })
+
+        return possibilities
     # ========================================================================
     # ANALYSE D'UNE ZONE
     # ========================================================================
