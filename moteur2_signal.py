@@ -2,26 +2,28 @@
 NOVA TRADE AI — ENGINE 2
 moteur2_signal.py
 
-Construction du signal final.
-Ce module ne crée aucune nouvelle décision stratégique.
-Il transforme uniquement une validation finale READY_FOR_SIGNAL
-et un plan de risque déjà construit en objet Signal + message Telegram.
+Couche de sortie du moteur 2.
 
 Responsabilités :
-    Validation READY_FOR_SIGNAL
-        -> extraction des données
-        -> contrôle de cohérence minimale
-        -> construction du signal
-        -> formatage Telegram
+    - transformer une décision BUY/SELL déjà prise en signal exploitable ;
+    - utiliser le plan technique Entry / SL / TP déjà construit ;
+    - conserver RR et Score comme informations descriptives ;
+    - formater le message Telegram ;
+    - ne jamais prendre une nouvelle décision.
 
-Ne fait PAS :
-    - calcul Entry / SL / TP / RR
-    - modification du RiskPlan
-    - nouvelle analyse du marché
-    - nouveau scoring
-    - nouvelle validation
-    - décision BUY / SELL
-    - exécution d'ordre
+Ce module ne fait PAS :
+    - analyse de marché ;
+    - calcul de Risk financier ;
+    - filtrage par RR minimum ;
+    - filtrage par Score minimum ;
+    - décision BUY / SELL / WAIT ;
+    - modification de la décision ;
+    - blocage sur M5/M1 ;
+    - exécution d'ordre.
+
+Compatibilité :
+    `risk_plan` est conservé comme nom historique pour le plan technique.
+    Il n'est pas traité comme une autorité de gestion du risque financier.
 """
 
 from __future__ import annotations
@@ -29,11 +31,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-
-
-# ============================================================================
-# OUTILS COMPATIBLES DICT / DATACLASS
-# ============================================================================
 
 
 def _get(data: Any, key: str, default: Any = None) -> Any:
@@ -74,11 +71,6 @@ def _price(value: Any) -> str:
     return "N/A" if number is None else f"{number:.2f}"
 
 
-# ============================================================================
-# OBJET FINAL
-# ============================================================================
-
-
 @dataclass
 class SignalMoteur2:
     signal_id: str
@@ -103,40 +95,49 @@ class SignalMoteur2:
     telegram_message: str = ""
 
 
-# ============================================================================
-# MOTEUR SIGNAL
-# ============================================================================
-
-
 class Moteur2Signal:
-    """Construit exclusivement le signal issu d'une validation finale."""
+    """
+    Dernière couche de construction/présentation.
+
+    La décision stratégique appartient exclusivement à moteur2_decision.py.
+    Le signal ne peut pas transformer WAIT en BUY/SELL.
+    """
 
     FINAL_VALIDATION_STATUS = "READY_FOR_SIGNAL"
 
     def generer_signal_id(self, setup_id: str) -> str:
-        """Identifiant technique unique du message construit."""
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
         return f"{setup_id}-{timestamp}"
 
-    def _extraire_risk(self, risk_plan: Any) -> Dict[str, Optional[float]]:
-        rr = _float(_get(risk_plan, "primary_rr"))
+    def _extraire_plan_technique(self, plan: Any) -> Dict[str, Optional[float]]:
+        """
+        Extrait uniquement les niveaux techniques déjà produits en amont.
+
+        RR reste optionnel et purement descriptif.
+        Aucun minimum de RR n'est appliqué.
+        """
+        rr = _float(_get(plan, "primary_rr"))
         if rr is None:
-            rr = _float(_get(risk_plan, "rr"))
+            rr = _float(_get(plan, "rr"))
         if rr is None:
-            rr = _float(_get(risk_plan, "rr_tp1"))
+            rr = _float(_get(plan, "rr_tp1"))
 
         return {
-            "entry": _float(_get(risk_plan, "entry")),
-            "sl": _float(_get(risk_plan, "sl")),
-            "tp1": _float(_get(risk_plan, "tp1")),
-            "tp2": _float(_get(risk_plan, "tp2")),
-            "tp3": _float(_get(risk_plan, "tp3")),
-            "rr": rr,
+            "entry": _float(_get(plan, "entry")),
+            "sl": _float(_get(plan, "sl")),
+            "tp1": _float(_get(plan, "tp1")),
+            "tp2": _float(_get(plan, "tp2")),
+            "tp3": _float(_get(plan, "tp3")),
+            "rr": 0.0 if rr is None else rr,
         }
+
+    # Compatibilité avec le nom historique.
+    def _extraire_risk(self, risk_plan: Any) -> Dict[str, Optional[float]]:
+        return self._extraire_plan_technique(risk_plan)
 
     def _extraire_score(self, score_result: Any) -> Dict[str, Any]:
         return {
-            "score": _float(_get(score_result, "score"), 0.0),
+            "score": _float(_get(score_result, "score"), 0.0) or 0.0,
             "quality": str(_get(score_result, "quality", "N/A")).upper(),
         }
 
@@ -144,7 +145,6 @@ class Moteur2Signal:
         status = str(_get(validation, "status", "UNKNOWN")).strip().upper()
         validated = bool(_get(validation, "validated", False))
 
-        # Compatibilité avec d'anciennes conventions éventuelles.
         if not validated:
             validated = bool(_get(validation, "valid", False))
 
@@ -163,17 +163,31 @@ class Moteur2Signal:
             )
         ).strip().upper()
 
-        entry_triggered = bool(_get(confirmation, "entry_triggered", False))
-
         return {
             "status": status,
-            "entry_triggered": entry_triggered,
+            "entry_triggered": bool(_get(confirmation, "entry_triggered", False)),
+        }
+
+    def _extraire_decision(self, decision: Any) -> Dict[str, Any]:
+        value = _direction(
+            _get(
+                decision,
+                "decision",
+                _get(decision, "direction", ""),
+            )
+        )
+        return {
+            "decision": value,
+            "confidence": _float(
+                _get(decision, "confidence"),
+                0.0,
+            ) or 0.0,
         }
 
     def _resolve_setup_id(
         self,
         setup: Any,
-        risk_plan: Any,
+        plan: Any,
         symbol: str,
         direction: str,
         setup_type: str,
@@ -181,40 +195,67 @@ class Moteur2Signal:
         setup_id = str(
             _get(setup, "setup_id")
             or _get(setup, "id")
-            or _get(risk_plan, "setup_id")
+            or _get(plan, "setup_id")
             or ""
         ).strip()
 
         if setup_id:
             return setup_id
 
-        entry = _price(_get(risk_plan, "entry"))
-        sl = _price(_get(risk_plan, "sl"))
+        entry = _price(_get(plan, "entry"))
+        sl = _price(_get(plan, "sl"))
         return f"M2-{symbol}-{direction}-{setup_type}-{entry}-{sl}"
 
-    def _controle_minimal(
+    def _controle_technique_minimal(
         self,
         direction: str,
-        risk: Dict[str, Optional[float]],
+        plan: Dict[str, Optional[float]],
     ) -> bool:
-        """Contrôle de sécurité de forme, sans recalcul ni décision stratégique."""
-        entry = risk["entry"]
-        sl = risk["sl"]
-        tp1 = risk["tp1"]
-        rr = risk["rr"]
+        """
+        Contrôle uniquement la cohérence technique minimale.
 
-        if entry is None or sl is None or tp1 is None or rr is None:
-            return False
-        if entry <= 0 or sl <= 0 or tp1 <= 0 or rr <= 0:
+        Ce n'est ni un score, ni un filtre RR, ni une gestion financière.
+        """
+        entry = plan["entry"]
+        sl = plan["sl"]
+        tp1 = plan["tp1"]
+
+        if entry is None or sl is None or tp1 is None:
             return False
 
-        # Simple cohérence de données déjà produites par Risk/Validation.
+        if entry <= 0 or sl <= 0 or tp1 <= 0:
+            return False
+
         if direction == "BUY" and not (sl < entry < tp1):
             return False
+
         if direction == "SELL" and not (tp1 < entry < sl):
             return False
 
         return True
+
+    def _decision_compatible(
+        self,
+        decision: Any,
+        direction: str,
+    ) -> bool:
+        """
+        Vérifie la cohérence de la décision déjà produite.
+
+        Si aucun objet décision n'est encore fourni, la compatibilité historique
+        est conservée. moteur2.py pourra transmettre explicitement la décision
+        lors de son évolution.
+        """
+        if decision is None:
+            return True
+
+        decision_data = self._extraire_decision(decision)
+        value = decision_data["decision"]
+
+        if value == "WAIT":
+            return False
+
+        return value in {"BUY", "SELL"} and value == direction
 
     def construire_signal(
         self,
@@ -225,21 +266,35 @@ class Moteur2Signal:
         validation: Any,
         antispam_result: Any = None,
         setup_id: Optional[str] = None,
+        decision: Any = None,
+        technical_plan: Any = None,
     ) -> Optional[SignalMoteur2]:
         """
-        Construit un signal UNIQUEMENT si la chaîne précédente est terminée.
+        Construit le signal final.
 
-        Point important : VALIDATED_WAITING_CONFIRMATION ne devient jamais
-        un signal Telegram. Il reste dans les étapes précédentes jusqu'à ce
-        que la validation finale passe à READY_FOR_SIGNAL.
+        `technical_plan` est le nouveau nom recommandé.
+        `risk_plan` reste accepté pour compatibilité avec l'orchestrateur actuel.
+
+        Conditions bloquantes :
+            - validation explicitement non validée ;
+            - statut de validation différent de READY_FOR_SIGNAL ;
+            - antispam explicitement interdit ;
+            - direction absente/invalide ;
+            - incohérence technique Entry/SL/TP1 ;
+            - décision explicite WAIT ou différente de la direction.
+
+        Ne sont PAS bloquants :
+            - RR faible ou absent ;
+            - score faible ;
+            - qualité faible ;
+            - M5/M1 non déclenché ;
+            - TP2/TP3 absents.
         """
-
         validation_data = self._extraire_validation(validation)
 
         if not validation_data["validated"]:
             return None
 
-        # Le module Signal n'autorise que la validation finale.
         if validation_data["status"] != self.FINAL_VALIDATION_STATUS:
             return None
 
@@ -248,44 +303,46 @@ class Moteur2Signal:
         ):
             return None
 
+        plan = technical_plan if technical_plan is not None else risk_plan
+
         symbol = _symbol(
             _get(setup, "symbol")
-            or _get(risk_plan, "symbol")
+            or _get(plan, "symbol")
             or "XAUUSD"
         )
 
         direction = _direction(
-            _get(setup, "direction")
-            or _get(risk_plan, "direction")
+            _get(decision, "decision")
+            or _get(decision, "direction")
+            or _get(setup, "direction")
+            or _get(plan, "direction")
         )
 
         setup_type = str(
             _get(setup, "setup_type")
-            or _get(risk_plan, "setup_type")
-            or "UNKNOWN"
+            or _get(plan, "setup_type")
+            or _get(decision, "setup_type")
+            or "OPPORTUNITE"
         ).strip().upper()
 
         if direction not in {"BUY", "SELL"}:
             return None
 
-        risk = self._extraire_risk(risk_plan)
+        if not self._decision_compatible(decision, direction):
+            return None
 
-        # TP1 est obligatoire. TP2 / TP3 restent réellement facultatifs.
-        if not self._controle_minimal(direction, risk):
+        technical = self._extraire_plan_technique(plan)
+
+        if not self._controle_technique_minimal(direction, technical):
             return None
 
         score_data = self._extraire_score(score_result)
         confirmation_data = self._extraire_confirmation(confirmation)
 
-        # Une validation finale READY_FOR_SIGNAL implique une confirmation
-        # effectivement déclenchée. On ne reconstruit pas la décision ici.
-        if not confirmation_data["entry_triggered"]:
-            return None
-
         if setup_id is None:
             setup_id = self._resolve_setup_id(
                 setup,
-                risk_plan,
+                plan,
                 symbol,
                 direction,
                 setup_type,
@@ -294,37 +351,48 @@ class Moteur2Signal:
         signal_id = self.generer_signal_id(setup_id)
         timestamp = datetime.now(timezone.utc).isoformat()
 
+        rr = float(technical["rr"] or 0.0)
+
         metadata = {
             "engine": "MOTEUR_2",
             "data_source": "BIQUOTE",
             "instrument": symbol,
+            "decision_owner": "moteur2_decision.py",
+            "decision_received": decision is not None,
             "validation_status": validation_data["status"],
             "confirmation_status": confirmation_data["status"],
-            "entry_triggered": True,
-            "created_at": timestamp,
+            "entry_triggered": confirmation_data["entry_triggered"],
+            "confirmation_is_blocking": False,
+            "m5_is_blocking": False,
+            "m1_is_blocking": False,
+            "score_is_blocking": False,
+            "rr_is_blocking": False,
+            "minimum_rr_enabled": False,
+            "financial_risk_is_decision_factor": False,
             "signal_layer_is_decisive": False,
             "risk_modified": False,
             "score_recomputed": False,
             "validation_recomputed": False,
-            "tp2_optional": risk["tp2"] is None,
-            "tp3_optional": risk["tp3"] is None,
+            "tp2_optional": technical["tp2"] is None,
+            "tp3_optional": technical["tp3"] is None,
+            "created_at": timestamp,
         }
 
         message = self.formater_telegram(
             symbol=symbol,
             direction=direction,
             setup_type=setup_type,
-            entry=float(risk["entry"]),
-            sl=float(risk["sl"]),
-            tp1=float(risk["tp1"]),
-            tp2=risk["tp2"],
-            tp3=risk["tp3"],
-            rr=float(risk["rr"]),
-            score=float(score_data["score"] or 0.0),
+            entry=float(technical["entry"]),
+            sl=float(technical["sl"]),
+            tp1=float(technical["tp1"]),
+            tp2=technical["tp2"],
+            tp3=technical["tp3"],
+            rr=rr,
+            score=float(score_data["score"]),
             quality=score_data["quality"],
             validation_status=validation_data["status"],
             confirmation_status=confirmation_data["status"],
-            entry_triggered=True,
+            entry_triggered=confirmation_data["entry_triggered"],
             setup_id=setup_id,
         )
 
@@ -334,13 +402,13 @@ class Moteur2Signal:
             symbol=symbol,
             direction=direction,
             setup_type=setup_type,
-            entry=float(risk["entry"]),
-            sl=float(risk["sl"]),
-            tp1=float(risk["tp1"]),
-            tp2=risk["tp2"],
-            tp3=risk["tp3"],
-            rr=float(risk["rr"]),
-            score=float(score_data["score"] or 0.0),
+            entry=float(technical["entry"]),
+            sl=float(technical["sl"]),
+            tp1=float(technical["tp1"]),
+            tp2=technical["tp2"],
+            tp3=technical["tp3"],
+            rr=rr,
+            score=float(score_data["score"]),
             quality=score_data["quality"],
             validation_status=validation_data["status"],
             confirmation_status=confirmation_data["status"],
@@ -369,9 +437,7 @@ class Moteur2Signal:
         entry_triggered: bool,
         setup_id: str,
     ) -> str:
-        display_symbol = symbol
-        if symbol == "XAUUSD":
-            display_symbol = "XAU/USD"
+        display_symbol = "XAU/USD" if symbol == "XAUUSD" else symbol
 
         title = (
             f"🟢 {display_symbol} — BUY"
@@ -380,13 +446,16 @@ class Moteur2Signal:
         )
 
         timing = (
-            "⚡ ENTRÉE CONFIRMÉE"
+            "⚡ CONFIRMATION OBSERVÉE"
             if entry_triggered
-            else "⏳ EN ATTENTE DE CONFIRMATION"
+            else "👁️ OPPORTUNITÉ VALIDÉE"
         )
 
         tp2_text = _price(tp2) if tp2 is not None else "—"
         tp3_text = _price(tp3) if tp3 is not None else "—"
+
+        rr_text = f"{rr:.2f}" if rr > 0 else "N/A"
+        score_text = f"{score:.0f}/100"
 
         return (
             f"{title}\n"
@@ -398,8 +467,8 @@ class Moteur2Signal:
             f"🥇 TP1 : {_price(tp1)}\n"
             f"🥈 TP2 : {tp2_text}\n"
             f"🥉 TP3 : {tp3_text}\n\n"
-            f"📐 RR : {rr:.2f}\n"
-            f"⭐ Score : {score:.0f}/100\n"
+            f"📐 RR indicatif : {rr_text}\n"
+            f"⭐ Score descriptif : {score_text}\n"
             f"🏷️ Qualité : {quality}\n\n"
             f"🔎 Validation : {validation_status}\n"
             f"⏱️ Confirmation : {confirmation_status}\n\n"
@@ -433,11 +502,6 @@ class Moteur2Signal:
         }
 
 
-# ============================================================================
-# FONCTION PUBLIQUE COMPATIBLE
-# ============================================================================
-
-
 def construire_signal(
     setup: Any,
     risk_plan: Any,
@@ -446,6 +510,8 @@ def construire_signal(
     validation: Any,
     antispam_result: Any = None,
     setup_id: Optional[str] = None,
+    decision: Any = None,
+    technical_plan: Any = None,
 ) -> Optional[SignalMoteur2]:
     return Moteur2Signal().construire_signal(
         setup=setup,
@@ -455,12 +521,9 @@ def construire_signal(
         validation=validation,
         antispam_result=antispam_result,
         setup_id=setup_id,
+        decision=decision,
+        technical_plan=technical_plan,
     )
-
-
-# ============================================================================
-# TEST LOCAL
-# ============================================================================
 
 
 if __name__ == "__main__":
@@ -473,32 +536,38 @@ if __name__ == "__main__":
         "symbol": "XAUUSD",
     }
 
-    risk = {
+    technical_plan = {
         "symbol": "XAUUSD",
         "setup_id": "XAUUSD_BUY_TEST",
         "direction": "BUY",
         "entry": 4650.0,
         "sl": 4640.0,
-        "tp1": 4680.0,
+        "tp1": 4660.0,
         "tp2": None,
         "tp3": None,
-        "primary_rr": 3.0,
+        "primary_rr": 0.5,
     }
 
     confirmation = {
-        "confirmation_status": "CONFIRMED_M5_M1",
-        "entry_triggered": True,
+        "confirmation_status": "FORMING",
+        "entry_triggered": False,
     }
 
     score = {
-        "score": 72.0,
-        "quality": "A",
+        "score": 20.0,
+        "quality": "LOW",
     }
 
     validation = {
         "validated": True,
         "status": "READY_FOR_SIGNAL",
-        "reason": "Validation finale réussie.",
+        "reason": "Validation technique finale.",
+    }
+
+    decision = {
+        "decision": "BUY",
+        "direction": "BUY",
+        "confidence": 61.0,
     }
 
     antispam = {
@@ -507,34 +576,35 @@ if __name__ == "__main__":
 
     signal = moteur.construire_signal(
         setup=setup,
-        risk_plan=risk,
+        risk_plan=technical_plan,
+        technical_plan=technical_plan,
         confirmation=confirmation,
         score_result=score,
         validation=validation,
         antispam_result=antispam,
+        decision=decision,
     )
 
     assert signal is not None
+    assert signal.direction == "BUY"
+    assert signal.rr == 0.5
+    assert signal.score == 20.0
     assert signal.tp2 is None
     assert signal.tp3 is None
-    assert signal.validation_status == "READY_FOR_SIGNAL"
-    assert signal.waiting_confirmation is False
+    assert signal.metadata["rr_is_blocking"] is False
+    assert signal.metadata["score_is_blocking"] is False
+    assert signal.metadata["m5_is_blocking"] is False
 
-    waiting_validation = {
-        "validated": True,
-        "status": "VALIDATED_WAITING_CONFIRMATION",
-    }
-    assert (
-        moteur.construire_signal(
-            setup,
-            risk,
-            confirmation,
-            score,
-            waiting_validation,
-            antispam,
-        )
-        is None
+    # WAIT ne doit jamais devenir un signal.
+    blocked = moteur.construire_signal(
+        setup=setup,
+        risk_plan=technical_plan,
+        confirmation=confirmation,
+        score_result=score,
+        validation=validation,
+        antispam_result=antispam,
+        decision={"decision": "WAIT"},
     )
+    assert blocked is None
 
-    print("OK moteur2_signal")
-    print(signal.telegram_message)
+    print("moteur2_signal.py : OK")
