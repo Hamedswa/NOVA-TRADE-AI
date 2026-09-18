@@ -7,7 +7,7 @@ Couche descriptive de lecture de la liquidité.
 Objectif :
     Transformer la cartographie du marché en une lecture structurée des
     zones où la liquidité peut être concentrée, sans imposer de scénario
-    de trading et sans utiliser BOS / CHoCH / OB / FVG.
+    de trading.
 
 Principes :
     - aucune décision BUY / SELL ;
@@ -230,6 +230,20 @@ class Moteur2Liquidite:
             market_map=market_map,
         )
 
+        possibilities = self._build_liquidity_possibilities(
+            current_price=current_price,
+            levels=levels,
+            clusters=clusters,
+            market_map=market_map,
+        )
+
+        summary["possibility_count"] = len(possibilities)
+        summary["adaptive_reading"] = self._build_adaptive_reading(
+            levels=levels,
+            clusters=clusters,
+            possibilities=possibilities,
+        )
+
         return {
             "symbol": symbol,
             "current_price": current_price,
@@ -257,7 +271,10 @@ class Moteur2Liquidite:
             "sweep_clusters": [
                 asdict(item) for item in sweep_clusters
             ],
+            "liquidity_possibilities": possibilities,
             "summary": summary,
+            "descriptive_only": True,
+            "blocking": False,
         }
 
     # ======================================================================
@@ -958,6 +975,111 @@ class Moteur2Liquidite:
                 nearest_sell=nearest_sell,
                 clusters=clusters,
             ),
+        }
+
+    def _build_liquidity_possibilities(
+        self,
+        current_price: float,
+        levels: List[LiquidityLevel],
+        clusters: List[LiquidityCluster],
+        market_map: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Construit des possibilités de lecture sans les transformer en signaux."""
+        possibilities: List[Dict[str, Any]] = []
+
+        nearby_buy = [x for x in levels if x.nearby and x.side == "BUY_SIDE"]
+        nearby_sell = [x for x in levels if x.nearby and x.side == "SELL_SIDE"]
+        buy_clusters = [x for x in clusters if x.side == "BUY_SIDE"]
+        sell_clusters = [x for x in clusters if x.side == "SELL_SIDE"]
+        sweep_near = [x for x in levels if x.sweep_candidate]
+
+        if nearby_buy and nearby_sell:
+            possibilities.append({
+                "type": "LIQUIDITY_BALANCE_NEAR_PRICE",
+                "description": "Des niveaux sont présents des deux côtés du prix ; une interaction avec l'un ou l'autre côté mérite une surveillance.",
+                "evidence": {"buy": len(nearby_buy), "sell": len(nearby_sell)},
+                "confidence": 55.0,
+            })
+        elif nearby_buy or nearby_sell:
+            side = "BUY_SIDE" if nearby_buy else "SELL_SIDE"
+            possibilities.append({
+                "type": "LIQUIDITY_SIDE_NEAR_PRICE",
+                "description": f"Une concentration de liquidité potentielle est proche du prix sur {side}.",
+                "evidence": {"side": side, "count": len(nearby_buy or nearby_sell)},
+                "confidence": 58.0,
+            })
+
+        strong_clusters = [x for x in clusters if x.level_count >= 2]
+        if strong_clusters:
+            possibilities.append({
+                "type": "LIQUIDITY_CONCENTRATION",
+                "description": "Plusieurs niveaux se regroupent dans une même zone de prix ; cette concentration peut devenir un point d'interaction important.",
+                "evidence": {"clusters": len(strong_clusters)},
+                "confidence": min(90.0, 55.0 + len(strong_clusters) * 7.0),
+            })
+
+        if buy_clusters and sell_clusters:
+            possibilities.append({
+                "type": "TWO_SIDED_LIQUIDITY",
+                "description": "La cartographie montre des concentrations potentielles au-dessus et sous le prix, laissant plusieurs trajectoires d'interaction ouvertes.",
+                "evidence": {"buy_clusters": len(buy_clusters), "sell_clusters": len(sell_clusters)},
+                "confidence": 60.0,
+            })
+
+        if sweep_near:
+            possibilities.append({
+                "type": "LIQUIDITY_INTERACTION_WATCH",
+                "description": "Des niveaux sont suffisamment proches pour surveiller une prise de liquidité ou une réaction du prix ; aucune occurrence n'est affirmée à l'avance.",
+                "evidence": {"candidates": len(sweep_near)},
+                "confidence": 57.0,
+            })
+
+        if not possibilities:
+            possibilities.append({
+                "type": "LIQUIDITY_DISTRIBUTION_OPEN",
+                "description": "La liquidité identifiée est dispersée ; aucune concentration locale ne domine actuellement la lecture.",
+                "evidence": {"levels": len(levels), "clusters": len(clusters)},
+                "confidence": 45.0,
+            })
+
+        # Une possibilité globale de volatilité est informative uniquement.
+        avg_range = self._get_average_range(market_map)
+        if avg_range and levels:
+            nearest = min(levels, key=lambda x: x.distance_units)
+            relative_distance = nearest.distance_units / max(avg_range, 1e-12)
+            if relative_distance <= 1.5:
+                possibilities.append({
+                    "type": "LIQUIDITY_WITHIN_RECENT_RANGE",
+                    "description": "Le niveau de liquidité le plus proche se situe dans une distance comparable à l'amplitude récente du marché.",
+                    "evidence": {"distance_vs_range": round(relative_distance, 3)},
+                    "confidence": 62.0,
+                })
+
+        return possibilities
+
+    @staticmethod
+    def _build_adaptive_reading(
+        levels: List[LiquidityLevel],
+        clusters: List[LiquidityCluster],
+        possibilities: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Résumé adaptatif : décrire la structure observée plutôt que filtrer."""
+        if not levels:
+            state = "LIQUIDITY_SPARSE"
+        elif len(clusters) >= 3:
+            state = "LIQUIDITY_HIGHLY_CONCENTRATED"
+        elif len(clusters) >= 1:
+            state = "LIQUIDITY_CONCENTRATED"
+        else:
+            state = "LIQUIDITY_DISTRIBUTED"
+
+        return {
+            "state": state,
+            "level_count": len(levels),
+            "cluster_count": len(clusters),
+            "possibility_count": len(possibilities),
+            "interpretive": True,
+            "blocking": False,
         }
 
     @staticmethod
