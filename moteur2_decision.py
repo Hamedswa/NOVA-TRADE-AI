@@ -1,1120 +1,809 @@
-"""
-NOVA TRADE AI - ENGINE 2
-moteur2_decision.py
-
-DECISION ENGINE — CERVEAU STRATÉGIQUE
-
-Rôle :
-    Recevoir toutes les informations disponibles sur un setup
-    et prendre une décision globale :
-
-        BUY
-        SELL
-        WAIT
-
-Philosophie :
-    - Pas de checklist rigide.
-    - Pas de seuil RR obligatoire.
-    - Pas de seuil score obligatoire.
-    - Pas d'obligation M5/M1.
-    - Le score est informatif.
-    - Le RR est informatif.
-    - Les zones, structures, confluences et réactions sont des
-      informations permettant de construire un jugement global.
-    - Le moteur peut accepter un setup à RR inférieur à 3 si le
-      contexte global est suffisamment intéressant.
-    - Le moteur peut refuser un setup avec RR élevé si le contexte
-      est faible ou contradictoire.
-    - WAIT signifie que le marché/setup n'est pas suffisamment
-      exploitable maintenant.
-    - Le Decision Engine ne fabrique jamais Entry / SL / TP.
-    - Le Risk Engine reste responsable du plan de risque.
-    - Le Safety Guard / Validation technique reste responsable des
-      impossibilités techniques.
-
-Architecture :
-
-    Market Data
-          ↓
-    Market Radar
-          ↓
-    Market Intelligence
-          ↓
-    Context / Zones / Setups
-          ↓
-    Risk Plan
-          ↓
-    Score / Confirmation / Validation
-          ↓
-    moteur2_decision.py
-          ↓
-      BUY / SELL / WAIT
-          ↓
-    Safety / Anti-Spam
-          ↓
-       Telegram
-
-
-IMPORTANT :
-Ce moteur ne garantit évidemment pas qu'aucune opportunité ne sera
-jamais manquée. Son objectif est de réduire les faux rejets causés
-par des règles trop rigides tout en conservant une protection
-technique minimale.
-"""
+# moteur2_decision.py
+# NOVA TRADE AI — Engine 2
+#
+# Rôle :
+#   Décision stratégique finale BUY / SELL / WAIT.
+#
+# Principes :
+#   - aucune obligation de score minimum ;
+#   - aucune obligation de RR minimum ;
+#   - score et RR sont informatifs ;
+#   - la qualité n'est pas un veto ;
+#   - les observations M5/M1 sont contributives mais non bloquantes ;
+#   - le moteur peut travailler avec une opportunité/hypothèse sans setup classique ;
+#   - le plan technique est distinct du risque financier ;
+#   - aucune donnée de marché n'est fabriquée ;
+#   - le moteur ne force jamais une décision ;
+#   - BUY/SELL/WAIT reste la responsabilité exclusive de ce module.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-import math
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+import logging
 
+logger = logging.getLogger(__name__)
 
-# ============================================================================
-# CONSTANTES
-# ============================================================================
-
-ENGINE_NAME = "NOVA TRADE AI - ENGINE 2"
-
-DECISION_BUY = "BUY"
-DECISION_SELL = "SELL"
-DECISION_WAIT = "WAIT"
-
-# Références uniquement.
-# Elles NE SONT PAS des seuils de rejet.
+ENGINE_NAME = "NOVA TRADE AI — Engine 2"
 REFERENCE_SCORE = 60.0
 REFERENCE_RR = 3.0
-
-# Bornes de confiance.
 MIN_CONFIDENCE = 0.0
 MAX_CONFIDENCE = 100.0
 
 
-# ============================================================================
-# DATACLASS
-# ============================================================================
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalise_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().upper()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "to_dict"):
+        try:
+            result = value.to_dict()
+            return result if isinstance(result, dict) else {}
+        except Exception:
+            return {}
+    if hasattr(value, "__dict__"):
+        try:
+            return dict(value.__dict__)
+        except Exception:
+            return {}
+    return {}
+
+
+def _safe_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _get(value: Any, key: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    try:
+        return getattr(value, key, default)
+    except Exception:
+        return default
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, value))
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _extract_direction(*objects: Any) -> str:
+    keys = (
+        "direction",
+        "bias",
+        "directional_bias",
+        "preferred_direction",
+        "side",
+        "signal_direction",
+    )
+    for obj in objects:
+        for key in keys:
+            value = _normalise_text(_get(obj, key))
+            if value in {"BUY", "SELL"}:
+                return value
+
+        nested = _get(obj, "decision")
+        value = _normalise_text(nested)
+        if value in {"BUY", "SELL"}:
+            return value
+
+    return ""
+
+
+def _extract_symbol(*objects: Any) -> str:
+    for obj in objects:
+        value = _normalise_text(
+            _first_non_empty(
+                _get(obj, "symbol"),
+                _get(obj, "asset"),
+                _get(obj, "ticker"),
+            )
+        )
+        if value:
+            return value.replace("/", "").replace(" ", "").replace("-", "").replace("_", "")
+    return ""
+
+
+def _extract_setup_id(*objects: Any) -> str:
+    for obj in objects:
+        value = _first_non_empty(
+            _get(obj, "setup_id"),
+            _get(obj, "opportunity_id"),
+            _get(obj, "hypothesis_id"),
+            _get(obj, "id"),
+        )
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def _extract_score(value: Any) -> Optional[float]:
+    for key in ("score", "score_value", "value", "total", "confidence_score"):
+        raw = _get(value, key)
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _extract_rr(value: Any) -> Optional[float]:
+    for key in ("primary_rr", "rr", "rr_tp1", "reward_risk", "reward_to_risk"):
+        raw = _get(value, key)
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _iter_texts(value: Any) -> Iterable[str]:
+    if value is None:
+        return
+    if isinstance(value, str):
+        if value.strip():
+            yield value.strip()
+        return
+    if isinstance(value, dict):
+        for key in ("reason", "message", "description", "observation", "label", "state", "name"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.strip():
+                yield raw.strip()
+        return
+    for item in _safe_list(value):
+        yield from _iter_texts(item)
+
 
 @dataclass
 class DecisionResult:
-    """
-    Résultat produit par le Decision Engine.
-    """
-
-    decision: str
-    confidence: float
-
-    symbol: Optional[str] = None
-    setup_id: Optional[str] = None
-    direction: Optional[str] = None
-    setup_type: Optional[str] = None
-
-    priority: str = "NORMAL"
-    quality: str = "NEUTRAL"
-
+    decision: str = "WAIT"
+    confidence: float = 0.0
+    symbol: str = ""
+    setup_id: str = ""
+    direction: str = ""
+    setup_type: str = ""
+    priority: str = "LOW"
+    quality: str = "UNDETERMINED"
     reasons: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
-
     evidence: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
-
-    timestamp: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
-    )
+    timestamp: str = field(default_factory=_now_iso)
 
     @property
     def is_actionable(self) -> bool:
-        return self.decision in (DECISION_BUY, DECISION_SELL)
+        return self.decision in {"BUY", "SELL"}
 
     @property
     def is_wait(self) -> bool:
-        return self.decision == DECISION_WAIT
+        return self.decision == "WAIT"
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "decision": self.decision,
-            "confidence": self.confidence,
-            "symbol": self.symbol,
-            "setup_id": self.setup_id,
-            "direction": self.direction,
-            "setup_type": self.setup_type,
-            "priority": self.priority,
-            "quality": self.quality,
-            "reasons": list(self.reasons),
-            "warnings": list(self.warnings),
-            "evidence": dict(self.evidence),
-            "metadata": dict(self.metadata),
-            "timestamp": self.timestamp,
-            "is_actionable": self.is_actionable,
-            "is_wait": self.is_wait,
-        }
+        return asdict(self)
 
-
-# ============================================================================
-# DECISION ENGINE
-# ============================================================================
 
 class Moteur2Decision:
     """
-    Cerveau stratégique du moteur 2.
+    Décide à partir d'un ensemble d'éléments de marché.
 
-    Le moteur ne cherche pas à vérifier une liste de cases obligatoires.
+    Le moteur ne demande pas qu'un objet particulier existe.
+    Il peut utiliser :
+        - opportunité ;
+        - hypothèse ;
+        - scénario ;
+        - contexte ;
+        - marché ;
+        - zones ;
+        - liquidité ;
+        - confluences ;
+        - confirmation ;
+        - plan technique ;
+        - validation technique ;
+        - intelligence/fondamental.
 
-    Il cherche à répondre à une question :
-
-        "Est-ce que l'ensemble des informations disponibles forme
-         actuellement une opportunité exploitable ?"
-
-    Les différentes informations contribuent à la conviction globale.
-
-    Aucune de ces informations, à elle seule, ne constitue un veto
-    stratégique automatique.
+    Les éléments économiques/financiers éventuels restent du contexte.
+    Ils ne deviennent pas un mécanisme automatique de gestion du capital.
     """
 
     def __init__(
         self,
         reference_score: float = REFERENCE_SCORE,
         reference_rr: float = REFERENCE_RR,
-    ):
-        self.reference_score = float(reference_score)
-        self.reference_rr = float(reference_rr)
+    ) -> None:
+        # Conservés uniquement pour compatibilité avec les appels existants.
+        # Ils ne constituent aucun seuil de décision.
+        self.reference_score = _safe_float(reference_score, REFERENCE_SCORE)
+        self.reference_rr = _safe_float(reference_rr, REFERENCE_RR)
 
-        self.last_decision: Optional[DecisionResult] = None
+    # ------------------------------------------------------------------
+    # EXTRACTION GÉNÉRIQUE
+    # ------------------------------------------------------------------
 
-    # ========================================================================
-    # UTILITAIRES
-    # ========================================================================
-
-    @staticmethod
-    def _safe_float(
-        value: Any,
-        default: Optional[float] = None,
-    ) -> Optional[float]:
-
-        try:
-            if value is None:
-                return default
-
-            result = float(value)
-
-            if not math.isfinite(result):
-                return default
-
-            return result
-
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def _normalize_direction(direction: Any) -> Optional[str]:
-
-        if direction is None:
-            return None
-
-        value = str(direction).strip().upper()
-
-        aliases = {
-            "LONG": DECISION_BUY,
-            "SHORT": DECISION_SELL,
-            "BULLISH": DECISION_BUY,
-            "BEARISH": DECISION_SELL,
-            "UP": DECISION_BUY,
-            "DOWN": DECISION_SELL,
-        }
-
-        return aliases.get(value, value)
-
-    @staticmethod
-    def _get(data: Any, key: str, default: Any = None) -> Any:
-        """
-        Permet de travailler avec :
-            - dict
-            - objet Python
-        """
-
-        if data is None:
-            return default
-
-        if isinstance(data, dict):
-            return data.get(key, default)
-
-        return getattr(data, key, default)
-
-    @staticmethod
-    def _clamp(
-        value: float,
-        minimum: float = MIN_CONFIDENCE,
-        maximum: float = MAX_CONFIDENCE,
-    ) -> float:
-
-        return max(minimum, min(maximum, value))
-
-    @staticmethod
-    def _extract_direction(setup: Any) -> Optional[str]:
-
-        for key in (
-            "direction",
-            "side",
-            "signal",
-            "bias",
-        ):
-            value = Moteur2Decision._get(setup, key)
-
-            direction = Moteur2Decision._normalize_direction(value)
-
-            if direction in (DECISION_BUY, DECISION_SELL):
-                return direction
-
-        return None
-
-    @staticmethod
-    def _extract_symbol(setup: Any, context: Any = None) -> Optional[str]:
-
-        symbol = Moteur2Decision._get(setup, "symbol")
-
-        if symbol:
-            return str(symbol).upper()
-
-        symbol = Moteur2Decision._get(context, "symbol")
-
-        if symbol:
-            return str(symbol).upper()
-
-        return None
-
-    @staticmethod
-    def _extract_setup_id(setup: Any) -> Optional[str]:
-
-        for key in (
-            "setup_id",
-            "id",
-            "identifier",
-        ):
-            value = Moteur2Decision._get(setup, key)
-
-            if value is not None:
-                return str(value)
-
-        return None
-
-    # ========================================================================
-    # EXTRACTION DES INFORMATIONS
-    # ========================================================================
-
-    def _extract_score(self, score_result: Any) -> Optional[float]:
-
-        if score_result is None:
-            return None
-
-        for key in (
-            "score",
-            "score_value",
-            "value",
-            "total",
-        ):
-            value = self._get(score_result, key)
-
-            number = self._safe_float(value)
-
-            if number is not None:
-                return number
-
-        return None
-
-    def _extract_rr(self, risk_plan: Any) -> Optional[float]:
-
-        if risk_plan is None:
-            return None
-
-        for key in (
-            "primary_rr",
-            "rr",
-            "rr_tp1",
-        ):
-            value = self._get(risk_plan, key)
-
-            number = self._safe_float(value)
-
-            if number is not None:
-                return number
-
-        return None
-
-    def _extract_quality(self, source: Any) -> Optional[str]:
-
-        for key in (
-            "quality",
-            "quality_label",
-            "grade",
-            "classification",
-        ):
-            value = self._get(source, key)
-
-            if value:
-                return str(value).upper()
-
-        return None
-
-    # ========================================================================
-    # CONTEXTE
-    # ========================================================================
-
-    def _analyse_context(
+    def _directional_sources(
         self,
-        context: Any,
-        direction: str,
-    ) -> Dict[str, Any]:
-
-        result = {
-            "supportive": 0.0,
-            "contradictory": 0.0,
-            "neutral": 0.0,
-            "details": [],
-        }
-
-        if context is None:
-            result["neutral"] = 1.0
-            result["details"].append("Contexte indisponible.")
-            return result
-
-        # Direction générale du contexte.
-        context_direction = None
-
-        for key in (
-            "direction",
-            "bias",
-            "market_bias",
-            "trend",
-        ):
-            value = self._get(context, key)
-
-            normalized = self._normalize_direction(value)
-
-            if normalized in (DECISION_BUY, DECISION_SELL):
-                context_direction = normalized
-                break
-
-        if context_direction == direction:
-            result["supportive"] += 1.0
-            result["details"].append(
-                "Le contexte général soutient la direction du setup."
-            )
-
-        elif context_direction in (DECISION_BUY, DECISION_SELL):
-            result["contradictory"] += 1.0
-            result["details"].append(
-                "Le contexte général présente une opposition à la direction."
-            )
-
-        else:
-            result["neutral"] += 1.0
-
-        # Etat du marché.
-        market_state = self._get(context, "market_state")
-
-        if market_state:
-            state = str(market_state).upper()
-
-            if state in {
-                "TREND",
-                "TRENDING",
-                "EXPANSION",
-                "IMPULSE",
-                "DIRECTIONAL",
-            }:
-                result["supportive"] += 0.5
-                result["details"].append(
-                    f"Etat de marché exploitable : {state}."
-                )
-
-            elif state in {
-                "CHAOTIC",
-                "UNSTABLE",
-                "EXTREME_NOISE",
-            }:
-                result["contradictory"] += 0.5
-                result["details"].append(
-                    f"Marché actuellement instable : {state}."
-                )
-
-        return result
-
-    # ========================================================================
-    # STRUCTURE
-    # ========================================================================
-
-    def _analyse_structure(
-        self,
+        setup: Any,
+        opportunite: Any,
+        hypothese: Any,
+        contexte: Any,
         structure: Any,
-        direction: str,
-    ) -> Dict[str, Any]:
-
-        result = {
-            "supportive": 0.0,
-            "contradictory": 0.0,
-            "neutral": 0.0,
-            "details": [],
-        }
-
-        if structure is None:
-            result["neutral"] = 1.0
-            return result
-
-        structure_direction = None
-
-        for key in (
-            "direction",
-            "bias",
-            "trend",
-            "market_direction",
-        ):
-            value = self._get(structure, key)
-
-            normalized = self._normalize_direction(value)
-
-            if normalized in (DECISION_BUY, DECISION_SELL):
-                structure_direction = normalized
-                break
-
-        if structure_direction == direction:
-            result["supportive"] += 1.2
-            result["details"].append(
-                "La structure disponible soutient la direction."
-            )
-
-        elif structure_direction in (DECISION_BUY, DECISION_SELL):
-            result["contradictory"] += 1.2
-            result["details"].append(
-                "La structure présente une divergence directionnelle."
-            )
-
-        else:
-            result["neutral"] += 1.0
-
-        return result
-
-    # ========================================================================
-    # ZONES
-    # ========================================================================
-
-    def _analyse_zones(
-        self,
         zones: Any,
-        direction: str,
-    ) -> Dict[str, Any]:
-
-        result = {
-            "supportive": 0.0,
-            "contradictory": 0.0,
-            "neutral": 0.0,
-            "details": [],
-        }
-
-        if zones is None:
-            result["neutral"] = 1.0
-            return result
-
-        zone_direction = None
-
-        for key in (
-            "direction",
-            "bias",
-            "preferred_direction",
-        ):
-            value = self._get(zones, key)
-
-            normalized = self._normalize_direction(value)
-
-            if normalized in (DECISION_BUY, DECISION_SELL):
-                zone_direction = normalized
-                break
-
-        if zone_direction == direction:
-            result["supportive"] += 1.0
-            result["details"].append(
-                "Les zones importantes favorisent la direction."
-            )
-
-        elif zone_direction in (DECISION_BUY, DECISION_SELL):
-            result["contradictory"] += 0.8
-            result["details"].append(
-                "Certaines zones favorisent le sens opposé."
-            )
-
-        else:
-            result["neutral"] += 1.0
-
-        # Proximité d'une zone exploitable.
-        near_zone = self._get(zones, "near_important_zone")
-
-        if near_zone is True:
-            result["supportive"] += 0.7
-            result["details"].append(
-                "Le prix se trouve à proximité d'une zone importante."
-            )
-
-        return result
-
-    # ========================================================================
-    # CONFLUENCES
-    # ========================================================================
-
-    def _analyse_confluences(
-        self,
         confluences: Any,
-        direction: str,
-    ) -> Dict[str, Any]:
-
-        result = {
-            "supportive": 0.0,
-            "contradictory": 0.0,
-            "neutral": 0.0,
-            "details": [],
-        }
-
-        if confluences is None:
-            result["neutral"] = 1.0
-            return result
-
-        strength = None
-
-        for key in (
-            "strength",
-            "score",
-            "confluence_score",
-            "value",
-        ):
-            value = self._get(confluences, key)
-
-            number = self._safe_float(value)
-
-            if number is not None:
-                strength = number
-                break
-
-        if strength is not None:
-
-            if strength >= 75:
-                result["supportive"] += 1.5
-                result["details"].append(
-                    f"Confluences fortes ({strength:.1f})."
-                )
-
-            elif strength >= 50:
-                result["supportive"] += 0.8
-                result["details"].append(
-                    f"Confluences modérées ({strength:.1f})."
-                )
-
-            elif strength < 30:
-                result["contradictory"] += 0.5
-                result["details"].append(
-                    f"Confluences faibles ({strength:.1f})."
-                )
-
-            else:
-                result["neutral"] += 0.5
-
-        direction_value = None
-
-        for key in (
-            "direction",
-            "bias",
-            "preferred_direction",
-        ):
-            value = self._get(confluences, key)
-
-            normalized = self._normalize_direction(value)
-
-            if normalized in (DECISION_BUY, DECISION_SELL):
-                direction_value = normalized
-                break
-
-        if direction_value == direction:
-            result["supportive"] += 0.8
-
-        elif direction_value in (DECISION_BUY, DECISION_SELL):
-            result["contradictory"] += 0.8
-
-        return result
-
-    # ========================================================================
-    # CONFIRMATIONS
-    # ========================================================================
-
-    def _analyse_confirmation(
-        self,
         confirmation: Any,
-        direction: str,
-    ) -> Dict[str, Any]:
-
-        result = {
-            "supportive": 0.0,
-            "contradictory": 0.0,
-            "neutral": 0.0,
-            "details": [],
-        }
-
-        if confirmation is None:
-            result["neutral"] = 1.0
-            result["details"].append(
-                "Aucune confirmation supplémentaire disponible."
-            )
-            return result
-
-        # IMPORTANT :
-        # M5/M1 ne sont jamais des conditions obligatoires.
-
-        confirmed = self._get(confirmation, "confirmed")
-
-        if confirmed is True:
-            result["supportive"] += 1.0
-            result["details"].append(
-                "Confirmation supplémentaire favorable."
-            )
-
-        elif confirmed is False:
-            result["neutral"] += 0.2
-            result["details"].append(
-                "Confirmation supplémentaire absente ou non confirmée."
-            )
-
-        confirmation_direction = None
-
-        for key in (
-            "direction",
-            "bias",
-            "signal",
-        ):
-            value = self._get(confirmation, key)
-
-            normalized = self._normalize_direction(value)
-
-            if normalized in (DECISION_BUY, DECISION_SELL):
-                confirmation_direction = normalized
-                break
-
-        if confirmation_direction == direction:
-            result["supportive"] += 0.6
-
-        elif confirmation_direction in (
-            DECISION_BUY,
-            DECISION_SELL,
-        ):
-            result["contradictory"] += 0.8
-            result["details"].append(
-                "La confirmation secondaire diverge de la direction."
-            )
-
-        return result
-
-    # ========================================================================
-    # SCORE
-    # ========================================================================
-
-    def _analyse_score(
-        self,
-        score_result: Any,
-    ) -> Dict[str, Any]:
-
-        score = self._extract_score(score_result)
-
-        result = {
-            "score": score,
-            "supportive": 0.0,
-            "contradictory": 0.0,
-            "details": [],
-        }
-
-        if score is None:
-            result["details"].append(
-                "Score indisponible."
-            )
-            return result
-
-        # Le score influence la conviction mais ne décide pas seul.
-
-        if score >= 80:
-            result["supportive"] = 1.5
-            result["details"].append(
-                f"Score très solide ({score:.1f})."
-            )
-
-        elif score >= 65:
-            result["supportive"] = 1.0
-            result["details"].append(
-                f"Score favorable ({score:.1f})."
-            )
-
-        elif score >= 50:
-            result["supportive"] = 0.4
-            result["details"].append(
-                f"Score intermédiaire ({score:.1f})."
-            )
-
-        elif score >= 35:
-            result["contradictory"] = 0.3
-            result["details"].append(
-                f"Score faible ({score:.1f}), mais non bloquant."
-            )
-
-        else:
-            result["contradictory"] = 0.6
-            result["details"].append(
-                f"Score très faible ({score:.1f}), sans veto automatique."
-            )
-
-        return result
-
-    # ========================================================================
-    # RR
-    # ========================================================================
-
-    def _analyse_rr(
-        self,
-        risk_plan: Any,
-    ) -> Dict[str, Any]:
-
-        rr = self._extract_rr(risk_plan)
-
-        result = {
-            "rr": rr,
-            "supportive": 0.0,
-            "contradictory": 0.0,
-            "details": [],
-        }
-
-        if rr is None:
-            result["contradictory"] = 1.0
-            result["details"].append(
-                "RR indisponible."
-            )
-            return result
-
-        if rr >= 5:
-            result["supportive"] = 1.5
-            result["details"].append(
-                f"RR exceptionnel ({rr:.2f})."
-            )
-
-        elif rr >= 3:
-            result["supportive"] = 1.2
-            result["details"].append(
-                f"RR très favorable ({rr:.2f})."
-            )
-
-        elif rr >= 2:
-            result["supportive"] = 0.7
-            result["details"].append(
-                f"RR intéressant ({rr:.2f}), sans exigence de 3R."
-            )
-
-        elif rr >= 1:
-            result["supportive"] = 0.1
-            result["details"].append(
-                f"RR exploitable mais faible ({rr:.2f})."
-            )
-
-        else:
-            result["contradictory"] = 1.5
-            result["details"].append(
-                f"RR défavorable ({rr:.2f})."
-            )
-
-        return result
-
-    # ========================================================================
-    # COHÉRENCE DU SETUP
-    # ========================================================================
-
-    def _analyse_setup_quality(
-        self,
-        setup: Any,
-    ) -> Dict[str, Any]:
-
-        result = {
-            "supportive": 0.0,
-            "contradictory": 0.0,
-            "details": [],
-        }
-
-        if setup is None:
-            result["contradictory"] = 1.0
-            result["details"].append(
-                "Setup absent."
-            )
-            return result
-
-        quality = self._extract_quality(setup)
-
-        if quality:
-
-            if quality in {
-                "EXCELLENT",
-                "VERY_GOOD",
-                "HIGH",
-                "A+",
-                "A",
-            }:
-                result["supportive"] += 1.2
-
-            elif quality in {
-                "GOOD",
-                "FAVORABLE",
-                "B",
-            }:
-                result["supportive"] += 0.7
-
-            elif quality in {
-                "WEAK",
-                "LOW",
-                "POOR",
-                "C",
-            }:
-                result["contradictory"] += 0.4
-
-            result["details"].append(
-                f"Qualité du setup : {quality}."
-            )
-
-        return result
-
-    # ========================================================================
-    # VALIDATION TECHNIQUE
-    # ========================================================================
-
-    def _technical_safety_check(
-        self,
-        setup: Any,
-        risk_plan: Any,
-        validation: Any,
-        direction: Optional[str],
-    ) -> Dict[str, Any]:
-
-        """
-        Ici seulement se trouvent les véritables impossibilités
-        techniques.
-
-        Ce n'est PAS une décision stratégique.
-        """
-
-        blockers: List[str] = []
-
-        if setup is None:
-            blockers.append("setup_absent")
-
-        if direction not in (DECISION_BUY, DECISION_SELL):
-            blockers.append("direction_invalide")
-
-        if risk_plan is None:
-            blockers.append("risk_plan_absent")
-
-        if risk_plan is not None:
-
-            entry = self._safe_float(
-                self._get(risk_plan, "entry")
-            )
-
-            sl = self._safe_float(
-                self._get(risk_plan, "sl")
-            )
-
-            tp1 = self._safe_float(
-                self._get(risk_plan, "tp1")
-            )
-
-            if entry is None:
-                blockers.append("entry_absente")
-
-            if sl is None:
-                blockers.append("sl_absente")
-
-            if tp1 is None:
-                blockers.append("tp1_absent")
-
-            if (
-                entry is not None
-                and sl is not None
-            ):
-                if direction == DECISION_BUY and sl >= entry:
-                    blockers.append("geometrie_sl_buy_invalide")
-
-                if direction == DECISION_SELL and sl <= entry:
-                    blockers.append("geometrie_sl_sell_invalide")
-
-            if (
-                entry is not None
-                and tp1 is not None
-            ):
-                if direction == DECISION_BUY and tp1 <= entry:
-                    blockers.append("geometrie_tp_buy_invalide")
-
-                if direction == DECISION_SELL and tp1 >= entry:
-                    blockers.append("geometrie_tp_sell_invalide")
-
-        if validation is not None:
-
-            valid = self._get(validation, "valid")
-
-            # False n'est pas toujours interprété comme un veto
-            # stratégique. On regarde les éventuels blockers explicites.
-
-            technical_blockers = self._get(
-                validation,
-                "technical_blockers",
-            )
-
-            if isinstance(technical_blockers, (list, tuple)):
-                blockers.extend(
-                    str(x) for x in technical_blockers if x
-                )
-
-            explicit_critical = self._get(
-                validation,
-                "critical_error",
-            )
-
-            if explicit_critical:
-                blockers.append(str(explicit_critical))
-
-            status = str(
-                self._get(validation, "status", "")
-            ).upper()
-
-            if status in {
-                "TECHNICAL_INVALID",
-                "INVALID_GEOMETRY",
-                "BROKEN_DATA",
-                "CRITICAL_ERROR",
-            }:
-                blockers.append(
-                    f"validation:{status}"
-                )
-
-        return {
-            "safe": len(blockers) == 0,
-            "blockers": list(dict.fromkeys(blockers)),
-        }
-
-    # ========================================================================
-    # CALCUL DE CONVICTION
-    # ========================================================================
-
-    def _calculate_conviction(
-        self,
-        components: List[Dict[str, Any]],
-    ) -> Dict[str, float]:
+        intelligence: Any,
+        fondamental: Any,
+    ) -> List[Tuple[str, str]]:
+        sources: List[Tuple[str, str]] = []
+        objects = (
+            ("opportunite", opportunite),
+            ("hypothese", hypothese),
+            ("contexte", contexte),
+            ("structure", structure),
+            ("zones", zones),
+            ("confluences", confluences),
+            ("confirmation", confirmation),
+            ("intelligence", intelligence),
+            ("fondamental", fondamental),
+            ("setup_compatibilite", setup),
+        )
+
+        for name, obj in objects:
+            direction = _extract_direction(obj)
+            if direction in {"BUY", "SELL"}:
+                sources.append((name, direction))
+
+        return sources
+
+    def _analyse_context(self, contexte: Any, direction: str) -> Dict[str, Any]:
+        data = _safe_dict(contexte)
+        bias = _extract_direction(data)
 
         supportive = 0.0
         contradictory = 0.0
+        reasons: List[str] = []
+        warnings: List[str] = []
 
-        for component in components:
-            supportive += float(
-                component.get("supportive", 0.0)
+        if bias == direction:
+            supportive += 2.0
+            reasons.append(f"Le contexte général converge vers {direction}.")
+        elif bias in {"BUY", "SELL"}:
+            contradictory += 2.0
+            warnings.append(
+                f"Le contexte général indique {bias}, différent de l'hypothèse {direction}."
             )
 
-            contradictory += float(
-                component.get("contradictory", 0.0)
+        state = _normalise_text(
+            _first_non_empty(
+                data.get("market_state"),
+                data.get("market_regime"),
+                data.get("phase"),
             )
+        )
 
-        total = supportive + contradictory
-
-        if total <= 0:
-            conviction = 50.0
-
-        else:
-            conviction = (
-                supportive / total
-            ) * 100.0
-
-        # La conviction ne devient jamais négative ou >100.
-        conviction = self._clamp(conviction)
+        if state in {
+            "TRENDING",
+            "DIRECTIONAL",
+            "EXPANSION",
+            "IMPULSE",
+            "ACCELERATION",
+        }:
+            supportive += 1.0
+            reasons.append(f"État de marché compatible avec un développement directionnel ({state}).")
+        elif state in {"CHAOTIC", "UNSTABLE"}:
+            contradictory += 0.8
+            warnings.append("Le marché présente un contexte instable.")
 
         return {
             "supportive": supportive,
             "contradictory": contradictory,
-            "conviction": conviction,
+            "reasons": reasons,
+            "warnings": warnings,
+            "state": state,
+            "bias": bias,
         }
 
-    # ========================================================================
-    # QUALIFICATION
-    # ========================================================================
-
-    @staticmethod
-    def _quality_from_confidence(
-        confidence: float,
-    ) -> str:
-
-        if confidence >= 90:
-            return "EXCEPTIONAL"
-
-        if confidence >= 80:
-            return "VERY_STRONG"
-
-        if confidence >= 70:
-            return "STRONG"
-
-        if confidence >= 60:
-            return "FAVORABLE"
-
-        if confidence >= 50:
-            return "NEUTRAL"
-
-        if confidence >= 40:
-            return "WEAK"
-
-        return "VERY_WEAK"
-
-    @staticmethod
-    def _priority_from_confidence(
-        confidence: float,
-    ) -> str:
-
-        if confidence >= 85:
-            return "HIGH"
-
-        if confidence >= 70:
-            return "NORMAL"
-
-        if confidence >= 55:
-            return "LOW"
-
-        return "OBSERVATION"
-
-    # ========================================================================
-    # RAISONS
-    # ========================================================================
-
-    @staticmethod
-    def _collect_details(
-        components: List[Dict[str, Any]],
-    ) -> List[str]:
-
+    def _analyse_structure(self, structure: Any, direction: str) -> Dict[str, Any]:
+        bias = _extract_direction(structure)
+        supportive = 0.0
+        contradictory = 0.0
         reasons: List[str] = []
+        warnings: List[str] = []
 
-        for component in components:
+        if bias == direction:
+            supportive += 1.5
+            reasons.append(f"La lecture structurelle converge vers {direction}.")
+        elif bias in {"BUY", "SELL"}:
+            contradictory += 1.5
+            warnings.append(f"La lecture structurelle indique {bias}.")
 
-            details = component.get(
-                "details",
-                [],
+        return {
+            "supportive": supportive,
+            "contradictory": contradictory,
+            "reasons": reasons,
+            "warnings": warnings,
+            "bias": bias,
+        }
+
+    def _analyse_zones(self, zones: Any, direction: str) -> Dict[str, Any]:
+        data = _safe_dict(zones)
+        bias = _extract_direction(data)
+        supportive = 0.0
+        contradictory = 0.0
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        if bias == direction:
+            supportive += 1.0
+            reasons.append(f"Les zones observées sont compatibles avec {direction}.")
+        elif bias in {"BUY", "SELL"}:
+            contradictory += 0.8
+            warnings.append(f"Les zones présentent un biais {bias}.")
+
+        near = _get(data, "near_important_zone")
+        if near is True:
+            supportive += 0.5
+            reasons.append("Une zone importante est proche du prix.")
+
+        possibilities = _get(data, "possibilities")
+        if possibilities:
+            reasons.append("Les interactions avec les zones alimentent l'analyse des possibilités.")
+
+        return {
+            "supportive": supportive,
+            "contradictory": contradictory,
+            "reasons": reasons,
+            "warnings": warnings,
+            "bias": bias,
+        }
+
+    def _analyse_confluences(self, confluences: Any, direction: str) -> Dict[str, Any]:
+        data = _safe_dict(confluences)
+        bias = _extract_direction(data)
+        strength = _safe_float(
+            _first_non_empty(
+                data.get("strength"),
+                data.get("confluence_strength"),
+                data.get("score"),
+            ),
+            0.0,
+        )
+
+        supportive = 0.0
+        contradictory = 0.0
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        if bias == direction:
+            supportive += 1.5
+            reasons.append(f"Les confluences disponibles convergent vers {direction}.")
+        elif bias in {"BUY", "SELL"}:
+            contradictory += 1.2
+            warnings.append(f"Les confluences présentent un biais {bias}.")
+
+        if strength >= 75:
+            supportive += 1.0
+            reasons.append("Plusieurs éléments convergent avec une intensité élevée.")
+        elif strength >= 50:
+            supportive += 0.5
+        elif 0 < strength < 30:
+            contradictory += 0.3
+            warnings.append("La convergence observée reste faible.")
+
+        return {
+            "supportive": supportive,
+            "contradictory": contradictory,
+            "reasons": reasons,
+            "warnings": warnings,
+            "bias": bias,
+            "strength": strength,
+        }
+
+    def _analyse_confirmation(self, confirmation: Any, direction: str) -> Dict[str, Any]:
+        data = _safe_dict(confirmation)
+        bias = _extract_direction(data)
+        supportive = 0.0
+        contradictory = 0.0
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        confirmed = _get(data, "confirmation_valid")
+        if confirmed is None:
+            confirmed = _get(data, "confirmed")
+
+        if confirmed is True:
+            supportive += 1.0
+            reasons.append("La confirmation disponible converge avec l'hypothèse.")
+        elif confirmed is False:
+            # Non-confirmation = information, pas veto.
+            warnings.append("La confirmation n'est pas complète ; elle reste informative.")
+
+        status = _normalise_text(
+            _first_non_empty(
+                data.get("confirmation_status"),
+                data.get("status"),
+            )
+        )
+        if status in {"CONVERGENCE", "CONFIRMED", "FAVORABLE"}:
+            supportive += 0.8
+        elif status in {"CONTRARY", "OPPOSITE"}:
+            contradictory += 0.8
+            warnings.append("La confirmation contient une pression contraire.")
+
+        if bias == direction:
+            supportive += 0.5
+        elif bias in {"BUY", "SELL"}:
+            contradictory += 0.7
+
+        return {
+            "supportive": supportive,
+            "contradictory": contradictory,
+            "reasons": reasons,
+            "warnings": warnings,
+            "bias": bias,
+            "status": status,
+        }
+
+    def _analyse_possibilities(
+        self,
+        opportunite: Any,
+        hypothese: Any,
+        scenarios: Any,
+        intelligence: Any,
+        contexte: Any,
+    ) -> Dict[str, Any]:
+        """
+        Analyse les possibilités sans demander qu'elles appartiennent
+        à une famille prédéfinie.
+        """
+        supportive = 0.0
+        contradictory = 0.0
+        reasons: List[str] = []
+        warnings: List[str] = []
+        items: List[Dict[str, Any]] = []
+
+        sources = (
+            ("opportunite", opportunite),
+            ("hypothese", hypothese),
+            ("scenarios", scenarios),
+            ("intelligence", intelligence),
+            ("contexte", contexte),
+        )
+
+        for source_name, source in sources:
+            if source is None:
+                continue
+
+            data = _safe_dict(source)
+
+            raw_items = _first_non_empty(
+                data.get("possibilities"),
+                data.get("opportunities"),
+                data.get("scenarios"),
+                data.get("hypotheses"),
+                data.get("observations"),
             )
 
-            if isinstance(details, str):
-                details = [details]
+            for item in _safe_list(raw_items):
+                item_data = _safe_dict(item)
+                if not item_data and isinstance(item, str):
+                    item_data = {"description": item}
 
-            for detail in details:
+                item_direction = _extract_direction(item_data)
+                state = _normalise_text(
+                    _first_non_empty(
+                        item_data.get("state"),
+                        item_data.get("bias"),
+                        item_data.get("status"),
+                    )
+                )
+                description = str(
+                    _first_non_empty(
+                        item_data.get("description"),
+                        item_data.get("name"),
+                        item_data.get("type"),
+                        item_data.get("label"),
+                        state,
+                    )
+                    or ""
+                ).strip()
 
-                if detail and detail not in reasons:
-                    reasons.append(str(detail))
+                if item_direction == _extract_direction(opportunite, hypothese) and item_direction:
+                    supportive += 0.8
+                elif item_direction in {"BUY", "SELL"}:
+                    if item_direction == _extract_direction(opportunite, hypothese):
+                        supportive += 0.5
+                    else:
+                        contradictory += 0.5
 
-        return reasons
+                if description:
+                    items.append(
+                        {
+                            "source": source_name,
+                            "description": description,
+                            "direction": item_direction,
+                            "state": state,
+                        }
+                    )
 
-    # ========================================================================
-    # MÉTHODE PRINCIPALE
-    # ========================================================================
+            # Un conteneur d'opportunités est déjà une information utile,
+            # même si aucun type précis n'est reconnu.
+            if raw_items:
+                supportive += 0.2
+
+        if items:
+            reasons.append(f"{len(items)} possibilité(s) de marché ont été intégrées à la décision.")
+
+        return {
+            "supportive": supportive,
+            "contradictory": contradictory,
+            "reasons": reasons,
+            "warnings": warnings,
+            "items": items,
+        }
+
+    def _analyse_score(self, score_result: Any) -> Dict[str, Any]:
+        """
+        Le score est observé mais ne pilote pas la décision.
+        """
+        score = _extract_score(score_result)
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        if score is None:
+            return {
+                "score": None,
+                "supportive": 0.0,
+                "contradictory": 0.0,
+                "reasons": reasons,
+                "warnings": warnings,
+            }
+
+        if score >= 80:
+            reasons.append(f"Score descriptif élevé ({score:.1f}/100).")
+        elif score < 35:
+            warnings.append(f"Score descriptif faible ({score:.1f}/100).")
+        else:
+            reasons.append(f"Score descriptif observé : {score:.1f}/100.")
+
+        return {
+            "score": score,
+            "supportive": 0.0,
+            "contradictory": 0.0,
+            "reasons": reasons,
+            "warnings": warnings,
+        }
+
+    def _analyse_rr(self, plan: Any, score_result: Any = None) -> Dict[str, Any]:
+        """
+        Le RR est uniquement descriptif.
+        Il ne modifie jamais la conviction.
+        """
+        rr = _extract_rr(plan)
+        if rr is None:
+            rr = _extract_rr(score_result)
+
+        warnings: List[str] = []
+        reasons: List[str] = []
+
+        if rr is None:
+            return {
+                "rr": None,
+                "supportive": 0.0,
+                "contradictory": 0.0,
+                "reasons": reasons,
+                "warnings": warnings,
+            }
+
+        reasons.append(f"RR technique observé : {rr:.2f}.")
+        if rr < 1.0:
+            warnings.append("RR technique faible ; information à considérer par le trader.")
+        elif rr < self.reference_rr:
+            warnings.append(
+                f"RR inférieur à la référence descriptive {self.reference_rr:.2f} ; aucun veto."
+            )
+
+        return {
+            "rr": rr,
+            "supportive": 0.0,
+            "contradictory": 0.0,
+            "reasons": reasons,
+            "warnings": warnings,
+        }
+
+    def _analyse_quality(self, source: Any) -> Dict[str, Any]:
+        quality = _normalise_text(
+            _first_non_empty(
+                _get(source, "quality"),
+                _get(source, "setup_quality"),
+                _get(source, "quality_label"),
+            )
+        )
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        if quality in {"HIGH", "GOOD", "STRONG"}:
+            reasons.append(f"Qualité descriptive : {quality}.")
+        elif quality in {"LOW", "WEAK", "POOR"}:
+            warnings.append(f"Qualité descriptive : {quality}.")
+        elif quality:
+            reasons.append(f"Qualité descriptive : {quality}.")
+
+        return {
+            "quality": quality or "UNDETERMINED",
+            "supportive": 0.0,
+            "contradictory": 0.0,
+            "reasons": reasons,
+            "warnings": warnings,
+        }
+
+    def _analyse_validation(
+        self,
+        validation_result: Any,
+        plan: Any,
+    ) -> Dict[str, Any]:
+        """
+        La validation n'est pas le décideur.
+        Elle fournit seulement des faits techniques critiques.
+        """
+        data = _safe_dict(validation_result)
+        blockers = _safe_list(
+            _first_non_empty(
+                data.get("technical_blockers"),
+                data.get("blockers"),
+            )
+        )
+        critical_error = bool(data.get("critical_error", False))
+        status = _normalise_text(data.get("status"))
+
+        warnings: List[str] = []
+        reasons: List[str] = []
+
+        if critical_error:
+            warnings.append("La validation technique signale une erreur critique.")
+
+        if blockers:
+            warnings.append(f"{len(blockers)} problème(s) technique(s) signalé(s) par la validation.")
+
+        if status:
+            reasons.append(f"État de validation technique : {status}.")
+
+        # On vérifie seulement l'existence/cohérence minimale du plan
+        # si celui-ci est fourni. L'absence de plan n'annule pas la décision
+        # stratégique ; elle empêchera ensuite un signal technique exploitable.
+        plan_data = _safe_dict(plan)
+        entry = _get(plan_data, "entry")
+        sl = _get(plan_data, "sl")
+        tp1 = _first_non_empty(
+            _get(plan_data, "tp1"),
+            _get(plan_data, "tp"),
+        )
+
+        plan_state = {
+            "available": bool(plan_data),
+            "entry_present": entry is not None,
+            "sl_present": sl is not None,
+            "tp1_present": tp1 is not None,
+        }
+
+        return {
+            "supportive": 0.0,
+            "contradictory": 0.0,
+            "reasons": reasons,
+            "warnings": warnings,
+            "technical_blockers": blockers,
+            "critical_error": critical_error,
+            "status": status,
+            "plan_state": plan_state,
+        }
+
+    def _technical_safety_check(
+        self,
+        direction: str,
+        validation_result: Any,
+    ) -> Dict[str, Any]:
+        """
+        Sécurité minimale : une direction inconnue ne peut pas produire BUY/SELL.
+        Une erreur technique explicitement critique peut imposer WAIT.
+        """
+        blockers: List[str] = []
+
+        if direction not in {"BUY", "SELL"}:
+            blockers.append("Direction exploitable absente.")
+
+        validation = _safe_dict(validation_result)
+        if bool(validation.get("critical_error", False)):
+            blockers.append("Erreur technique critique signalée.")
+
+        return {
+            "safe": not blockers,
+            "blockers": blockers,
+        }
+
+    def _calculate_conviction(
+        self,
+        supportive: float,
+        contradictory: float,
+        meaningful_sources: int,
+    ) -> float:
+        """
+        Conviction adaptative.
+
+        Il n'existe pas de seuil fixe de score/RR.
+        La décision compare l'information convergente et contradictoire.
+        """
+        total = supportive + contradictory
+        if total <= 0:
+            return 50.0
+
+        conviction = (supportive / total) * 100.0
+
+        # Plus il existe de sources réellement informatives, plus la
+        # conviction représente un ensemble d'observations plutôt qu'un
+        # seul champ isolé. Ce facteur reste doux et non bloquant.
+        if meaningful_sources >= 5:
+            conviction += 2.0
+        elif meaningful_sources >= 3:
+            conviction += 1.0
+
+        return _clamp(conviction)
+
+    def _priority_from_confidence(self, confidence: float) -> str:
+        if confidence >= 75:
+            return "HIGH"
+        if confidence >= 60:
+            return "MEDIUM"
+        return "LOW"
+
+    def _quality_from_balance(
+        self,
+        confidence: float,
+        contradictory: float,
+    ) -> str:
+        if contradictory <= 0 and confidence >= 75:
+            return "STRONG"
+        if confidence >= 65:
+            return "GOOD"
+        if confidence >= 50:
+            return "MIXED"
+        return "WEAK"
+
+    # ------------------------------------------------------------------
+    # API PRINCIPALE
+    # ------------------------------------------------------------------
 
     def analyser(
         self,
-        setup: Any,
+        setup: Any = None,
         contexte: Any = None,
         zones: Any = None,
         structure: Any = None,
@@ -1124,433 +813,220 @@ class Moteur2Decision:
         validation_result: Any = None,
         confirmation_result: Any = None,
         market_intelligence: Any = None,
+        opportunite: Any = None,
+        hypothese: Any = None,
+        plan: Any = None,
+        scenarios: Any = None,
+        fondamental: Any = None,
+        technical_plan: Any = None,
+        **kwargs: Any,
     ) -> DecisionResult:
         """
-        Analyse globale du setup.
+        Point d'entrée compatible avec l'ancienne signature.
 
-        Paramètres volontairement larges afin de pouvoir évoluer avec
-        le reste de l'architecture sans transformer le moteur en
-        checklist rigide.
+        risk_plan est accepté pour compatibilité historique, mais il est
+        traité uniquement comme éventuel plan technique. Il ne représente
+        pas une autorité financière de décision.
         """
+        # Priorité au nouveau nom ; compatibilité avec l'ancien.
+        resolved_plan = technical_plan
+        if resolved_plan is None:
+            resolved_plan = plan
+        if resolved_plan is None:
+            resolved_plan = risk_plan
 
-        symbol = self._extract_symbol(
+        # Compatibilité avec quelques noms d'appel possibles.
+        if opportunite is None:
+            opportunite = kwargs.get("opportunity")
+        if hypothese is None:
+            hypothese = kwargs.get("hypothesis")
+        if fondamental is None:
+            fondamental = kwargs.get("fundamental")
+        if scenarios is None:
+            scenarios = kwargs.get("scenario_result")
+
+        direction = _extract_direction(
+            opportunite,
+            hypothese,
             setup,
             contexte,
+            market_intelligence,
+            fondamental,
         )
 
-        setup_id = self._extract_setup_id(setup)
-
-        direction = self._extract_direction(setup)
-
-        setup_type = self._get(
+        symbol = _extract_symbol(
+            opportunite,
+            hypothese,
             setup,
-            "setup_type",
+            contexte,
+            zones,
+            market_intelligence,
         )
 
-        # --------------------------------------------------------------------
-        # SÉCURITÉ TECHNIQUE
-        # --------------------------------------------------------------------
-
-        technical = self._technical_safety_check(
-            setup=setup,
-            risk_plan=risk_plan,
-            validation=validation_result,
-            direction=direction,
+        setup_id = _extract_setup_id(
+            opportunite,
+            hypothese,
+            setup,
         )
 
-        if not technical["safe"]:
+        setup_type = _normalise_text(
+            _first_non_empty(
+                _get(opportunite, "opportunity_type"),
+                _get(opportunite, "type"),
+                _get(hypothese, "hypothesis_type"),
+                _get(hypothese, "type"),
+                _get(setup, "setup_type"),
+                _get(setup, "type"),
+            )
+        )
 
-            result = DecisionResult(
-                decision=DECISION_WAIT,
+        reasons: List[str] = []
+        warnings: List[str] = []
+
+        safety = self._technical_safety_check(direction, validation_result)
+        if not safety["safe"]:
+            return DecisionResult(
+                decision="WAIT",
                 confidence=0.0,
                 symbol=symbol,
                 setup_id=setup_id,
                 direction=direction,
                 setup_type=setup_type,
-                priority="OBSERVATION",
-                quality="TECHNICALLY_INVALID",
-                reasons=[
-                    "Le dossier n'est pas techniquement exploitable."
-                ],
-                warnings=technical["blockers"],
+                priority="LOW",
+                quality="UNDETERMINED",
+                reasons=["Aucune décision directionnelle sûre ne peut être produite."],
+                warnings=safety["blockers"],
                 evidence={
-                    "technical_safe": False,
-                    "technical_blockers": technical["blockers"],
+                    "decision_basis": "technical_safety",
+                    "direction": direction,
                 },
-                metadata={
-                    "engine": ENGINE_NAME,
-                    "decision_type": "TECHNICAL_WAIT",
-                    "decision_is_strategic": False,
-                    "risk_is_decision_owner": False,
-                    "score_is_blocking": False,
-                    "rr_is_blocking": False,
-                    "m5_is_blocking": False,
-                    "m1_is_blocking": False,
-                },
+                metadata=self._metadata(),
             )
 
-            self.last_decision = result
-
-            return result
-
-        # --------------------------------------------------------------------
-        # ANALYSE DES INFORMATIONS
-        # --------------------------------------------------------------------
-
-        components: List[Dict[str, Any]] = []
-
-        context_result = self._analyse_context(
-            contexte,
-            direction,
-        )
-
-        components.append(context_result)
-
-        structure_result = self._analyse_structure(
-            structure,
-            direction,
-        )
-
-        components.append(structure_result)
-
-        zones_result = self._analyse_zones(
-            zones,
-            direction,
-        )
-
-        components.append(zones_result)
-
-        confluence_result = self._analyse_confluences(
-            confluences,
-            direction,
-        )
-
-        components.append(confluence_result)
-
-        setup_quality_result = self._analyse_setup_quality(
-            setup,
-        )
-
-        components.append(setup_quality_result)
-
-        confirmation_analysis = self._analyse_confirmation(
-            confirmation_result,
-            direction,
-        )
-
-        components.append(confirmation_analysis)
-
-        score_analysis = self._analyse_score(
-            score_result,
-        )
-
-        components.append(score_analysis)
-
-        rr_analysis = self._analyse_rr(
-            risk_plan,
-        )
-
-        components.append(rr_analysis)
-
-        # --------------------------------------------------------------------
-        # MARKET INTELLIGENCE
-        # --------------------------------------------------------------------
-
-        if market_intelligence is not None:
-
-            intelligence_result = {
-                "supportive": 0.0,
-                "contradictory": 0.0,
-                "neutral": 0.0,
-                "details": [],
-            }
-
-            intelligence_direction = None
-
-            for key in (
-                "direction",
-                "bias",
-                "market_bias",
-            ):
-                value = self._get(
-                    market_intelligence,
-                    key,
-                )
-
-                normalized = self._normalize_direction(
-                    value
-                )
-
-                if normalized in (
-                    DECISION_BUY,
-                    DECISION_SELL,
-                ):
-                    intelligence_direction = normalized
-                    break
-
-            if intelligence_direction == direction:
-
-                intelligence_result["supportive"] += 1.0
-
-                intelligence_result["details"].append(
-                    "L'intelligence marché soutient la direction."
-                )
-
-            elif intelligence_direction in (
-                DECISION_BUY,
-                DECISION_SELL,
-            ):
-
-                intelligence_result["contradictory"] += 1.0
-
-                intelligence_result["details"].append(
-                    "L'intelligence marché présente une opposition."
-                )
-
-            # Etat global exploitable.
-            state = self._get(
+        components = [
+            self._analyse_context(contexte, direction),
+            self._analyse_structure(structure, direction),
+            self._analyse_zones(zones, direction),
+            self._analyse_confluences(confluences, direction),
+            self._analyse_confirmation(confirmation_result, direction),
+            self._analyse_possibilities(
+                opportunite,
+                hypothese,
+                scenarios,
                 market_intelligence,
-                "market_state",
-            )
+                contexte,
+            ),
+        ]
 
-            if state:
-                state = str(state).upper()
-
-                if state in {
-                    "TRENDING",
-                    "TREND",
-                    "EXPANSION",
-                    "IMPULSE",
-                    "DIRECTIONAL",
-                }:
-                    intelligence_result["supportive"] += 0.5
-
-                elif state in {
-                    "CHAOTIC",
-                    "UNSTABLE",
-                    "EXTREME_NOISE",
-                }:
-                    intelligence_result["contradictory"] += 0.5
-
-                intelligence_result["details"].append(
-                    f"Etat intelligence marché : {state}."
-                )
-
-            components.append(
-                intelligence_result
-            )
-
-        # --------------------------------------------------------------------
-        # CONVICTION GLOBALE
-        # --------------------------------------------------------------------
-
-        conviction = self._calculate_conviction(
-            components
+        score_info = self._analyse_score(score_result)
+        rr_info = self._analyse_rr(resolved_plan, score_result)
+        quality_info = self._analyse_quality(
+            _first_non_empty(opportunite, hypothese, setup)
+        )
+        validation_info = self._analyse_validation(
+            validation_result,
+            resolved_plan,
         )
 
-        supportive = conviction["supportive"]
-        contradictory = conviction["contradictory"]
+        supportive = 0.0
+        contradictory = 0.0
+        meaningful_sources = 0
 
-        confidence = conviction["conviction"]
+        for component in components:
+            supportive += _safe_float(component.get("supportive"))
+            contradictory += _safe_float(component.get("contradictory"))
+            reasons.extend(component.get("reasons", []))
+            warnings.extend(component.get("warnings", []))
 
-        # --------------------------------------------------------------------
-        # AJUSTEMENT PAR RR
-        # --------------------------------------------------------------------
-        #
-        # Le RR ne peut pas imposer une décision.
-        # Il ajuste simplement la qualité globale.
-        #
+            if (
+                component.get("supportive", 0.0)
+                or component.get("contradictory", 0.0)
+            ):
+                meaningful_sources += 1
 
-        rr = rr_analysis.get("rr")
+        # Score, RR et qualité restent descriptifs.
+        reasons.extend(score_info["reasons"])
+        warnings.extend(score_info["warnings"])
+        reasons.extend(rr_info["reasons"])
+        warnings.extend(rr_info["warnings"])
+        reasons.extend(quality_info["reasons"])
+        warnings.extend(quality_info["warnings"])
+        reasons.extend(validation_info["reasons"])
+        warnings.extend(validation_info["warnings"])
 
-        if rr is not None:
-
-            if rr >= 2:
-                confidence += 3.0
-
-            elif rr < 1:
-                confidence -= 8.0
-
-        # --------------------------------------------------------------------
-        # AJUSTEMENT PAR SCORE
-        # --------------------------------------------------------------------
-        #
-        # Le score reste une information.
-        #
-
-        score = score_analysis.get("score")
-
-        if score is not None:
-
-            if score >= 80:
-                confidence += 3.0
-
-            elif score < 35:
-                confidence -= 5.0
-
-        confidence = self._clamp(
-            confidence
+        confidence = self._calculate_conviction(
+            supportive,
+            contradictory,
+            meaningful_sources,
         )
 
-        # --------------------------------------------------------------------
-        # DÉCISION
-        # --------------------------------------------------------------------
-        #
-        # Pas de seuil fixe du type :
-        #     score >= 60
-        #     RR >= 3
-        #
-        # La décision repose sur la conviction globale.
-        #
-
-        reasons = self._collect_details(
-            components
-        )
-
-        warnings: List[str] = []
-
-        # Divergence secondaire : avertissement seulement.
-        if (
-            confirmation_analysis.get("contradictory", 0)
-            > confirmation_analysis.get("supportive", 0)
-        ):
-            warnings.append(
-                "La confirmation secondaire n'est pas parfaitement alignée."
-            )
-
-        # RR faible : avertissement, pas veto.
-        if rr is not None and rr < self.reference_rr:
-            warnings.append(
-                f"RR inférieur à la référence {self.reference_rr:.1f}R."
-            )
-
-        # Score faible : avertissement, pas veto.
-        if score is not None and score < self.reference_score:
-            warnings.append(
-                f"Score inférieur à la référence {self.reference_score:.0f}."
-            )
-
-        # --------------------------------------------------------------------
-        # CHOIX BUY / SELL / WAIT
-        # --------------------------------------------------------------------
-
-        if direction not in (
-            DECISION_BUY,
-            DECISION_SELL,
-        ):
-            decision = DECISION_WAIT
-
+        # Une contradiction critique explicitement signalée par la validation
+        # technique reste une raison de WAIT. Ce n'est pas un filtre de score/RR.
+        if validation_info["critical_error"]:
+            decision = "WAIT"
+            confidence = min(confidence, 49.0)
+            reasons.append("La décision reste WAIT à cause d'une erreur technique critique.")
         else:
-
-            # Conviction >= 58 :
-            # opportunité potentiellement exploitable.
-            #
-            # Conviction < 42 :
-            # contexte trop faible / contradictoire.
-            #
-            # Zone intermédiaire :
-            # WAIT plutôt que forcer une décision.
-            #
-            # Ces niveaux ne constituent pas des conditions de trading
-            # absolues comme l'ancien score minimum. Ils servent uniquement
-            # à traduire la conviction globale.
-
-            if confidence >= 58:
-
+            # Principe stratégique : une direction est retenue lorsque les
+            # éléments directionnels convergent davantage qu'ils ne se contredisent.
+            # Si l'information est trop équilibrée/absente, WAIT reste valide.
+            if supportive > contradictory and supportive > 0:
                 decision = direction
-
             else:
+                decision = "WAIT"
 
-                decision = DECISION_WAIT
+        quality = self._quality_from_balance(confidence, contradictory)
+        priority = self._priority_from_confidence(confidence)
 
-        # --------------------------------------------------------------------
-        # QUALITÉ / PRIORITÉ
-        # --------------------------------------------------------------------
-
-        quality = self._quality_from_confidence(
-            confidence
-        )
-
-        priority = self._priority_from_confidence(
-            confidence
-        )
-
-        # --------------------------------------------------------------------
-        # MÉTADONNÉES
-        # --------------------------------------------------------------------
+        # Déduplication propre des messages.
+        reasons = list(dict.fromkeys(str(x) for x in reasons if str(x).strip()))
+        warnings = list(dict.fromkeys(str(x) for x in warnings if str(x).strip()))
 
         evidence = {
-            "supportive_evidence": supportive,
-            "contradictory_evidence": contradictory,
-            "confidence": confidence,
-            "score": score,
-            "rr": rr,
-            "reference_score": self.reference_score,
-            "reference_rr": self.reference_rr,
-            "technical_safe": True,
-            "context": context_result,
-            "structure": structure_result,
-            "zones": zones_result,
-            "confluences": confluence_result,
-            "setup_quality": setup_quality_result,
-            "confirmation": confirmation_analysis,
-        }
-
-        metadata = {
-            "engine": ENGINE_NAME,
-
-            # Propriété fondamentale :
-            "decision_owner": "moteur2_decision.py",
-
-            # Le cerveau décide.
-            "decision_is_strategic": True,
-
-            # Risk Engine ne décide pas.
-            "risk_engine_decides_trade": False,
-
-            # Score non bloquant.
-            "score_is_blocking": False,
-            "score_can_reject_setup": False,
-
-            # RR non bloquant.
-            "rr_is_blocking": False,
-            "rr_can_reject_setup": False,
-
-            # M5/M1 non bloquants.
-            "m5_is_blocking": False,
-            "m1_is_blocking": False,
-
-            # Validation technique ≠ décision stratégique.
-            "validation_is_decision": False,
-
-            # Pas de quota.
-            "signal_quota": None,
-
-            # Pas de signal forcé.
-            "forced_signal": False,
-
-            # Les prix restent ceux du Risk Engine.
-            "prices_generated_here": False,
-
-            # Analyse multi-facteurs.
-            "decision_mode": "MULTI_FACTOR",
-
-            # WAIT est une vraie décision.
-            "wait_is_valid_decision": True,
-
-            # L'objectif est de réduire les faux rejets.
-            "rigid_checklist": False,
-
-            # Le moteur n'invente aucune donnée.
-            "fabricates_market_data": False,
-        }
-
-        result = DecisionResult(
-            decision=decision,
-            confidence=round(
-                confidence,
-                2,
+            "supportive_evidence": round(supportive, 4),
+            "contradictory_evidence": round(contradictory, 4),
+            "meaningful_sources": meaningful_sources,
+            "score": score_info["score"],
+            "rr": rr_info["rr"],
+            "quality": quality_info["quality"],
+            "validation_status": validation_info["status"],
+            "technical_blockers": validation_info["technical_blockers"],
+            "plan_state": validation_info["plan_state"],
+            "possibilities": components[-1].get("items", []),
+            "direction_sources": self._directional_sources(
+                setup,
+                opportunite,
+                hypothese,
+                contexte,
+                structure,
+                zones,
+                confluences,
+                confirmation_result,
+                market_intelligence,
+                fondamental,
             ),
+        }
+
+        metadata = self._metadata()
+        metadata.update(
+            {
+                "symbol": symbol,
+                "setup_id": setup_id,
+                "setup_type": setup_type,
+                "decision_basis": "adaptive_multi_source_evidence",
+                "technical_plan_present": bool(_safe_dict(resolved_plan)),
+                "score_observed_only": True,
+                "rr_observed_only": True,
+                "quality_observed_only": True,
+                "m5_m1_blocking": False,
+                "forced_signal": False,
+                "auto_execution": False,
+            }
+        )
+
+        return DecisionResult(
+            decision=decision,
+            confidence=round(confidence, 2),
             symbol=symbol,
             setup_id=setup_id,
             direction=direction,
@@ -1563,149 +1039,79 @@ class Moteur2Decision:
             metadata=metadata,
         )
 
-        self.last_decision = result
+    # ------------------------------------------------------------------
+    # COMPATIBILITÉS
+    # ------------------------------------------------------------------
 
-        return result
+    def analyser_setup(self, *args: Any, **kwargs: Any) -> DecisionResult:
+        return self.analyser(*args, **kwargs)
 
-    # ========================================================================
-    # ALIASES DE COMPATIBILITÉ
-    # ========================================================================
+    def analyser_opportunite(self, *args: Any, **kwargs: Any) -> DecisionResult:
+        return self.analyser(*args, **kwargs)
 
-    def analyser_setup(
-        self,
-        setup: Any,
-        **kwargs,
-    ) -> DecisionResult:
-        """
-        Alias pratique pour l'orchestrateur.
-        """
+    def analyser_hypothese(self, *args: Any, **kwargs: Any) -> DecisionResult:
+        return self.analyser(*args, **kwargs)
 
-        return self.analyser(
-            setup=setup,
-            **kwargs,
-        )
+    def decide(self, *args: Any, **kwargs: Any) -> DecisionResult:
+        return self.analyser(*args, **kwargs)
 
-    def decide(
-        self,
-        setup: Any,
-        **kwargs,
-    ) -> DecisionResult:
-        """
-        Alias lisible.
-        """
-
-        return self.analyser(
-            setup=setup,
-            **kwargs,
-        )
-
-    # ========================================================================
-    # STATUS
-    # ========================================================================
+    def _metadata(self) -> Dict[str, Any]:
+        return {
+            "engine": ENGINE_NAME,
+            "decision_owner": "moteur2_decision.py",
+            "decision_is_strategic": True,
+            "risk_engine_decides_trade": False,
+            "financial_risk_is_decision_maker": False,
+            "score_blocking": False,
+            "score_can_reject_setup": False,
+            "rr_blocking": False,
+            "rr_can_reject_setup": False,
+            "quality_blocking": False,
+            "m5_m1_blocking": False,
+            "validation_is_decision": False,
+            "ranking_is_decision": False,
+            "signal_quota_is_decision": False,
+            "forced_signal": False,
+            "prices_generated_here": False,
+            "rigid_threshold": False,
+            "rigid_checklist": False,
+            "wait_is_valid_decision": True,
+            "auto_execution": False,
+        }
 
     def get_status(self) -> Dict[str, Any]:
-
         return {
             "engine": ENGINE_NAME,
             "module": "moteur2_decision",
-            "role": "STRATEGIC_DECISION_ENGINE",
-
-            "decisions": [
-                DECISION_BUY,
-                DECISION_SELL,
-                DECISION_WAIT,
-            ],
-
+            "status": "READY",
             "reference_score": self.reference_score,
             "reference_rr": self.reference_rr,
-
             "score_blocking": False,
             "rr_blocking": False,
-            "m5_blocking": False,
-            "m1_blocking": False,
-
-            "risk_decides_trade": False,
-            "validation_decides_trade": False,
-
-            "rigid_checklist": False,
-            "forced_signals": False,
-            "signal_quota": None,
-
-            "last_decision": (
-                self.last_decision.to_dict()
-                if self.last_decision is not None
-                else None
-            ),
+            "quality_blocking": False,
+            "m5_m1_blocking": False,
+            "decision_owner": True,
+            "auto_execution": False,
         }
 
 
-# ============================================================================
-# COMPATIBILITÉ DE NOM
-# ============================================================================
-
-DecisionEngine = Moteur2Decision
-
-
-# ============================================================================
-# TEST LOCAL
-# ============================================================================
-
-if __name__ == "__main__":
-
-    engine = Moteur2Decision()
-
-    setup = {
-        "setup_id": "TEST-001",
-        "symbol": "XAUUSD",
-        "direction": "BUY",
-        "setup_type": "REVERSAL_ZONE",
-        "quality": "GOOD",
-    }
-
-    context = {
-        "symbol": "XAUUSD",
-        "direction": "BUY",
-        "market_state": "TRENDING",
-    }
-
-    structure = {
-        "direction": "BUY",
-    }
-
-    zones = {
-        "direction": "BUY",
-        "near_important_zone": True,
-    }
-
-    confluences = {
-        "direction": "BUY",
-        "strength": 72,
-    }
-
-    risk_plan = {
-        "entry": 3500.0,
-        "sl": 3490.0,
-        "tp1": 3520.0,
-        "primary_rr": 2.0,
-    }
-
-    score_result = {
-        "score": 48,
-    }
-
-    validation_result = {
-        "valid": True,
-        "status": "READY_FOR_SIGNAL",
-    }
-
-    confirmation_result = {
-        "confirmed": False,
-        "direction": "BUY",
-    }
-
-    result = engine.analyser(
+def analyser_decision(
+    setup: Any = None,
+    contexte: Any = None,
+    zones: Any = None,
+    structure: Any = None,
+    confluences: Any = None,
+    risk_plan: Any = None,
+    score_result: Any = None,
+    validation_result: Any = None,
+    confirmation_result: Any = None,
+    market_intelligence: Any = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    moteur = Moteur2Decision()
+    result = moteur.analyser(
         setup=setup,
-        contexte=context,
+        contexte=contexte,
         zones=zones,
         structure=structure,
         confluences=confluences,
@@ -1713,34 +1119,58 @@ if __name__ == "__main__":
         score_result=score_result,
         validation_result=validation_result,
         confirmation_result=confirmation_result,
+        market_intelligence=market_intelligence,
+        **kwargs,
+    )
+    return result.to_dict()
+
+
+# Alias historiques possibles.
+decider = analyser_decision
+prendre_decision = analyser_decision
+
+
+if __name__ == "__main__":
+    # Test local minimal :
+    # score faible et RR faible ne doivent pas empêcher une décision
+    # lorsque les autres observations convergent.
+    moteur = Moteur2Decision()
+
+    resultat = moteur.analyser(
+        opportunite={
+            "symbol": "XAUUSD",
+            "direction": "BUY",
+            "opportunity_type": "AUTONOMOUS",
+        },
+        hypothese={
+            "direction": "BUY",
+            "possibilities": [
+                {"direction": "BUY", "description": "développement directionnel"},
+            ],
+        },
+        contexte={
+            "directional_bias": "BUY",
+            "market_state": "EXPANSION",
+        },
+        structure={"direction": "BUY"},
+        zones={"direction": "BUY", "near_important_zone": True},
+        confluences={"direction": "BUY", "strength": 72},
+        confirmation_result={
+            "direction": "BUY",
+            "confirmation_valid": False,
+            "confirmation_status": "FORMING",
+        },
+        score_result={"score": 20},
+        technical_plan={
+            "entry": 100.0,
+            "sl": 99.0,
+            "tp1": 100.5,
+            "rr": 0.5,
+        },
+        validation_result={
+            "status": "READY_FOR_SIGNAL",
+            "critical_error": False,
+        },
     )
 
-    print("=" * 70)
-    print("NOVA TRADE AI - ENGINE 2")
-    print("DECISION ENGINE TEST")
-    print("=" * 70)
-    print()
-
-    print("DECISION :", result.decision)
-    print("CONFIDENCE :", result.confidence)
-    print("QUALITY :", result.quality)
-    print("PRIORITY :", result.priority)
-    print("RR :", result.evidence.get("rr"))
-    print("SCORE :", result.evidence.get("score"))
-    print()
-
-    print("RAISONS :")
-
-    for reason in result.reasons:
-        print("-", reason)
-
-    print()
-
-    print("AVERTISSEMENTS :")
-
-    for warning in result.warnings:
-        print("-", warning)
-
-    print()
-    print("METADATA :")
-    print(result.metadata)
+    print(resultat.to_dict())
