@@ -20,20 +20,20 @@ IMPORTANT
 ---------
 Ce module ne crée pas de setup.
 Ce module ne calcule pas le plan de risque.
-Ce module ne valide pas définitivement un signal.
+Ce module ne valide pas définitivement un signal et ne bloque pas une opportunité.
 Ce module ne déclenche aucune entrée.
 Hiérarchie stricte :
     H4 / H1 / M15
         ↓
     Setup
         ↓
-    Risk plan
+    Plan technique
         ↓
-    M5 = confirmation principale
+    M5 = observation principale
         ↓
-    M1 = confirmation secondaire
+    M1 = observation secondaire
         ↓
-    Validation finale
+    Décision stratégique
 M1 ne peut jamais compenser un M5 insuffisant.
 La décision READY_FOR_SIGNAL appartient exclusivement
 à moteur2_validation.py.
@@ -51,14 +51,13 @@ SUPPORTED_SYMBOLS = (
     "EURUSD",
     "GBPUSD",
 )
-M5_MIN_SCORE = 60.0
-M1_MIN_SCORE = 45.0
-# Score indicatif global.
-# Il ne peut jamais remplacer l'exigence M5.
-CONFIRMATION_SCORE = 65.0
+M5_MIN_SCORE = 0.0
+M1_MIN_SCORE = 0.0
+# Paramètres conservés pour compatibilité API. Ils ne sont pas bloquants.
+CONFIRMATION_SCORE = 0.0
 MIN_CANDLES_M5 = 5
 MIN_CANDLES_M1 = 5
-# M5 domine clairement M1.
+# M5 reste plus important dans la lecture descriptive du timing.
 M5_WEIGHT = 0.70
 M1_WEIGHT = 0.30
 EPSILON = 1e-9
@@ -91,14 +90,13 @@ class Moteur2Confirmation:
     """
     Confirmation du timing M5/M1.
     Règle principale :
-        M5 doit être confirmé.
+        M5 est observé en priorité, mais sa confirmation n'est plus une condition bloquante.
     M1 peut :
         - renforcer le timing ;
         - rester neutre ;
         - signaler une faiblesse ;
         - signaler une divergence de court terme.
-    M1 ne peut jamais transformer un M5 non confirmé
-    en confirmation valide.
+    M1 ne remplace pas M5 ; les deux alimentent simplement la lecture du timing.
     M1 neutre ne bloque pas un M5 confirmé.
     """
     def __init__(
@@ -922,32 +920,53 @@ class Moteur2Confirmation:
         # ----------------------------------------------------
         # VALIDATION DE LA CONFIRMATION
         # ----------------------------------------------------
-        # M5 est la référence. M1 ne peut jamais remplacer M5.
+        # M5 reste la référence d'observation. Ni M5 ni M1 ne constituent un veto.
         #
         # IMPORTANT : le score combiné n'est PAS une porte
         # obligatoire. Il sert à qualifier la force du timing.
-        # Ainsi, un M5 réellement confirmé reste exploitable
-        # lorsque M1 est neutre ou encore en formation.
+        # Les états M5/M1 décrivent le timing disponible pour les couches suivantes.
         # ----------------------------------------------------
+        # Cette couche observe le timing ; elle ne doit plus bloquer
+        # une possibilité issue des horizons supérieurs.
+        # m5_confirmed / m1_confirmed restent des observations.
         confirmation_valid = (
-            m5_confirmed
-            and not major_counter_move
+            len(m5) >= MIN_CANDLES_M5
+            or len(m1) >= MIN_CANDLES_M1
         )
 
         if m5_confirmed and m1_confirmed:
-            confirmation_status = "CONFIRMED_M5_M1"
-        elif m5_confirmed and m1_bias == "NEUTRAL":
-            confirmation_status = "CONFIRMED_M5_M1_NEUTRAL"
-        elif m5_confirmed and m1_bias != direction:
-            confirmation_status = "CONFIRMED_M5_M1_CONTRARY"
+            confirmation_status = "TIMING_CONVERGENT"
+        elif m5_confirmed:
+            confirmation_status = "TIMING_M5_FAVORABLE"
+        elif m1_confirmed:
+            confirmation_status = "TIMING_M1_FAVORABLE"
         elif major_counter_move:
-            confirmation_status = "TEMPORARILY_UNFAVORABLE"
+            confirmation_status = "TIMING_CONTRARY_PRESSURE"
+        elif len(m5) >= MIN_CANDLES_M5 or len(m1) >= MIN_CANDLES_M1:
+            confirmation_status = "TIMING_OBSERVED"
         else:
-            confirmation_status = "WAITING_M5_CONFIRMATION"
+            confirmation_status = "TIMING_INSUFFICIENT_DATA"
         # ----------------------------------------------------
         # MÉTADONNÉES
         # ----------------------------------------------------
+        timing_possibilities: List[str] = []
+        if m5_confirmed and m1_confirmed:
+            timing_possibilities.append("CONVERGENCE_M5_M1")
+        if m5_confirmed and not m1_confirmed:
+            timing_possibilities.append("M5_LEAD_M1_EN_FORMATION")
+        if m1_confirmed and not m5_confirmed:
+            timing_possibilities.append("M1_EARLY_DEVELOPMENT")
+        if m5_behavior == "IMPULSION" or m1_behavior == "IMPULSION":
+            timing_possibilities.append("ACCELERATION")
+        if m5_behavior == "PERTE_PRESSION" or m1_behavior == "PERTE_PRESSION":
+            timing_possibilities.append("DECELERATION")
+        if major_counter_move:
+            timing_possibilities.append("COUNTER_PRESSURE")
+        if not timing_possibilities:
+            timing_possibilities.append("TIMING_NEUTRAL_OR_FORMING")
+
         metadata = {
+            "timing_possibilities": timing_possibilities,
             "m5_candles": len(m5),
             "m1_candles": len(m1),
             "m5_pressure": m5_data["pressure"],
@@ -970,16 +989,20 @@ class Moteur2Confirmation:
             "m1_min_score": self.m1_min_score,
             "confirmation_score": self.confirmation_score,
             "setup_type": setup_type,
-            "m5_is_master": True,
-            "m1_is_secondary": True,
+            "m5_is_primary_observation": True,
+            "m1_is_secondary_observation": True,
             "m1_can_replace_m5": False,
             "combined_score_is_blocking": False,
+            "m5_threshold_is_blocking": False,
+            "m1_threshold_is_blocking": False,
             "m1_neutral_is_blocking": False,
+            "confirmation_is_blocking": False,
+            "autonomous_timing_layer": True,
             "risk_plan_available": (
                 risk_plan is not None
             ),
             "final_validation_owner": (
-                "moteur2_validation.py"
+                "moteur2_decision.py"
             ),
             "execution_authority": False,
         }
