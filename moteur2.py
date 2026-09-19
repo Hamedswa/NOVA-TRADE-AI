@@ -36,6 +36,12 @@ from moteur2_validation import Moteur2Validation
 from moteur2_antispam import Moteur2AntiSpam
 from moteur2_signal import Moteur2Signal
 from moteur2_decision import Moteur2Decision
+from moteur2_intelligence import Moteur2Intelligence
+from moteur2_radar import Moteur2Radar
+from moteur2_scenarios import Moteur2Scenarios
+from moteur2_opportunites import Moteur2Opportunites
+from moteur2_plan import Moteur2Plan
+from moteur2_fondamental import Moteur2Fondamental
 
 
 SYMBOL = "XAUUSD"
@@ -107,6 +113,24 @@ class Moteur2:
         self.signal = Moteur2Signal()
         self.decision = Moteur2Decision()
 
+        # Couches d'observation et de génération ajoutées à Engine 2.
+        # Elles sont descriptives/contributives : aucune ne possède la
+        # décision finale.
+        self.radar = Moteur2Radar()
+        self.intelligence = Moteur2Intelligence(
+            reference_score=60.0,
+            reference_rr=0.0,
+        )
+        self.scenarios = Moteur2Scenarios(
+            reference_score=60.0,
+            reference_rr=0.0,
+        )
+        self.opportunites = Moteur2Opportunites()
+        self.plan = Moteur2Plan()
+        self.fondamental = Moteur2Fondamental(
+            supported_symbols=SUPPORTED_SYMBOLS,
+        )
+
         self.running = False
         self.initialized = False
         self.latest_tick: Optional[Any] = None
@@ -143,6 +167,106 @@ class Moteur2:
             return await result
 
         return result
+
+    @staticmethod
+    def _to_dict(data: Any) -> Dict[str, Any]:
+        """Normalise les dataclasses/objets des couches descriptives."""
+        if data is None:
+            return {}
+        if isinstance(data, dict):
+            return data
+        to_dict = getattr(data, "to_dict", None)
+        if callable(to_dict):
+            try:
+                value = to_dict()
+                return value if isinstance(value, dict) else {}
+            except Exception:
+                return {}
+        return getattr(data, "__dict__", {}) or {}
+
+    @classmethod
+    def _technical_plan_to_legacy(cls, plan: Any) -> Optional[Dict[str, Any]]:
+        """Adapte un TechnicalPlan au format historique attendu par validation/signal."""
+        data = cls._to_dict(plan)
+        if not data:
+            return None
+        targets = data.get("targets") or []
+        tp_values = []
+        for target in targets:
+            value = cls._get(target, "price")
+            if value is not None:
+                try:
+                    tp_values.append(float(value))
+                except (TypeError, ValueError):
+                    pass
+        entry = cls._get(data, "entry")
+        sl = cls._get(data, "stop_loss")
+        if entry is None or sl is None or not tp_values:
+            return None
+        try:
+            entry = float(entry)
+            sl = float(sl)
+        except (TypeError, ValueError):
+            return None
+        rr_values = data.get("rr_values") or []
+        primary_rr = data.get("best_informational_rr")
+        try:
+            primary_rr = float(primary_rr) if primary_rr is not None else None
+        except (TypeError, ValueError):
+            primary_rr = None
+        return {
+            "symbol": data.get("symbol"),
+            "setup_id": data.get("plan_id") or data.get("opportunity_id") or "PLAN",
+            "setup_type": data.get("opportunity_type") or "OPPORTUNITE",
+            "direction": data.get("direction"),
+            "entry": entry,
+            "sl": sl,
+            "tp1": tp_values[0] if len(tp_values) > 0 else None,
+            "tp2": tp_values[1] if len(tp_values) > 1 else None,
+            "tp3": tp_values[2] if len(tp_values) > 2 else None,
+            "primary_rr": primary_rr,
+            "rr_values": rr_values,
+            "rr_is_informational": True,
+            "risk_managed_here": False,
+            "valid": True,
+            "geometry_valid": True,
+            "metadata": {
+                "technical_plan": data,
+                "legacy_alias": True,
+            },
+        }
+
+    @classmethod
+    def _match_plan_for_setup(cls, plans: Any, setup: Any) -> Optional[Dict[str, Any]]:
+        items = []
+        if isinstance(plans, dict):
+            items = (
+                plans.get("plans")
+                or plans.get("opportunities")
+                or plans.get("scenarios")
+                or []
+            )
+        elif isinstance(plans, (list, tuple)):
+            items = list(plans)
+        direction = str(cls._get(setup, "direction", "")).upper()
+        setup_id = str(cls._get(setup, "setup_id", ""))
+        for item in items:
+            data = cls._to_dict(item)
+            if not data:
+                continue
+            ids = {
+                str(data.get("opportunity_id", "")),
+                str(data.get("plan_id", "")),
+                str(data.get("scenario_id", "")),
+                str(data.get("setup_id", "")),
+            }
+            if setup_id and setup_id in ids:
+                return data
+        for item in items:
+            data = cls._to_dict(item)
+            if str(data.get("direction", "")).upper() == direction:
+                return data
+        return None
 
     # ============================================================
     # TICK LIVE
@@ -459,6 +583,11 @@ class Moteur2:
         donnees: Dict[str, Any],
         cartographie: Any = None,
         liquidite: Any = None,
+        opportunite: Any = None,
+        hypothese: Any = None,
+        scenarios: Any = None,
+        fondamental: Any = None,
+        technical_plan: Any = None,
     ) -> Dict[str, Any]:
 
         confirmation = await self.analyser_confirmation(
@@ -541,6 +670,12 @@ class Moteur2:
                     "cartographie": cartographie,
                     "liquidite": liquidite,
                 },
+                opportunite=opportunite,
+                hypothese=hypothese,
+                plan=technical_plan,
+                technical_plan=technical_plan,
+                scenarios=scenarios,
+                fondamental=fondamental,
             )
         except TypeError:
             # Compatibilité avec une version du Decision Engine
@@ -556,6 +691,12 @@ class Moteur2:
                 score_result=score_result,
                 validation_result=validation,
                 confirmation_result=confirmation,
+                opportunite=opportunite,
+                hypothese=hypothese,
+                plan=technical_plan,
+                technical_plan=technical_plan,
+                scenarios=scenarios,
+                fondamental=fondamental,
             )
         except Exception as exc:
             logger.exception(
@@ -690,6 +831,8 @@ class Moteur2:
             validation=validation,
             antispam_result=antispam,
             setup_id=setup_id,
+            decision=decision_result,
+            technical_plan=technical_plan,
         )
 
         if signal is None:
@@ -803,6 +946,29 @@ class Moteur2:
                 liquidite,
             )
 
+            market_snapshot = {
+                "price": current_price,
+                "current_price": current_price,
+                "timeframes": donnees,
+            }
+
+            radar_events = self.radar.surveiller(
+                self.symbol,
+                market_data=market_snapshot,
+                zones=self._to_dict(zones).get("zones", []) if isinstance(self._to_dict(zones), dict) else [],
+            )
+
+            intelligence_result = self.intelligence.analyser(
+                self.symbol,
+                market_data=donnees,
+                contexte=self._to_dict(contexte),
+                zones=zones,
+                structure=self._to_dict(cartographie),
+                confluences=confluences,
+                events=radar_events,
+            )
+            intelligence_data = self._to_dict(intelligence_result)
+
             setups_result = await self.analyser_setups(
                 zones,
                 confluences,
@@ -825,6 +991,73 @@ class Moteur2:
                     else []
                 )
 
+            scenarios_result = self.scenarios.analyser(
+                symbol=self.symbol,
+                intelligence=intelligence_data,
+                radar_events=radar_events,
+                contexte=self._to_dict(contexte),
+                zones=zones,
+                setups=setups,
+            )
+
+            fundamental_result = self.fondamental.analyser(
+                self.symbol,
+                macro_context={},
+                technical_context={
+                    "intelligence": intelligence_data,
+                    "contexte": self._to_dict(contexte),
+                    "cartographie": self._to_dict(cartographie),
+                },
+            )
+
+            opportunities_result = self.opportunites.analyser(
+                symbol=self.symbol,
+                intelligence=intelligence_data,
+                radar_events=radar_events,
+                contexte=contexte,
+                zones=zones,
+                liquidite=liquidite,
+                confluences=confluences,
+                scenarios=scenarios_result,
+                setups=setups,
+                market_data=market_snapshot,
+                fundamental=fundamental_result,
+            )
+
+            technical_plans_result = self.plan.analyser(
+                symbol=self.symbol,
+                opportunities=opportunities_result,
+                current_price=current_price,
+                market_map=self._to_dict(cartographie),
+                zones=zones,
+            )
+
+            if not setups:
+                # Les opportunités autonomes peuvent exister sans setup
+                # historique. On crée uniquement un support technique à
+                # partir d'un plan réellement généré ; aucune décision ou
+                # signal n'est forcé ici.
+                raw_plans = (
+                    technical_plans_result.get("plans", [])
+                    if isinstance(technical_plans_result, dict)
+                    else []
+                )
+                synthetic_setups = []
+                for plan_data in raw_plans:
+                    plan_dict = self._to_dict(plan_data)
+                    direction = str(plan_dict.get("direction", "")).upper()
+                    if direction not in {"BUY", "SELL"}:
+                        continue
+                    synthetic_setups.append({
+                        "setup_id": plan_dict.get("plan_id") or plan_dict.get("opportunity_id") or "TECHNICAL_OPPORTUNITY",
+                        "setup_type": plan_dict.get("opportunity_type") or "OPPORTUNITE",
+                        "symbol": self.symbol,
+                        "direction": direction,
+                        "source": "moteur2_opportunites.py",
+                        "autonomous": True,
+                    })
+                setups = synthetic_setups
+
             if not setups:
 
                 result = {
@@ -836,6 +1069,12 @@ class Moteur2:
                     "zones": zones,
                     "contexte": contexte,
                     "confluences": confluences,
+                    "intelligence": intelligence_data,
+                    "radar": [self._to_dict(item) for item in radar_events],
+                    "scenarios": [self._to_dict(item) for item in scenarios_result],
+                    "fundamental": fundamental_result,
+                    "opportunities": opportunities_result,
+                    "technical_plans": technical_plans_result,
                     "setups": [],
                     "results": [],
                     "signals": [],
@@ -893,10 +1132,27 @@ class Moteur2:
                 if risk_plan is None and index < len(risk_plans):
                     risk_plan = risk_plans[index]
 
-                if risk_plan is None:
+                technical_plan_data = self._match_plan_for_setup(
+                    technical_plans_result,
+                    setup,
+                )
+
+                # Le nouveau plan technique est prioritaire. L'ancien
+                # moteur Risk reste un filet de compatibilité tant que
+                # toutes les intégrations externes n'ont pas migré.
+                technical_plan_legacy = self._technical_plan_to_legacy(
+                    technical_plan_data
+                ) if technical_plan_data is not None else None
+
+                if technical_plan_legacy is not None:
+                    active_plan = technical_plan_legacy
+                else:
+                    active_plan = risk_plan
+
+                if active_plan is None:
 
                     results.append({
-                        "status": "NO_RISK_PLAN",
+                        "status": "NO_TECHNICAL_PLAN",
                         "setup": setup,
                     })
 
@@ -905,13 +1161,18 @@ class Moteur2:
                 results.append(
                     await self.traiter_setup(
                         setup=setup,
-                        risk_plan=risk_plan,
+                        risk_plan=active_plan,
                         zones=zones,
                         contexte=contexte,
                         confluences=confluences,
                         donnees=donnees,
                         cartographie=cartographie,
                         liquidite=liquidite,
+                        opportunite=self._match_plan_for_setup(opportunities_result, setup),
+                        hypothese=self._match_plan_for_setup(scenarios_result, setup),
+                        scenarios=scenarios_result,
+                        fondamental=fundamental_result,
+                        technical_plan=technical_plan_data,
                     )
                 )
 
@@ -943,6 +1204,12 @@ class Moteur2:
                 "zones": zones,
                 "contexte": contexte,
                 "confluences": confluences,
+                "intelligence": intelligence_data,
+                "radar": [self._to_dict(item) for item in radar_events],
+                "scenarios": [self._to_dict(item) for item in scenarios_result],
+                "fundamental": fundamental_result,
+                "opportunities": opportunities_result,
+                "technical_plans": technical_plans_result,
                 "setups": setups,
                 "risk": risk_result,
                 "results": results,
