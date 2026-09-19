@@ -21,8 +21,12 @@ L'anti-spam ne :
 - ne crée pas de signal.
 
 Flux :
-SETUP → RISK → CONFIRMATION → SCORE → VALIDATION
+SETUP → PLAN TECHNIQUE → CONFIRMATION → SCORE → VALIDATION
 → ANTISPAM → SIGNAL
+
+Compatibilité : `risk_plan` reste accepté par les appels existants,
+mais désigne ici uniquement le plan technique Entry / SL / TP.
+L'anti-spam ne lit ni ne gère un risque financier.
 
 Important : seul READY_FOR_SIGNAL peut passer ici.
 """
@@ -151,7 +155,12 @@ class Moteur2AntiSpam:
         return value if value in SUPPORTED_SYMBOLS else ""
 
     def _resolve_symbol(self, setup: Any, risk_plan: Any = None, validation: Any = None) -> str:
-        """Résout le symbole sans dépendre d'un champ obligatoire dans Setup."""
+        """
+        Résout le symbole sans dépendre d'un champ obligatoire dans Setup.
+
+        `risk_plan` est conservé comme alias historique du plan technique.
+        Il n'est pas interprété comme un objet de gestion financière.
+        """
         candidates = (
             self._extract(setup, "symbol"),
             self._extract(risk_plan, "symbol"),
@@ -175,6 +184,7 @@ class Moteur2AntiSpam:
     # ========================================================================
 
     def generer_setup_id(self, setup: Any, risk_plan: Any = None) -> str:
+        """Génère un identifiant stable à partir de l'identité technique du setup."""
         existing_id = self._extract(setup, "setup_id")
         if existing_id:
             return str(existing_id).strip()
@@ -373,6 +383,8 @@ class Moteur2AntiSpam:
                 "validation_required": READY_FOR_SIGNAL,
                 "analysis_decision": False,
                 "risk_modification": False,
+                "financial_risk_used": False,
+                "risk_plan_semantics": "technical_plan_alias",
             },
         )
 
@@ -532,7 +544,9 @@ if __name__ == "__main__":
         "tp1": 4680.00,
         "tp2": None,
         "tp3": None,
-        "rr": 3.0,
+        "rr": 0.5,
+        "risk_valid": False,
+        "financial_risk": {"invalid": True},
     }
 
     # Compatible avec les deux conventions du validateur.
@@ -544,13 +558,25 @@ if __name__ == "__main__":
     first = moteur.verifier(setup, risk, validation)
     print("FIRST:", first)
 
-    if first.allowed:
-        moteur.enregistrer_signal(
-            setup=setup,
-            risk_plan=risk,
-            setup_id=first.setup_id,
-        )
+    assert first.allowed, first
+    assert first.metadata.get("financial_risk_used") is False
+
+    moteur.enregistrer_signal(
+        setup=setup,
+        risk_plan=risk,
+        setup_id=first.setup_id,
+    )
 
     second = moteur.verifier(setup, risk, validation)
     print("SECOND:", second)
+    assert second.allowed is False
+    assert second.status == "ACTIVE_DUPLICATE"
+
+    moteur.desactiver_signal(first.setup_id)
+    third = moteur.verifier(setup, risk, validation)
+    print("THIRD:", third)
+    assert third.allowed is False
+    assert third.status == "COOLDOWN"
+
     print("STATUS:", moteur.get_status())
+    print("ANTI-SPAM TEST: OK")
