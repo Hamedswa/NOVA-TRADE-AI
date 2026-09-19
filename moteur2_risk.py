@@ -1,7 +1,7 @@
 """
 NOVA TRADE AI - ENGINE 2
 moteur2_risk.py
-Plan de risque déterministe du moteur 2.
+Plan technique déterministe du moteur 2.
 Responsabilités :
     setup
         -> Entry naturelle
@@ -10,8 +10,8 @@ Responsabilités :
         -> calcul RR
         -> vérification géométrique
 Règles :
-    - RR minimum obligatoire : 1:3
-    - TP1 obligatoire
+    - aucun minimum RR
+    - TP1 naturel recherché lorsque disponible
     - TP2 / TP3 facultatifs
     - aucun TP artificiel
     - aucun déplacement artificiel du SL
@@ -25,7 +25,7 @@ Timeframes utilisés pour la géométrie :
     M15 : timeframe principal du setup
 M5 et M1 ne servent PAS à construire le plan de risque.
 Ils sont réservés à moteur2_confirmation.py.
-Aucun concept SMC obligatoire.
+Aucun concept externe obligatoire.
 """
 from __future__ import annotations
 from dataclasses import dataclass, asdict
@@ -49,10 +49,10 @@ CONFIRMATION_TIMEFRAMES = (
     "M5",
     "M1",
 )
-MIN_RR = 3.0
-TP1_RR_TARGET = 3.0
-TP2_RR_TARGET = 4.0
-TP3_RR_TARGET = 5.0
+MIN_RR = 0.0  # Compatibilité API uniquement : aucun minimum RR.
+TP1_RR_TARGET = 0.0  # Référence historique, non bloquante.
+TP2_RR_TARGET = 0.0  # Référence historique, non bloquante.
+TP3_RR_TARGET = 0.0  # Référence historique, non bloquante.
 DEFAULT_SWING_LOOKBACK = 30
 # Utilisé uniquement pour placer un SL légèrement au-delà
 # d'une invalidation naturelle.
@@ -88,24 +88,22 @@ class RiskPlan:
 # ============================================================================
 class Moteur2Risk:
     """
-    Construit un plan de risque naturel à partir d'un setup.
+    Construit un plan technique naturel à partir d'un setup.
     Ce module répond uniquement à la question :
-        "Ce setup possède-t-il une géométrie naturelle
-         Entry / SL / TP permettant au moins 1:3 ?"
+        "Quels niveaux Entry / SL / TP naturels peut-on construire ?"
+    Le RR est calculé et exposé comme information descriptive.
+    Il ne constitue jamais une condition de validité ou de décision.
     Il ne répond PAS à :
         "Doit-on envoyer le signal ?"
-    Cette décision appartient exclusivement à
-    moteur2_validation.py.
     """
     def __init__(
         self,
         min_rr: float = MIN_RR,
         swing_lookback: int = DEFAULT_SWING_LOOKBACK,
     ) -> None:
-        self.min_rr = max(
-            float(min_rr),
-            MIN_RR,
-        )
+        # Compatibilité avec les anciens appels : le paramètre est conservé,
+        # mais aucun minimum RR n'est appliqué.
+        self.min_rr = 0.0
         self.swing_lookback = max(
             int(swing_lookback),
             5,
@@ -932,36 +930,36 @@ class Moteur2Risk:
         Optional[float],
         Optional[float],
     ]:
-        risk = abs(
-            entry - sl
-        )
+        """Construit des TP uniquement à partir de niveaux naturels.
+
+        Aucun seuil RR n'est utilisé pour choisir ou rejeter un objectif.
+        Le premier niveau naturel valide devient TP1, puis les suivants
+        deviennent TP2 et TP3 lorsqu'ils existent.
+        """
+        risk = abs(entry - sl)
         if risk <= 0:
             return None, None, None
-        natural_targets = (
-            self._collect_natural_targets(
-                direction=direction,
-                entry=entry,
-                zones=zones,
-                candles_by_timeframe=candles_by_timeframe,
-                active_zone=active_zone,
-            )
+
+        natural_targets = self._collect_natural_targets(
+            direction=direction,
+            entry=entry,
+            zones=zones,
+            candles_by_timeframe=candles_by_timeframe,
+            active_zone=active_zone,
         )
 
         # Un setup peut fournir des objectifs déjà identifiés par une couche
-        # supérieure. Ils sont acceptés comme références naturelles, jamais
-        # comme projections artificielles.
+        # supérieure. Ils restent des références naturelles, jamais des
+        # projections artificielles.
         provided_targets: List[float] = []
-        for key in (
-            "target_levels",
-            "tp_candidates",
-            "natural_targets",
-        ):
+        for key in ("target_levels", "tp_candidates", "natural_targets"):
             values = self._get(setup, key, []) if setup is not None else []
             if isinstance(values, (list, tuple)):
                 for value in values:
                     number = self._number(value)
                     if number is not None and number > 0:
                         provided_targets.append(number)
+
         if provided_targets:
             natural_targets = self._deduplicate_levels(
                 sorted(
@@ -970,86 +968,26 @@ class Moteur2Risk:
                 ),
                 candles_by_timeframe,
             )
+
         if not natural_targets:
             return None, None, None
-        tp1 = None
-        tp2 = None
-        tp3 = None
-        # ----------------------------------------------------
-        # BUY
-        # ----------------------------------------------------
-        if direction == "BUY":
-            for target in natural_targets:
-                rr = (
-                    target - entry
-                ) / risk
-                if rr >= self.min_rr:
-                    tp1 = target
-                    break
-            if tp1 is None:
-                return None, None, None
-            for target in natural_targets:
-                if target <= tp1:
-                    continue
-                rr = (
-                    target - entry
-                ) / risk
-                if rr >= TP2_RR_TARGET:
-                    tp2 = target
-                    break
-            for target in natural_targets:
-                reference = (
-                    tp2
-                    if tp2 is not None
-                    else tp1
-                )
-                if target <= reference:
-                    continue
-                rr = (
-                    target - entry
-                ) / risk
-                if rr >= TP3_RR_TARGET:
-                    tp3 = target
-                    break
-            return tp1, tp2, tp3
-        # ----------------------------------------------------
-        # SELL
-        # ----------------------------------------------------
-        if direction == "SELL":
-            for target in natural_targets:
-                rr = (
-                    entry - target
-                ) / risk
-                if rr >= self.min_rr:
-                    tp1 = target
-                    break
-            if tp1 is None:
-                return None, None, None
-            for target in natural_targets:
-                if target >= tp1:
-                    continue
-                rr = (
-                    entry - target
-                ) / risk
-                if rr >= TP2_RR_TARGET:
-                    tp2 = target
-                    break
-            for target in natural_targets:
-                reference = (
-                    tp2
-                    if tp2 is not None
-                    else tp1
-                )
-                if target >= reference:
-                    continue
-                rr = (
-                    entry - target
-                ) / risk
-                if rr >= TP3_RR_TARGET:
-                    tp3 = target
-                    break
-            return tp1, tp2, tp3
-        return None, None, None
+
+        # Les niveaux sont déjà triés dans le sens de la direction.
+        # Aucun RR minimum ne vient supprimer les premiers objectifs.
+        valid_targets: List[float] = []
+        for target in natural_targets:
+            if direction == "BUY" and target > entry:
+                valid_targets.append(target)
+            elif direction == "SELL" and target < entry:
+                valid_targets.append(target)
+
+        if not valid_targets:
+            return None, None, None
+
+        tp1 = valid_targets[0]
+        tp2 = valid_targets[1] if len(valid_targets) > 1 else None
+        tp3 = valid_targets[2] if len(valid_targets) > 2 else None
+        return tp1, tp2, tp3
     # ========================================================================
     # GÉOMÉTRIE
     # ========================================================================
@@ -1185,7 +1123,10 @@ class Moteur2Risk:
             valid=False,
             reason=reason,
             metadata=metadata or {
-                "minimum_rr": self.min_rr,
+                "minimum_rr": None,
+                "rr_is_blocking": False,
+                "financial_risk_is_decision_factor": False,
+                "technical_plan_only": True,
             },
         )
     # ========================================================================
@@ -1426,7 +1367,7 @@ class Moteur2Risk:
                 rr_tp2=rr_tp2,
                 rr_tp3=rr_tp3,
                 metadata={
-                    "minimum_rr": self.min_rr,
+                    "minimum_rr": None,
                     "tp1_required": True,
                     "tp2_optional": True,
                     "tp3_optional": True,
@@ -1435,53 +1376,12 @@ class Moteur2Risk:
                 },
             )
         # ================================================================
-        # RR MINIMUM
+        # RR INFORMATIF UNIQUEMENT
         # ================================================================
-        rr_valid = (
-            primary_rr is not None
-            and primary_rr >= self.min_rr
-        )
-        if not rr_valid:
-            return RiskPlan(
-                symbol=resolved_symbol,
-                setup_id=setup_id,
-                setup_type=setup_type,
-                direction=direction,
-                entry=entry,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
-                risk_distance=risk_distance,
-                rr_tp1=rr_tp1,
-                rr_tp2=rr_tp2,
-                rr_tp3=rr_tp3,
-                primary_rr=primary_rr,
-                geometry_valid=True,
-                rr_valid=False,
-                valid=False,
-                reason=(
-                    f"RR primaire insuffisant : "
-                    f"{primary_rr:.2f}R si disponible, "
-                    f"minimum requis {self.min_rr:.2f}R."
-                    if primary_rr is not None
-                    else (
-                        "TP1 naturel ne permettant pas "
-                        "de calculer un RR valide."
-                    )
-                ),
-                metadata={
-                    "minimum_rr": self.min_rr,
-                    "tp1_required": True,
-                    "tp2_optional": True,
-                    "tp3_optional": True,
-                    "zone_used": active_zone,
-                    "natural_target_sources": ["M15", "H1", "H4", "zones", "setup"] ,
-                },
-            )
-        # ================================================================
-        # PLAN VALIDE
-        # ================================================================
+        rr_valid = primary_rr is not None and primary_rr > 0
+
+        # La validité du module repose sur la géométrie technique, pas sur
+        # un seuil RR et jamais sur un risque financier.
         return RiskPlan(
             symbol=resolved_symbol,
             setup_id=setup_id,
@@ -1498,12 +1398,15 @@ class Moteur2Risk:
             rr_tp3=rr_tp3,
             primary_rr=primary_rr,
             geometry_valid=True,
-            rr_valid=True,
+            rr_valid=rr_valid,
             valid=True,
             reason=(
-                "Plan de risque naturel valide : "
-                f"RR primaire {primary_rr:.2f}R "
-                f">= minimum {self.min_rr:.2f}R."
+                "Plan technique naturel valide : "
+                + (
+                    f"RR primaire informatif {primary_rr:.2f}R."
+                    if primary_rr is not None
+                    else "RR primaire indisponible."
+                )
             ),
             metadata={
                 "zone_used": active_zone,
@@ -1513,10 +1416,13 @@ class Moteur2Risk:
                     for timeframe, values
                     in candles_by_timeframe.items()
                 },
-                "minimum_rr": self.min_rr,
-                "tp1_rr_requirement": TP1_RR_TARGET,
-                "tp2_rr_reference": TP2_RR_TARGET,
-                "tp3_rr_reference": TP3_RR_TARGET,
+                "minimum_rr": None,
+                "rr_is_blocking": False,
+                "financial_risk_is_decision_factor": False,
+                "technical_plan_only": True,
+                "tp1_rr_reference": None,
+                "tp2_rr_reference": None,
+                "tp3_rr_reference": None,
                 "tp1_required": True,
                 "tp2_optional": True,
                 "tp3_optional": True,
@@ -1603,7 +1509,7 @@ class Moteur2Risk:
         )
         return {
             "symbol": resolved_symbol,
-            "minimum_rr": self.min_rr,
+            "minimum_rr": None,
             "plans": [
                 self.to_dict(plan)
                 for plan in plans
