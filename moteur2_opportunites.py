@@ -707,6 +707,7 @@ class Moteur2Opportunites:
                         "observations"
                     )
                 )
+            )
         )
 
         risks = _unique_text(
