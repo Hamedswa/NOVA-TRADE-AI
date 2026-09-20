@@ -1,12 +1,12 @@
 """
 NOVA TRADE AI - ENGINE 2
 moteur2_confirmation.py
-Confirmation du timing sur M5 et M1.
+Confirmation descriptive du timing sur M5 et M1.
 RESPONSABILITÉS
 ---------------
 - Observer le comportement immédiat du prix.
-- M5 = confirmation principale.
-- M1 = confirmation secondaire.
+- M5 = observation principale.
+- M1 = observation secondaire.
 - Détecter :
     * impulsion
     * rejet
@@ -18,11 +18,13 @@ RESPONSABILITÉS
   d'un setup déjà détecté.
 IMPORTANT
 ---------
-Ce module ne crée pas de setup.
-Ce module ne calcule pas le plan de risque.
-Ce module ne valide pas définitivement un signal et ne bloque pas une opportunité.
-Ce module ne déclenche aucune entrée.
-Hiérarchie stricte :
+Ce module :
+- ne crée pas de setup ;
+- ne calcule pas le plan de risque ;
+- ne prend pas la décision BUY / SELL / WAIT ;
+- ne force pas une entrée ;
+- ne transforme pas M5/M1 en filtres rigides.
+Hiérarchie :
     H4 / H1 / M15
         ↓
     Setup
@@ -33,10 +35,14 @@ Hiérarchie stricte :
         ↓
     M1 = observation secondaire
         ↓
-    Décision stratégique
-M1 ne peut jamais compenser un M5 insuffisant.
-La décision READY_FOR_SIGNAL appartient exclusivement
-à moteur2_validation.py.
+    couches de validation / décision
+M5/M1 sont contributifs pour le timing.
+`entry_triggered` ne signifie pas que ce module prend
+une décision d'entrée. Il indique uniquement que le moteur
+dispose d'une observation de timing suffisante pour permettre
+au pipeline de continuer.
+La décision BUY / SELL / WAIT reste exclusivement du ressort
+de moteur2_decision.py.
 """
 from __future__ import annotations
 from dataclasses import dataclass, asdict
@@ -51,9 +57,10 @@ SUPPORTED_SYMBOLS = (
     "EURUSD",
     "GBPUSD",
 )
+# Paramètres conservés pour compatibilité API.
+# Ils ne constituent pas des filtres bloquants.
 M5_MIN_SCORE = 0.0
 M1_MIN_SCORE = 0.0
-# Paramètres conservés pour compatibilité API. Ils ne sont pas bloquants.
 CONFIRMATION_SCORE = 0.0
 MIN_CANDLES_M5 = 5
 MIN_CANDLES_M1 = 5
@@ -80,6 +87,9 @@ class ConfirmationResult:
     m1_confirmed: bool
     confirmation_status: str
     confirmation_valid: bool
+    # Interface attendue par moteur2_validation.py.
+    # Ce champ ne constitue PAS une décision BUY/SELL.
+    entry_triggered: bool
     reasons: List[str]
     warnings: List[str]
     metadata: Dict[str, Any]
@@ -88,16 +98,19 @@ class ConfirmationResult:
 # ============================================================
 class Moteur2Confirmation:
     """
-    Confirmation du timing M5/M1.
-    Règle principale :
-        M5 est observé en priorité, mais sa confirmation n'est plus une condition bloquante.
+    Confirmation descriptive du timing M5/M1.
+    M5 est observé en priorité.
     M1 peut :
         - renforcer le timing ;
         - rester neutre ;
         - signaler une faiblesse ;
         - signaler une divergence de court terme.
-    M1 ne remplace pas M5 ; les deux alimentent simplement la lecture du timing.
-    M1 neutre ne bloque pas un M5 confirmé.
+    IMPORTANT :
+    m5_confirmed et m1_confirmed sont des observations.
+    Ils ne constituent pas des veto.
+    `entry_triggered` indique uniquement qu'une observation
+    minimale de timing est disponible pour continuer le pipeline.
+    Il ne décide jamais BUY / SELL / WAIT.
     """
     def __init__(
         self,
@@ -107,9 +120,7 @@ class Moteur2Confirmation:
     ):
         self.m5_min_score = float(m5_min_score)
         self.m1_min_score = float(m1_min_score)
-        self.confirmation_score = float(
-            confirmation_score
-        )
+        self.confirmation_score = float(confirmation_score)
     # ========================================================
     # OUTILS GÉNÉRAUX
     # ========================================================
@@ -364,39 +375,26 @@ class Moteur2Confirmation:
         )
         if first_close is None or last_close is None:
             return 0.0
-        ranges = [
-            self._range(candle)
-            for candle in candles
-        ]
-        valid_ranges = [
-            value
-            for value in ranges
-            if value > EPSILON
-        ]
-        if not valid_ranges:
+        reference_range = 0.0
+        for candle in candles:
+            reference_range += self._range(candle)
+        reference_range /= max(len(candles), 1)
+        if reference_range <= EPSILON:
             return 0.0
-        average_range = (
-            sum(valid_ranges)
-            / len(valid_ranges)
-        )
-        distance = last_close - first_close
-        denominator = (
-            average_range
-            * max(len(candles) * 0.50, 1.0)
-        )
-        if denominator <= EPSILON:
-            return 0.0
+        value = (
+            last_close - first_close
+        ) / reference_range
         return max(
             -1.0,
             min(
                 1.0,
-                distance / denominator,
+                value,
             ),
         )
     # ========================================================
-    # PROGRESSION DES CLÔTURES
+    # PROGRESSION
     # ========================================================
-    def _close_progression(
+    def _progression(
         self,
         candles: Sequence[Any],
     ) -> float:
@@ -412,84 +410,110 @@ class Moteur2Confirmation:
                 closes.append(close)
         if len(closes) < 3:
             return 0.0
-        bullish = 0
-        bearish = 0
+        movements = []
         for previous, current in zip(
             closes[:-1],
             closes[1:],
         ):
-            if current > previous:
-                bullish += 1
-            elif current < previous:
-                bearish += 1
-        total = bullish + bearish
-        if total == 0:
+            movements.append(
+                current - previous
+            )
+        if not movements:
             return 0.0
+        positive = sum(
+            1
+            for movement in movements
+            if movement > 0
+        )
+        negative = sum(
+            1
+            for movement in movements
+            if movement < 0
+        )
         return (
-            bullish - bearish
-        ) / total
+            positive - negative
+        ) / max(len(movements), 1)
     # ========================================================
     # REJET
     # ========================================================
-    def _rejection_strength(
+    def _rejection(
         self,
-        candle: Any,
-        direction: str,
+        candles: Sequence[Any],
     ) -> float:
-        o = self._candle_value(candle, "open")
-        h = self._candle_value(candle, "high")
-        l = self._candle_value(candle, "low")
-        c = self._candle_value(candle, "close")
-        if None in (o, h, l, c):
+        if not candles:
             return 0.0
-        candle_range = h - l
-        if candle_range <= EPSILON:
+        values = []
+        for candle in candles:
+            h = self._candle_value(
+                candle,
+                "high",
+            )
+            l = self._candle_value(
+                candle,
+                "low",
+            )
+            o = self._candle_value(
+                candle,
+                "open",
+            )
+            c = self._candle_value(
+                candle,
+                "close",
+            )
+            if None in (h, l, o, c):
+                continue
+            candle_range = h - l
+            if candle_range <= EPSILON:
+                continue
+            upper_wick = (
+                h - max(o, c)
+            )
+            lower_wick = (
+                min(o, c) - l
+            )
+            body = abs(c - o)
+            rejection = max(
+                upper_wick,
+                lower_wick,
+            )
+            values.append(
+                rejection
+                / max(candle_range, EPSILON)
+            )
+        if not values:
             return 0.0
-        upper_wick = h - max(o, c)
-        lower_wick = min(o, c) - l
-        if direction == "BUY":
-            return max(
-                0.0,
-                min(
-                    1.0,
-                    lower_wick / candle_range,
-                ),
-            )
-        if direction == "SELL":
-            return max(
-                0.0,
-                min(
-                    1.0,
-                    upper_wick / candle_range,
-                ),
-            )
-        return 0.0
+        return max(
+            0.0,
+            min(
+                1.0,
+                sum(values)
+                / len(values),
+            ),
+        )
     # ========================================================
     # PERTE DE PRESSION
     # ========================================================
     def _pressure_loss(
         self,
         candles: Sequence[Any],
-        direction: str,
     ) -> float:
         if len(candles) < 4:
             return 0.0
-        split = max(
-            2,
-            len(candles) // 2,
+        midpoint = len(candles) // 2
+        first = candles[:midpoint]
+        second = candles[midpoint:]
+        first_pressure = abs(
+            self._pressure(first)
         )
-        previous = candles[:split]
-        recent = candles[split:]
-        previous_pressure = self._pressure(
-            previous
+        second_pressure = abs(
+            self._pressure(second)
         )
-        recent_pressure = self._pressure(
-            recent
-        )
-        if direction == "SELL":
-            previous_pressure *= -1
-            recent_pressure *= -1
-        loss = previous_pressure - recent_pressure
+        if first_pressure <= EPSILON:
+            return 0.0
+        loss = (
+            first_pressure
+            - second_pressure
+        ) / first_pressure
         return max(
             0.0,
             min(
@@ -507,22 +531,11 @@ class Moteur2Confirmation:
     ) -> str:
         if len(candles) < 2:
             return "INSUFFISANT"
-        recent = list(
-            candles[-5:]
-        )
-        pressure = self._pressure(
-            recent
-        )
-        momentum = self._momentum(
-            recent
-        )
-        progression = self._close_progression(
-            recent
-        )
-        rejection = self._rejection_strength(
-            recent[-1],
-            direction,
-        )
+        pressure = self._pressure(candles)
+        momentum = self._momentum(candles)
+        progression = self._progression(candles)
+        rejection = self._rejection(candles)
+        pressure_loss = self._pressure_loss(candles)
         directional_pressure = (
             pressure
             if direction == "BUY"
@@ -533,40 +546,33 @@ class Moteur2Confirmation:
             if direction == "BUY"
             else -momentum
         )
-        directional_progression = (
-            progression
-            if direction == "BUY"
-            else -progression
-        )
-        pressure_loss = self._pressure_loss(
-            recent,
-            direction,
-        )
         if (
-            directional_pressure >= 0.32
-            and directional_momentum >= 0.18
+            directional_pressure >= 0.45
+            and directional_momentum >= 0.35
         ):
             return "IMPULSION"
-        if rejection >= 0.45:
-            return "REJET"
         if (
-            directional_progression >= 0.40
-            and directional_pressure >= 0.12
-        ):
-            return "REPRISE"
-        if (
-            directional_pressure >= 0.05
+            directional_pressure >= 0.25
+            and progression >= 0.25
         ):
             return "PRESSION"
         if (
-            pressure_loss >= 0.45
-            and directional_pressure < 0.10
+            directional_pressure >= 0.20
+            and directional_momentum >= 0.15
+            and rejection >= 0.20
+        ):
+            return "REPRISE"
+        if (
+            rejection >= 0.45
+            and directional_pressure >= 0.10
+        ):
+            return "REJET"
+        if (
+            pressure_loss >= 0.40
+            and directional_pressure >= 0.0
         ):
             return "PERTE_PRESSION"
-        if (
-            directional_pressure <= -0.25
-            and directional_momentum <= -0.15
-        ):
+        if directional_pressure <= -0.30:
             return "CONTRE_MOUVEMENT"
         return "NEUTRE"
     # ========================================================
@@ -588,66 +594,36 @@ class Moteur2Confirmation:
                 "rejection": 0.0,
                 "pressure_loss": 0.0,
             }
-        recent = list(
-            candles[-10:]
+        pressure = self._pressure(candles)
+        momentum = self._momentum(candles)
+        progression = self._progression(candles)
+        rejection = self._rejection(candles)
+        pressure_loss = self._pressure_loss(candles)
+        raw_direction = (
+            pressure * 0.40
+            + momentum * 0.30
+            + progression * 0.20
         )
-        pressure = self._pressure(
-            recent
+        if direction == "SELL":
+            raw_direction *= -1.0
+        directional = max(
+            -1.0,
+            min(
+                1.0,
+                raw_direction,
+            ),
         )
-        momentum = self._momentum(
-            recent
+        # Score descriptif de 0 à 100.
+        score = (
+            50.0
+            + directional * 50.0
         )
-        progression = self._close_progression(
-            recent
-        )
-        rejection = self._rejection_strength(
-            recent[-1],
-            direction,
-        )
-        pressure_loss = self._pressure_loss(
-            recent,
-            direction,
-        )
-        directional_pressure = (
-            pressure
-            if direction == "BUY"
-            else -pressure
-        )
-        directional_momentum = (
-            momentum
-            if direction == "BUY"
-            else -momentum
-        )
-        directional_progression = (
-            progression
-            if direction == "BUY"
-            else -progression
-        )
-        # ----------------------------------------------------
-        # SCORE
-        # ----------------------------------------------------
-        score = 50.0
-        score += directional_pressure * 24.0
-        score += directional_momentum * 18.0
-        score += directional_progression * 10.0
-        score += rejection * 10.0
-        # Une perte de pression réduit la qualité du timing,
-        # sans créer une interdiction absolue.
-        score -= pressure_loss * 12.0
         score = max(
             0.0,
             min(
                 100.0,
                 score,
             ),
-        )
-        # ----------------------------------------------------
-        # BIAS OBSERVÉ
-        # ----------------------------------------------------
-        raw_direction = (
-            pressure
-            + momentum
-            + progression
         )
         if raw_direction >= 0.22:
             bias = "BUY"
@@ -659,7 +635,7 @@ class Moteur2Confirmation:
             "score": round(score, 2),
             "bias": bias,
             "behavior": self._detect_behavior(
-                recent,
+                candles,
                 direction,
             ),
             "pressure": round(
@@ -724,7 +700,11 @@ class Moteur2Confirmation:
             or self._get(setup, "bias")
         )
         setup_type = str(
-            self._get(setup, "setup_type", "UNKNOWN")
+            self._get(
+                setup,
+                "setup_type",
+                "UNKNOWN",
+            )
         ).strip().upper()
         if direction is None and risk_plan is not None:
             direction = self._normalize_direction(
@@ -752,11 +732,15 @@ class Moteur2Confirmation:
                 m1_confirmed=False,
                 confirmation_status="INVALID",
                 confirmation_valid=False,
+                entry_triggered=False,
                 reasons=[
                     "Symbole absent ou non supporté."
                 ],
                 warnings=[],
-                metadata={},
+                metadata={
+                    "entry_triggered_semantics":
+                        "timing_observation_available"
+                },
             )
         # ----------------------------------------------------
         # DIRECTION INVALIDE
@@ -777,11 +761,15 @@ class Moteur2Confirmation:
                 m1_confirmed=False,
                 confirmation_status="INVALID",
                 confirmation_valid=False,
+                entry_triggered=False,
                 reasons=[
                     "Direction absente ou invalide."
                 ],
                 warnings=[],
-                metadata={},
+                metadata={
+                    "entry_triggered_semantics":
+                        "timing_observation_available"
+                },
             )
         # ----------------------------------------------------
         # CANDLES
@@ -854,7 +842,10 @@ class Moteur2Confirmation:
             reasons.append(
                 "M5 fournit la confirmation principale du timing."
             )
-            if setup_type not in {"", "UNKNOWN"}:
+            if setup_type not in {
+                "",
+                "UNKNOWN",
+            }:
                 reasons.append(
                     f"Timing M5 évalué pour le setup {setup_type}."
                 )
@@ -920,91 +911,173 @@ class Moteur2Confirmation:
         # ----------------------------------------------------
         # VALIDATION DE LA CONFIRMATION
         # ----------------------------------------------------
-        # M5 reste la référence d'observation. Ni M5 ni M1 ne constituent un veto.
         #
-        # IMPORTANT : le score combiné n'est PAS une porte
-        # obligatoire. Il sert à qualifier la force du timing.
-        # Les états M5/M1 décrivent le timing disponible pour les couches suivantes.
+        # M5 et M1 restent contributifs.
+        #
+        # Aucun seuil de score n'est un veto.
+        # Aucun seuil RR n'intervient.
+        #
+        # confirmation_valid signifie seulement que des données
+        # de timing exploitables sont disponibles.
         # ----------------------------------------------------
-        # Cette couche observe le timing ; elle ne doit plus bloquer
-        # une possibilité issue des horizons supérieurs.
-        # m5_confirmed / m1_confirmed restent des observations.
         confirmation_valid = (
             len(m5) >= MIN_CANDLES_M5
             or len(m1) >= MIN_CANDLES_M1
         )
-
+        # ----------------------------------------------------
+        # ENTRY TRIGGERED
+        # ----------------------------------------------------
+        #
+        # IMPORTANT :
+        #
+        # Ce champ ne signifie PAS :
+        #     "BUY maintenant"
+        #     "SELL maintenant"
+        #
+        # Il ne signifie pas non plus que M5/M1 doivent être
+        # favorables.
+        #
+        # Il sert uniquement d'interface avec validation.py :
+        # lorsqu'une observation minimale de timing existe,
+        # le pipeline peut continuer.
+        #
+        # La décision stratégique reste dans moteur2_decision.py.
+        # ----------------------------------------------------
+        entry_triggered = bool(
+            confirmation_valid
+        )
         if m5_confirmed and m1_confirmed:
-            confirmation_status = "TIMING_CONVERGENT"
+            confirmation_status = (
+                "TIMING_CONVERGENT"
+            )
         elif m5_confirmed:
-            confirmation_status = "TIMING_M5_FAVORABLE"
+            confirmation_status = (
+                "TIMING_M5_FAVORABLE"
+            )
         elif m1_confirmed:
-            confirmation_status = "TIMING_M1_FAVORABLE"
+            confirmation_status = (
+                "TIMING_M1_FAVORABLE"
+            )
         elif major_counter_move:
-            confirmation_status = "TIMING_CONTRARY_PRESSURE"
-        elif len(m5) >= MIN_CANDLES_M5 or len(m1) >= MIN_CANDLES_M1:
-            confirmation_status = "TIMING_OBSERVED"
+            confirmation_status = (
+                "TIMING_CONTRARY_PRESSURE"
+            )
+        elif (
+            len(m5) >= MIN_CANDLES_M5
+            or len(m1) >= MIN_CANDLES_M1
+        ):
+            confirmation_status = (
+                "TIMING_OBSERVED"
+            )
         else:
-            confirmation_status = "TIMING_INSUFFICIENT_DATA"
+            confirmation_status = (
+                "TIMING_INSUFFICIENT_DATA"
+            )
         # ----------------------------------------------------
         # MÉTADONNÉES
         # ----------------------------------------------------
         timing_possibilities: List[str] = []
         if m5_confirmed and m1_confirmed:
-            timing_possibilities.append("CONVERGENCE_M5_M1")
+            timing_possibilities.append(
+                "CONVERGENCE_M5_M1"
+            )
         if m5_confirmed and not m1_confirmed:
-            timing_possibilities.append("M5_LEAD_M1_EN_FORMATION")
+            timing_possibilities.append(
+                "M5_LEAD_M1_EN_FORMATION"
+            )
         if m1_confirmed and not m5_confirmed:
-            timing_possibilities.append("M1_EARLY_DEVELOPMENT")
-        if m5_behavior == "IMPULSION" or m1_behavior == "IMPULSION":
-            timing_possibilities.append("ACCELERATION")
-        if m5_behavior == "PERTE_PRESSION" or m1_behavior == "PERTE_PRESSION":
-            timing_possibilities.append("DECELERATION")
+            timing_possibilities.append(
+                "M1_EARLY_DEVELOPMENT"
+            )
+        if (
+            m5_behavior == "IMPULSION"
+            or m1_behavior == "IMPULSION"
+        ):
+            timing_possibilities.append(
+                "ACCELERATION"
+            )
+        if (
+            m5_behavior == "PERTE_PRESSION"
+            or m1_behavior == "PERTE_PRESSION"
+        ):
+            timing_possibilities.append(
+                "DECELERATION"
+            )
         if major_counter_move:
-            timing_possibilities.append("COUNTER_PRESSURE")
+            timing_possibilities.append(
+                "COUNTER_PRESSURE"
+            )
         if not timing_possibilities:
-            timing_possibilities.append("TIMING_NEUTRAL_OR_FORMING")
-
+            timing_possibilities.append(
+                "TIMING_NEUTRAL_OR_FORMING"
+            )
         metadata = {
-            "timing_possibilities": timing_possibilities,
-            "m5_candles": len(m5),
-            "m1_candles": len(m1),
-            "m5_pressure": m5_data["pressure"],
-            "m5_momentum": m5_data["momentum"],
-            "m5_progression": m5_data["progression"],
-            "m5_rejection": m5_data["rejection"],
-            "m5_pressure_loss": m5_data[
-                "pressure_loss"
-            ],
-            "m1_pressure": m1_data["pressure"],
-            "m1_momentum": m1_data["momentum"],
-            "m1_progression": m1_data["progression"],
-            "m1_rejection": m1_data["rejection"],
-            "m1_pressure_loss": m1_data[
-                "pressure_loss"
-            ],
-            "m5_weight": M5_WEIGHT,
-            "m1_weight": M1_WEIGHT,
-            "m5_min_score": self.m5_min_score,
-            "m1_min_score": self.m1_min_score,
-            "confirmation_score": self.confirmation_score,
-            "setup_type": setup_type,
-            "m5_is_primary_observation": True,
-            "m1_is_secondary_observation": True,
-            "m1_can_replace_m5": False,
-            "combined_score_is_blocking": False,
-            "m5_threshold_is_blocking": False,
-            "m1_threshold_is_blocking": False,
-            "m1_neutral_is_blocking": False,
-            "confirmation_is_blocking": False,
-            "autonomous_timing_layer": True,
-            "risk_plan_available": (
-                risk_plan is not None
-            ),
-            "final_validation_owner": (
-                "moteur2_decision.py"
-            ),
-            "execution_authority": False,
+            "timing_possibilities":
+                timing_possibilities,
+            "m5_candles":
+                len(m5),
+            "m1_candles":
+                len(m1),
+            "m5_pressure":
+                m5_data["pressure"],
+            "m5_momentum":
+                m5_data["momentum"],
+            "m5_progression":
+                m5_data["progression"],
+            "m5_rejection":
+                m5_data["rejection"],
+            "m5_pressure_loss":
+                m5_data["pressure_loss"],
+            "m1_pressure":
+                m1_data["pressure"],
+            "m1_momentum":
+                m1_data["momentum"],
+            "m1_progression":
+                m1_data["progression"],
+            "m1_rejection":
+                m1_data["rejection"],
+            "m1_pressure_loss":
+                m1_data["pressure_loss"],
+            "m5_weight":
+                M5_WEIGHT,
+            "m1_weight":
+                M1_WEIGHT,
+            "m5_min_score":
+                self.m5_min_score,
+            "m1_min_score":
+                self.m1_min_score,
+            "confirmation_score":
+                self.confirmation_score,
+            "setup_type":
+                setup_type,
+            "m5_is_primary_observation":
+                True,
+            "m1_is_secondary_observation":
+                True,
+            "m1_can_replace_m5":
+                False,
+            "combined_score_is_blocking":
+                False,
+            "m5_threshold_is_blocking":
+                False,
+            "m1_threshold_is_blocking":
+                False,
+            "m1_neutral_is_blocking":
+                False,
+            "confirmation_is_blocking":
+                False,
+            "entry_triggered_is_decision":
+                False,
+            "entry_triggered_semantics":
+                "timing_observation_available",
+            "autonomous_timing_layer":
+                True,
+            "risk_plan_available":
+                risk_plan is not None,
+            "final_decision_owner":
+                "moteur2_decision.py",
+            "execution_authority":
+                False,
         }
         return ConfirmationResult(
             symbol=resolved_symbol,
@@ -1028,8 +1101,12 @@ class Moteur2Confirmation:
             m1_behavior=m1_behavior,
             m5_confirmed=m5_confirmed,
             m1_confirmed=m1_confirmed,
-            confirmation_status=confirmation_status,
-            confirmation_valid=confirmation_valid,
+            confirmation_status=
+                confirmation_status,
+            confirmation_valid=
+                confirmation_valid,
+            entry_triggered=
+                entry_triggered,
             reasons=reasons,
             warnings=warnings,
             metadata=metadata,
