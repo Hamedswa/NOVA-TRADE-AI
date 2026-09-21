@@ -1032,6 +1032,94 @@ class Moteur2:
                 zones=zones,
             )
 
+            # ----------------------------------------------------------
+            # DIAGNOSTIC PIPELINE — OBSERVATION UNIQUEMENT
+            # ----------------------------------------------------------
+            # Ces logs servent à localiser précisément une éventuelle
+            # perte d'opportunités entre Opportunités → Plans → Setups.
+            # Ils ne filtrent, ne modifient et ne décident absolument rien.
+            raw_opportunities = []
+            if isinstance(opportunities_result, dict):
+                raw_opportunities = opportunities_result.get("opportunities", [])
+            elif isinstance(opportunities_result, (list, tuple)):
+                raw_opportunities = list(opportunities_result)
+
+            raw_technical_plans = []
+            if isinstance(technical_plans_result, dict):
+                raw_technical_plans = technical_plans_result.get("plans", [])
+            elif isinstance(technical_plans_result, (list, tuple)):
+                raw_technical_plans = list(technical_plans_result)
+
+            def _diagnostic_direction(item: Any) -> str:
+                data = self._to_dict(item)
+                return str(
+                    data.get("direction")
+                    or data.get("bias")
+                    or data.get("side")
+                    or "NEUTRAL"
+                ).upper()
+
+            opportunity_directions = [
+                _diagnostic_direction(item) for item in raw_opportunities
+            ]
+            plan_directions = [
+                _diagnostic_direction(item) for item in raw_technical_plans
+            ]
+
+            global_context = {}
+            context_data = self._to_dict(contexte)
+            if isinstance(context_data, dict):
+                candidate_global = context_data.get("global", {})
+                if isinstance(candidate_global, dict):
+                    global_context = candidate_global
+
+            logger.info(
+                "DIAGNOSTIC PIPELINE : %s | opportunities=%d | technical_plans=%d | classic_setups=%d | "
+                "context_direction=%s | context_state=%s | context_regime=%s | context_strength=%s",
+                self.symbol,
+                len(raw_opportunities),
+                len(raw_technical_plans),
+                len(setups),
+                global_context.get("direction", "N/A"),
+                global_context.get("state", "N/A"),
+                global_context.get("regime", global_context.get("market_regime", "N/A")),
+                global_context.get("strength", global_context.get("trend_strength", "N/A")),
+            )
+
+            if raw_opportunities:
+                logger.info(
+                    "DIAGNOSTIC OPPORTUNITIES : %s | directions=%s | types=%s",
+                    self.symbol,
+                    opportunity_directions,
+                    [
+                        self._to_dict(item).get("opportunity_type", "N/A")
+                        for item in raw_opportunities
+                    ],
+                )
+            else:
+                logger.info(
+                    "DIAGNOSTIC OPPORTUNITIES : %s | AUCUNE opportunite generee.",
+                    self.symbol,
+                )
+
+            if raw_technical_plans:
+                logger.info(
+                    "DIAGNOSTIC PLANS : %s | directions=%s | ids=%s",
+                    self.symbol,
+                    plan_directions,
+                    [
+                        self._to_dict(item).get("plan_id", "N/A")
+                        for item in raw_technical_plans
+                    ],
+                )
+            else:
+                logger.info(
+                    "DIAGNOSTIC PLANS : %s | AUCUN plan technique genere.",
+                    self.symbol,
+                )
+
+            classic_setups_count = len(setups)
+
             if not setups:
                 # Les opportunités autonomes peuvent exister sans setup
                 # historique. On crée uniquement un support technique à
@@ -1057,6 +1145,23 @@ class Moteur2:
                         "autonomous": True,
                     })
                 setups = synthetic_setups
+
+                logger.info(
+                    "DIAGNOSTIC SYNTHETIC SETUPS : %s | synthetic_setups=%d | directions=%s",
+                    self.symbol,
+                    len(synthetic_setups),
+                    [
+                        self._to_dict(item).get("direction", "N/A")
+                        for item in synthetic_setups
+                    ],
+                )
+
+            logger.info(
+                "DIAGNOSTIC FINAL SETUPS : %s | classic=%d | final=%d",
+                self.symbol,
+                classic_setups_count,
+                len(setups),
+            )
 
             if not setups:
 
