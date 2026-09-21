@@ -561,23 +561,26 @@ class Moteur2Opportunites:
                     if _dict(item)
                 ]
 
-        if isinstance(value, (list, tuple)):
-            return [
-                _dict(item)
-                for item in value
-                if _dict(item)
-            ]
+            if raw is not None:
+                item = _dict(raw)
 
-        if value is not None:
-            item = _dict(value)
+                return [item] if item else []
 
-            if item:
-                return [item]
+        result: List[Dict[str, Any]] = []
 
-        return []
+        for item in _list(value):
+
+            converted = _dict(item)
+
+            if converted:
+                result.append(
+                    converted
+                )
+
+        return result
 
     # ------------------------------------------------------------------
-    # OBSERVATIONS
+    # COLLECTE DES OBSERVATIONS
     # ------------------------------------------------------------------
 
     def _collect_observations(
@@ -595,13 +598,18 @@ class Moteur2Opportunites:
         setup_list: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
 
-        # Le contexte principal retourne son état global sous
-        # context_data["global"]. Les anciens accès à la racine
-        # (state/direction/strength) ne correspondent donc pas au
-        # contrat de sortie actuel de moteur2_contexte.py.
-        global_context = context_data.get("global")
-        if not isinstance(global_context, dict):
-            global_context = {}
+        # Le contexte global produit par moteur2_contexte.py est stocké
+        # sous context_data["global"]. Il constitue une source valide de
+        # contexte directionnel pour la génération des possibilités.
+        # On conserve les chemins historiques en fallback afin de ne pas
+        # casser les autres formes de données.
+        global_context = _dict(
+            context_data.get("global")
+        )
+
+        market_context = _dict(
+            context_data.get("market_context")
+        )
 
         market_state = _upper(
             intelligence_data.get(
@@ -610,11 +618,17 @@ class Moteur2Opportunites:
             or global_context.get(
                 "state"
             )
+            or global_context.get(
+                "market_state"
+            )
             or context_data.get(
                 "state"
             )
             or context_data.get(
                 "market_state"
+            )
+            or market_context.get(
+                "state"
             )
             or market_data.get(
                 "market_state"
@@ -629,29 +643,43 @@ class Moteur2Opportunites:
             or global_context.get(
                 "regime"
             )
+            or global_context.get(
+                "market_regime"
+            )
             or market_data.get(
                 "market_regime"
             )
             or context_data.get(
                 "regime"
+            )
+            or market_context.get(
+                "regime"
             ),
             "UNKNOWN",
         )
 
-        bias = _normalise_direction(
-            intelligence_data.get(
-                "directional_bias"
-            )
-            or global_context.get(
-                "direction"
-            )
-            or context_data.get(
-                "direction"
-            )
-            or context_data.get(
-                "global_direction"
-            )
+        # Priorité au biais explicite de l'intelligence, puis au contexte
+        # global. Le contexte global de moteur2_contexte.py expose sa
+        # direction dans le champ "direction".
+        bias_candidates = (
+            intelligence_data.get("directional_bias"),
+            intelligence_data.get("bias"),
+            global_context.get("direction"),
+            global_context.get("directional_bias"),
+            context_data.get("direction"),
+            context_data.get("global_direction"),
+            context_data.get("directional_bias"),
+            market_context.get("direction"),
+            market_context.get("bias"),
         )
+
+        bias = "NEUTRAL"
+
+        for candidate in bias_candidates:
+            normalized = _normalise_direction(candidate)
+            if normalized != "NEUTRAL":
+                bias = normalized
+                break
 
         momentum = _upper(
             intelligence_data.get(
@@ -810,23 +838,6 @@ class Moteur2Opportunites:
             return {
                 "value": alignment
             }
-
-        global_context = context_data.get(
-            "global"
-        )
-
-        if isinstance(global_context, dict):
-            alignment = global_context.get(
-                "alignment"
-            )
-
-            if isinstance(alignment, dict):
-                return alignment
-
-            if alignment is not None:
-                return {
-                    "value": alignment
-                }
 
         return {}
 
@@ -1130,25 +1141,38 @@ class Moteur2Opportunites:
         if direction == "NEUTRAL":
             return []
 
-        market_state = _upper(
-            obs["market_state"]
-        )
+        momentum = obs["momentum"]
+        state = obs["market_state"]
 
-        market_regime = _upper(
-            obs["market_regime"]
+        radar_text = " ".join(
+            _upper(
+                event.get(
+                    "description"
+                )
+            )
+            for event in obs["radar"]
         )
 
         correction_hint = (
             self._contains_any(
-                market_state,
+                momentum,
+                "FAIBLE",
+                "WEAK",
+                "SLOW",
+                "RALENT",
+                "CORR",
+            )
+            or self._contains_any(
+                state,
                 "CORRECTION",
                 "RETRAIT",
                 "PULLBACK",
             )
             or self._contains_any(
-                market_regime,
-                "CORRECTION",
-                "TRANSITION",
+                radar_text,
+                "RALENT",
+                "REVERS",
+                "CORR",
             )
         )
 
@@ -1156,30 +1180,39 @@ class Moteur2Opportunites:
             return []
 
         evidence = [
-            f"Direction dominante : {direction}.",
-            f"État de marché : {market_state}.",
-            f"Régime : {market_regime}.",
+            f"Biais principal observé : {direction}.",
+            (
+                "État/momentum compatible avec une phase "
+                f"de respiration : {state} / {momentum}."
+            ),
         ]
 
         return [
             self._make_opportunity(
                 symbol=symbol,
-                opportunity_type="CORRECTION",
+                opportunity_type="CORRECTION_REPRISE",
                 direction=direction,
-                strength=48.0,
-                state="POSSIBLE",
+                strength=(
+                    48.0
+                    + min(
+                        15.0,
+                        obs["trend_strength"] * 0.15,
+                    )
+                ),
+                state="OBSERVATION",
                 evidence=evidence,
                 triggers=[
-                    "Fin ou ralentissement de la phase corrective.",
-                    "Reprise observable dans le sens du contexte.",
+                    "Fin de correction avec retour de la pression directionnelle.",
+                    "Reprise cohérente avec le contexte dominant.",
                 ],
                 invalidations=[
-                    "Dégradation durable du contexte dominant.",
+                    "La correction devient une transition durable de contexte.",
                 ],
                 timeframe_focus="M15",
                 sources=[
-                    "contexte",
                     "intelligence",
+                    "radar",
+                    "contexte",
                 ],
                 obs=obs,
             )
@@ -1195,73 +1228,85 @@ class Moteur2Opportunites:
         obs: Dict[str, Any],
     ) -> List[Opportunity]:
 
-        market_state = _upper(
-            obs["market_state"]
-        )
-
-        market_regime = _upper(
-            obs["market_regime"]
-        )
+        state = obs["market_state"]
+        regime = obs["market_regime"]
+        radar = obs["radar"]
 
         transition_hint = (
             self._contains_any(
-                market_state,
+                state,
                 "TRANSITION",
-                "CHANGEMENT",
-                "UNCERTAIN",
+                "CHANGE",
+                "REVERS",
+                "TURN",
             )
             or self._contains_any(
-                market_regime,
+                regime,
                 "TRANSITION",
-                "SHIFT",
+                "CHANGE",
+                "REVERS",
             )
-            or self._contains_any(
-                " ".join(
-                    obs["observations"]
-                ),
-                "TRANSITION",
-                "CHANGEMENT",
+            or any(
+                self._contains_any(
+                    event.get(
+                        "event_type"
+                    ),
+                    "DIRECTION",
+                    "TRANSITION",
+                    "ANOMAL",
+                )
+                for event in radar
             )
         )
 
         if not transition_hint:
             return []
 
-        direction = obs["bias"]
+        direction = self._direction_from_radar(
+            radar
+        )
 
         if direction == "NEUTRAL":
-            direction = self._direction_from_radar(
-                obs["radar"]
-            )
+            direction = obs["bias"]
 
         evidence = [
-            "Le marché présente des signes de transition.",
+            f"État du marché : {state}.",
+            f"Régime observé : {regime}.",
+            (
+                "Des éléments de transition ont été détectés "
+                "dans les observations."
+            ),
         ]
-
-        if direction != "NEUTRAL":
-            evidence.append(
-                f"Une direction commence à émerger : {direction}."
-            )
 
         return [
             self._make_opportunity(
                 symbol=symbol,
                 opportunity_type="TRANSITION",
                 direction=direction,
-                strength=44.0,
-                state="EMERGING",
+                strength=(
+                    45.0
+                    + min(
+                        20.0,
+                        self._radar_strength(
+                            radar,
+                            direction,
+                        ) * 0.20,
+                    )
+                ),
+                state="TRANSITION_POSSIBLE",
                 evidence=evidence,
                 triggers=[
-                    "Confirmation progressive du nouveau comportement.",
-                    "Convergence de plusieurs observations.",
+                    "Confirmation progressive du nouveau comportement du marché.",
+                    "Cohérence croissante entre les unités de temps.",
                 ],
                 invalidations=[
-                    "Retour durable au régime précédent.",
+                    "Retour durable au contexte précédent.",
+                    "Disparition des indices de transition.",
                 ],
                 timeframe_focus="H1",
                 sources=[
-                    "intelligence",
                     "radar",
+                    "intelligence",
                     "contexte",
                 ],
                 obs=obs,
@@ -1278,61 +1323,86 @@ class Moteur2Opportunites:
         obs: Dict[str, Any],
     ) -> List[Opportunity]:
 
-        market_state = _upper(
-            obs["market_state"]
+        state = obs["market_state"]
+        regime = obs["market_regime"]
+        volatility = obs["volatility"]
+
+        radar_text = " ".join(
+            _upper(
+                event.get(
+                    "description"
+                )
+            )
+            for event in obs["radar"]
         )
 
-        market_regime = _upper(
-            obs["market_regime"]
+        compressed = (
+            self._contains_any(
+                state,
+                "RANGE",
+                "COMPRESSION",
+                "CONSOLIDATION",
+                "NEUTRAL",
+            )
+            or self._contains_any(
+                regime,
+                "RANGE",
+                "COMPRESSION",
+                "CONSOLIDATION",
+            )
         )
 
         expansion_hint = (
             self._contains_any(
-                market_state,
-                "EXPANSION",
-                "BREAKOUT",
-                "IMPULS",
+                volatility,
+                "EXPANS",
+                "RISING",
+                "HIGH",
+                "AUGMENT",
             )
             or self._contains_any(
-                market_regime,
-                "EXPANSION",
-                "VOLATILE",
+                radar_text,
+                "VOLAT",
+                "ACCEL",
+                "MOUVEMENT",
+                "EXPANS",
             )
         )
 
-        if not expansion_hint:
+        if not (
+            compressed
+            and expansion_hint
+        ):
             return []
 
-        direction = obs["bias"]
+        direction = self._direction_from_radar(
+            obs["radar"]
+        )
 
         if direction == "NEUTRAL":
-            direction = self._direction_from_radar(
-                obs["radar"]
-            )
-
-        evidence = [
-            "Le contexte présente des caractéristiques d'expansion.",
-        ]
-
-        if direction != "NEUTRAL":
-            evidence.append(
-                f"Direction dominante observée : {direction}."
-            )
+            direction = obs["bias"]
 
         return [
             self._make_opportunity(
                 symbol=symbol,
                 opportunity_type="EXPANSION",
                 direction=direction,
-                strength=50.0,
-                state="DEVELOPING",
-                evidence=evidence,
+                strength=47.0,
+                state="WATCHING_EXPANSION",
+                evidence=[
+                    f"État compressé/range observé : {state}.",
+                    f"Volatilité : {volatility}.",
+                    (
+                        "Les observations montrent des signes "
+                        "compatibles avec une expansion."
+                    ),
+                ],
                 triggers=[
-                    "Expansion confirmée par plusieurs observations.",
-                    "Maintien du mouvement après extension.",
+                    "Développement d'un mouvement directionnel hors de la phase comprimée.",
+                    "Augmentation durable de l'amplitude/momentum.",
                 ],
                 invalidations=[
-                    "Réintégration rapide de l'environnement précédent.",
+                    "Retour à la compression sans développement directionnel.",
                 ],
                 timeframe_focus="M15",
                 sources=[
@@ -1354,69 +1424,109 @@ class Moteur2Opportunites:
     ) -> List[Opportunity]:
 
         liquidity = obs.get(
-            "nearest_liquidity"
+            "liquidity"
+        ) or {}
+
+        nearby = _list(
+            liquidity.get(
+                "nearby_liquidity"
+            )
         )
 
-        if not liquidity:
+        clusters = _list(
+            liquidity.get(
+                "nearby_clusters"
+            )
+        )
+
+        sweep_areas = _list(
+            liquidity.get(
+                "sweep_areas"
+            )
+        )
+
+        if not nearby and not clusters and not sweep_areas:
             return []
 
         direction = obs["bias"]
 
         if direction == "NEUTRAL":
-            direction = _normalise_direction(
-                liquidity.get("direction")
-                or liquidity.get("side")
+            direction = self._direction_from_liquidity(
+                nearby,
+                clusters,
             )
-
-        if direction == "NEUTRAL":
-            direction = self._direction_from_radar(
-                obs["radar"]
-            )
-
-        if direction == "NEUTRAL":
-            return []
-
-        liquidity_type = _upper(
-            liquidity.get("kind")
-            or liquidity.get("type"),
-            "LIQUIDITY",
-        )
 
         evidence = [
-            f"Zone de liquidité observée : {liquidity_type}.",
+            (
+                "Une concentration de liquidité "
+                "est proche du prix courant."
+            ),
         ]
+
+        if clusters:
+            evidence.append(
+                f"Clusters proches détectés : {len(clusters)}."
+            )
+
+        if sweep_areas:
+            evidence.append(
+                (
+                    "Certaines zones de liquidité sont décrites "
+                    "comme susceptibles d'être travaillées."
+                )
+            )
+
+        reference = None
+
+        if clusters:
+            reference = _dict(
+                clusters[0]
+            )
+
+        elif nearby:
+            reference = _dict(
+                nearby[0]
+            )
+
+        elif sweep_areas:
+            reference = _dict(
+                sweep_areas[0]
+            )
 
         return [
             self._make_opportunity(
                 symbol=symbol,
-                opportunity_type="LIQUIDITY_REACTION",
+                opportunity_type="LIQUIDITY_INTERACTION",
                 direction=direction,
-                strength=43.0,
-                state="OBSERVATION",
+                strength=(
+                    44.0
+                    + min(
+                        20.0,
+                        len(nearby) * 3.0
+                        + len(clusters) * 4.0,
+                    )
+                ),
+                state="WATCHING_LIQUIDITY",
                 evidence=evidence,
                 triggers=[
-                    "Réaction observable autour de la liquidité.",
-                    "Convergence avec une direction du contexte.",
+                    "Réaction du prix autour de la concentration observée.",
+                    "Déplacement du prix après interaction avec la liquidité.",
                 ],
                 invalidations=[
-                    "Absence de réaction.",
+                    "Disparition de la concentration comme élément pertinent.",
                 ],
-                timeframe_focus=_upper(
-                    liquidity.get("timeframe"),
-                    "M15",
-                ),
+                timeframe_focus="M15",
                 sources=[
                     "liquidite",
-                    "contexte",
-                    "radar",
+                    "zones",
                 ],
-                liquidity=liquidity,
+                liquidity_reference=reference,
                 obs=obs,
             )
         ]
 
     # ------------------------------------------------------------------
-    # OBSERVATION NEUTRE
+    # INCERTITUDE ACTIVE
     # ------------------------------------------------------------------
 
     def _build_neutral_observation(
@@ -1425,65 +1535,105 @@ class Moteur2Opportunites:
         obs: Dict[str, Any],
     ) -> List[Opportunity]:
 
-        if obs["bias"] != "NEUTRAL":
-            return []
+        directions = []
 
-        if (
-            not obs["radar"]
-            and not obs["zones"]
-            and not obs["liquidity"]
-            and not obs["observations"]
-            and not obs["scenarios"]
-        ):
-            return []
+        for item in obs["setups"]:
 
-        evidence = [
-            "Le marché présente des informations exploitables "
-            "mais aucune direction dominante suffisamment claire.",
-        ]
-
-        if obs["zones"]:
-            evidence.append(
-                f"{len(obs['zones'])} zone(s) disponible(s)."
+            direction = _normalise_direction(
+                item.get(
+                    "direction"
+                )
             )
 
-        if obs["radar"]:
-            evidence.append(
-                f"{len(obs['radar'])} événement(s) radar observé(s)."
+            if direction != "NEUTRAL":
+                directions.append(
+                    direction
+                )
+
+        for item in obs["scenarios"]:
+
+            direction = _normalise_direction(
+                item.get(
+                    "direction"
+                )
             )
+
+            if direction != "NEUTRAL":
+                directions.append(
+                    direction
+                )
+
+        for item in obs["radar"]:
+
+            direction = _normalise_direction(
+                item.get(
+                    "direction"
+                )
+            )
+
+            if direction != "NEUTRAL":
+                directions.append(
+                    direction
+                )
+
+        bullish = directions.count(
+            "HAUSSIER"
+        )
+
+        bearish = directions.count(
+            "BAISSIER"
+        )
+
+        contradiction = (
+            bullish > 0
+            and bearish > 0
+        )
+
+        if not contradiction and obs["bias"] != "NEUTRAL":
+            return []
 
         return [
             self._make_opportunity(
                 symbol=symbol,
-                opportunity_type="ACTIVE_UNCERTAINTY",
+                opportunity_type="INCERTITUDE_ACTIVE",
                 direction="NEUTRAL",
-                strength=32.0,
+                strength=38.0,
                 state="OBSERVATION",
-                evidence=evidence,
+                evidence=[
+                    (
+                        "Les observations disponibles ne convergent "
+                        "pas suffisamment vers une seule direction."
+                    ),
+                    (
+                        f"Indices haussiers : {bullish}; "
+                        f"indices baissiers : {bearish}."
+                    ),
+                ],
                 triggers=[
-                    "Émergence d'une direction cohérente.",
-                    "Convergence de plusieurs observations.",
+                    (
+                        "Attendre une évolution des observations "
+                        "avant de privilégier une direction."
+                    ),
                 ],
-                invalidations=[
-                    "Disparition des observations actives.",
-                ],
-                timeframe_focus="M15",
+                invalidations=[],
+                timeframe_focus="H1",
                 sources=[
                     "intelligence",
+                    "scenarios",
+                    "setups",
                     "radar",
-                    "contexte",
                 ],
                 obs=obs,
             )
         ]
 
     # ------------------------------------------------------------------
-    # ATTACHEMENT DES PREUVES EXISTANTES
+    # ENRICHISSEMENT
     # ------------------------------------------------------------------
 
     def _attach_existing_evidence(
         self,
-        possibilities: List[Opportunity],
+        opportunities: List[Opportunity],
         setups: List[Dict[str, Any]],
         scenarios: List[Dict[str, Any]],
         radar: List[Dict[str, Any]],
@@ -1491,53 +1641,246 @@ class Moteur2Opportunites:
         liquidity: Dict[str, Any],
     ) -> List[Opportunity]:
 
-        for opportunity in possibilities:
+        for opportunity in opportunities:
 
-            if setups:
-                opportunity.related_setups = [
-                    dict(item)
-                    for item in setups[:4]
-                    if isinstance(item, dict)
-                ]
+            related_setups = self._matching_items(
+                setups,
+                opportunity.direction,
+                keys=("direction",),
+                limit=4,
+            )
 
-            if scenarios:
-                opportunity.related_scenarios = [
-                    dict(item)
-                    for item in scenarios[:4]
-                    if isinstance(item, dict)
-                ]
+            related_scenarios = self._matching_items(
+                scenarios,
+                opportunity.direction,
+                keys=("direction",),
+                limit=4,
+            )
 
-            if radar:
-                opportunity.radar_events = [
-                    dict(item)
-                    for item in radar[:6]
-                    if isinstance(item, dict)
-                ]
+            opportunity.related_setups = (
+                related_setups
+            )
 
-            if not opportunity.zone_reference and zones:
-                nearest = self._nearest_zone(
-                    zones
+            opportunity.related_scenarios = (
+                related_scenarios
+            )
+
+            if related_setups:
+
+                opportunity.sources.append(
+                    "setups"
                 )
 
-                if nearest:
-                    opportunity.zone_reference = dict(
-                        nearest
+                for setup in related_setups[:3]:
+
+                    setup_type = _text(
+                        setup.get(
+                            "setup_type"
+                        ),
+                        "SETUP",
                     )
 
-            if (
-                not opportunity.liquidity_reference
-                and liquidity
-            ):
-                nearest_liquidity = self._nearest_liquidity(
-                    liquidity
+                    opportunity.evidence.append(
+                        (
+                            f"Une lecture de type "
+                            f"{setup_type} existe "
+                            f"dans la couche setups."
+                        )
+                    )
+
+            if related_scenarios:
+
+                opportunity.sources.append(
+                    "scenarios"
                 )
 
-                if nearest_liquidity:
-                    opportunity.liquidity_reference = dict(
-                        nearest_liquidity
+                for scenario in related_scenarios[:3]:
+
+                    scenario_type = _text(
+                        scenario.get(
+                            "scenario_type"
+                        ),
+                        "SCENARIO",
                     )
 
-        return possibilities
+                    opportunity.evidence.append(
+                        (
+                            f"Un scénario "
+                            f"{scenario_type} soutient "
+                            f"cette possibilité."
+                        )
+                    )
+
+            related_radar = self._related_radar(
+                radar,
+                opportunity.direction,
+            )
+
+            opportunity.radar_events = (
+                related_radar[:5]
+            )
+
+            if related_radar:
+                opportunity.sources.append(
+                    "radar"
+                )
+
+            if opportunity.zone_reference is None:
+
+                zone = self._best_directional_zone(
+                    zones,
+                    opportunity.direction,
+                )
+
+                if zone:
+                    opportunity.zone_reference = zone
+
+            if opportunity.liquidity_reference is None:
+
+                liquidity_reference = (
+                    self._best_liquidity_reference(
+                        liquidity,
+                        opportunity.direction,
+                    )
+                )
+
+                if liquidity_reference:
+                    opportunity.liquidity_reference = (
+                        liquidity_reference
+                    )
+
+            opportunity.sources = _unique_text(
+                opportunity.sources,
+                12,
+            )
+
+            opportunity.evidence = _unique_text(
+                opportunity.evidence,
+                MAX_EVIDENCE,
+            )
+
+            opportunity.trigger_conditions = (
+                _unique_text(
+                    opportunity.trigger_conditions,
+                    MAX_TRIGGERS,
+                )
+            )
+
+            opportunity.invalidation_conditions = (
+                _unique_text(
+                    opportunity.invalidation_conditions,
+                    MAX_INVALIDATIONS,
+                )
+            )
+
+        return opportunities
+
+    # ------------------------------------------------------------------
+    # DÉDUPLICATION
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _deduplicate(
+        opportunities: List[Opportunity],
+    ) -> List[Opportunity]:
+
+        grouped: Dict[
+            Tuple[str, str, str],
+            Opportunity,
+        ] = {}
+
+        for item in opportunities:
+
+            key = (
+                item.symbol,
+                item.opportunity_type,
+                item.direction,
+            )
+
+            existing = grouped.get(
+                key
+            )
+
+            if existing is None:
+
+                grouped[key] = item
+                continue
+
+            existing.strength = max(
+                existing.strength,
+                item.strength,
+            )
+
+            existing.evidence = _unique_text(
+                existing.evidence
+                + item.evidence,
+                MAX_EVIDENCE,
+            )
+
+            existing.trigger_conditions = (
+                _unique_text(
+                    existing.trigger_conditions
+                    + item.trigger_conditions,
+                    MAX_TRIGGERS,
+                )
+            )
+
+            existing.invalidation_conditions = (
+                _unique_text(
+                    existing.invalidation_conditions
+                    + item.invalidation_conditions,
+                    MAX_INVALIDATIONS,
+                )
+            )
+
+            existing.sources = _unique_text(
+                existing.sources
+                + item.sources,
+                12,
+            )
+
+            existing.related_setups = (
+                existing.related_setups
+                + item.related_setups
+            )[:4]
+
+            existing.related_scenarios = (
+                existing.related_scenarios
+                + item.related_scenarios
+            )[:4]
+
+            existing.radar_events = (
+                existing.radar_events
+                + item.radar_events
+            )[:5]
+
+        return list(
+            grouped.values()
+        )
+
+    # ------------------------------------------------------------------
+    # CLASSEMENT INTERNE
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ranking_key(
+        item: Opportunity,
+    ) -> Tuple[float, int, int, int]:
+
+        return (
+            float(
+                item.strength
+            ),
+            len(
+                item.evidence
+            ),
+            len(
+                item.sources
+            ),
+            len(
+                item.trigger_conditions
+            ),
+        )
 
     # ------------------------------------------------------------------
     # CONSTRUCTION
@@ -1551,43 +1894,44 @@ class Moteur2Opportunites:
         direction: str,
         strength: float,
         state: str,
-        evidence: Sequence[Any],
-        triggers: Sequence[Any],
-        invalidations: Sequence[Any],
+        evidence: List[str],
+        triggers: List[str],
+        invalidations: List[str],
         timeframe_focus: str,
-        sources: Sequence[Any],
+        sources: List[str],
         obs: Dict[str, Any],
         zone: Optional[Dict[str, Any]] = None,
-        liquidity: Optional[Dict[str, Any]] = None,
+        liquidity_reference: Optional[
+            Dict[str, Any]
+        ] = None,
     ) -> Opportunity:
 
         safe_type = _safe_name(
             opportunity_type
         )
 
+        safe_direction = _safe_name(
+            direction
+        )
+
         opportunity_id = (
-            f"{symbol}_"
-            f"{safe_type}_"
-            f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+            f"OPP_{safe_type}_"
+            f"{safe_direction}_"
+            f"{_safe_name(symbol)}"
         )
 
         return Opportunity(
             symbol=symbol,
             opportunity_id=opportunity_id,
             opportunity_type=opportunity_type,
-            direction=_normalise_direction(
-                direction
-            ),
-            state=_upper(
-                state,
-                "OBSERVATION",
-            ),
+            direction=direction,
+            state=state,
             strength=_clamp(
                 strength
             ),
             sources=_unique_text(
                 sources,
-                8,
+                12,
             ),
             evidence=_unique_text(
                 evidence,
@@ -1601,45 +1945,120 @@ class Moteur2Opportunites:
                 invalidations,
                 MAX_INVALIDATIONS,
             ),
-            market_state=_upper(
-                obs.get(
-                    "market_state"
-                ),
+            market_state=obs.get(
+                "market_state",
                 "UNKNOWN",
             ),
-            market_regime=_upper(
-                obs.get(
-                    "market_regime"
-                ),
+            market_regime=obs.get(
+                "market_regime",
                 "UNKNOWN",
             ),
             timeframe_focus=_upper(
                 timeframe_focus,
                 "M15",
             ),
-            zone_reference=(
-                dict(zone)
-                if isinstance(zone, dict)
-                else None
-            ),
-            liquidity_reference=(
-                dict(liquidity)
-                if isinstance(liquidity, dict)
-                else None
-            ),
+            zone_reference=zone,
+            liquidity_reference=liquidity_reference,
             metadata={
-                "score_is_blocking": False,
-                "rr_is_blocking": False,
-                "risk_is_blocking": False,
-                "m5_is_blocking": False,
-                "m1_is_blocking": False,
-                "decision_owner": "moteur2_decision.py",
-                "autonomous": True,
+                "descriptive_only": True,
+                "blocking": False,
+                "rr_informational_only": True,
+                "risk_informational_only": True,
+                "decision_owner": (
+                    "moteur2_decision.py"
+                ),
             },
         )
 
+    @staticmethod
+    def _build_result(
+        symbol: str,
+        opportunities: List[Opportunity],
+        observations: Dict[str, Any],
+    ) -> Dict[str, Any]:
+
+        return {
+            "symbol": symbol,
+            "timestamp": _now_iso(),
+
+            "opportunities": [
+                item.to_dict()
+                for item in opportunities
+            ],
+
+            "opportunity_count": len(
+                opportunities
+            ),
+
+            "best_opportunity": (
+                opportunities[0].to_dict()
+                if opportunities
+                else None
+            ),
+
+            "types_found": list(
+                dict.fromkeys(
+                    item.opportunity_type
+                    for item in opportunities
+                )
+            ),
+
+            "directions_found": list(
+                dict.fromkeys(
+                    item.direction
+                    for item in opportunities
+                )
+            ),
+
+            "market_observation": {
+                "state": observations.get(
+                    "market_state",
+                    "UNKNOWN",
+                ),
+                "regime": observations.get(
+                    "market_regime",
+                    "UNKNOWN",
+                ),
+                "bias": observations.get(
+                    "bias",
+                    "NEUTRAL",
+                ),
+                "momentum": observations.get(
+                    "momentum",
+                    "UNKNOWN",
+                ),
+                "volatility": observations.get(
+                    "volatility",
+                    "UNKNOWN",
+                ),
+                "pressure": observations.get(
+                    "pressure",
+                    "UNKNOWN",
+                ),
+                "trend_strength": observations.get(
+                    "trend_strength",
+                    0.0,
+                ),
+            },
+
+            "descriptive_only": True,
+            "blocking": False,
+            "decision_ready": False,
+
+            "risk": {
+                "managed_here": False,
+                "role": "INFORMATION_ONLY",
+            },
+
+            "rr": {
+                "managed_here": False,
+                "minimum": None,
+                "role": "INFORMATION_ONLY",
+            },
+        }
+
     # ------------------------------------------------------------------
-    # UTILITAIRES OPPORTUNITÉS
+    # OUTILS
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1650,35 +2069,29 @@ class Moteur2Opportunites:
 
         text = _upper(value)
 
-        direction = _normalise_direction(
-            direction
-        )
-
         if direction == "HAUSSIER":
+
             return any(
                 token in text
                 for token in (
-                    "FORT",
-                    "STRONG",
-                    "HAUS",
-                    "BUY",
+                    "HAUSS",
                     "BULL",
+                    "BUY",
                     "UP",
-                    "POSITIVE",
+                    "POSIT",
                 )
             )
 
         if direction == "BAISSIER":
+
             return any(
                 token in text
                 for token in (
-                    "FORT",
-                    "STRONG",
                     "BAISS",
-                    "SELL",
                     "BEAR",
+                    "SELL",
                     "DOWN",
-                    "NEGATIVE",
+                    "NEGAT",
                 )
             )
 
@@ -1698,40 +2111,108 @@ class Moteur2Opportunites:
         )
 
     @staticmethod
-    def _direction_from_radar(
-        radar: List[Dict[str, Any]],
+    def _best_timeframe(
+        obs: Dict[str, Any],
     ) -> str:
 
-        buy_strength = 0.0
-        sell_strength = 0.0
+        alignment = obs.get(
+            "alignment"
+        )
 
-        for event in radar:
+        if isinstance(
+            alignment,
+            dict,
+        ):
 
-            direction = _normalise_direction(
-                event.get("direction")
+            dominant = alignment.get(
+                "dominant_timeframe"
             )
 
-            strength = (
+            if dominant:
+                return _upper(
+                    dominant,
+                    "M15",
+                )
+
+        return "M15"
+
+    @staticmethod
+    def _nearest_zone(
+        zones: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+
+        candidates = [
+            item
+            for item in zones
+            if isinstance(
+                item,
+                dict,
+            )
+        ]
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: (
+                _bool(
+                    item.get(
+                        "near_current_price"
+                    )
+                )
+                or _bool(
+                    item.get(
+                        "near"
+                    )
+                ),
                 _float(
-                    event.get("strength"),
+                    item.get(
+                        "proximity_score"
+                    ),
                     0.0,
                 )
-                or 0.0
+                or 0.0,
+                _float(
+                    item.get(
+                        "total_score"
+                    ),
+                    0.0,
+                )
+                or 0.0,
+            ),
+            reverse=True,
+        )
+
+        return candidates[0]
+
+    @staticmethod
+    def _nearest_liquidity(
+        liquidity: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+
+        nearby = _list(
+            liquidity.get(
+                "nearby_liquidity"
+            )
+        )
+
+        if nearby:
+            return _dict(
+                nearby[0]
             )
 
-            if direction == "HAUSSIER":
-                buy_strength += strength
+        clusters = _list(
+            liquidity.get(
+                "nearby_clusters"
+            )
+        )
 
-            elif direction == "BAISSIER":
-                sell_strength += strength
+        if clusters:
+            return _dict(
+                clusters[0]
+            )
 
-        if buy_strength > sell_strength:
-            return "HAUSSIER"
-
-        if sell_strength > buy_strength:
-            return "BAISSIER"
-
-        return "NEUTRAL"
+        return None
 
     @staticmethod
     def _radar_strength(
@@ -1739,33 +2220,142 @@ class Moteur2Opportunites:
         direction: str,
     ) -> float:
 
-        direction = _normalise_direction(
-            direction
-        )
-
-        total = 0.0
+        values = []
 
         for event in radar:
 
-            event_direction = _normalise_direction(
-                event.get("direction")
-            )
-
-            if event_direction != direction:
-                continue
-
-            total += (
-                _float(
-                    event.get("strength"),
-                    0.0,
+            event_direction = (
+                _normalise_direction(
+                    event.get(
+                        "direction"
+                    )
                 )
-                or 0.0
             )
 
-        return min(
-            100.0,
-            total,
+            if event_direction in (
+                direction,
+                "NEUTRAL",
+            ):
+
+                values.append(
+                    _float(
+                        event.get(
+                            "strength"
+                        ),
+                        0.0,
+                    )
+                    or 0.0
+                )
+
+        if not values:
+            return 0.0
+
+        return _clamp(
+            max(values)
         )
+
+    @staticmethod
+    def _direction_from_radar(
+        radar: List[Dict[str, Any]],
+    ) -> str:
+
+        bullish = 0.0
+        bearish = 0.0
+
+        for event in radar:
+
+            direction = (
+                _normalise_direction(
+                    event.get(
+                        "direction"
+                    )
+                )
+            )
+
+            strength = (
+                _float(
+                    event.get(
+                        "strength"
+                    ),
+                    1.0,
+                )
+                or 1.0
+            )
+
+            if direction == "HAUSSIER":
+                bullish += strength
+
+            elif direction == "BAISSIER":
+                bearish += strength
+
+        if bullish > bearish * 1.15:
+            return "HAUSSIER"
+
+        if bearish > bullish * 1.15:
+            return "BAISSIER"
+
+        return "NEUTRAL"
+
+    @staticmethod
+    def _direction_from_liquidity(
+        nearby: List[Any],
+        clusters: List[Any],
+    ) -> str:
+
+        bullish = 0.0
+        bearish = 0.0
+
+        for item in (
+            list(nearby)
+            + list(clusters)
+        ):
+
+            data = _dict(
+                item
+            )
+
+            side = _upper(
+                data.get(
+                    "side"
+                )
+            )
+
+            value = (
+                _float(
+                    data.get(
+                        "total_score"
+                    ),
+                    _float(
+                        data.get(
+                            "strength"
+                        ),
+                        1.0,
+                    ),
+                )
+                or 1.0
+            )
+
+            if side in {
+                "BUY_SIDE",
+                "BUY",
+                "BID",
+            }:
+                bullish += value
+
+            elif side in {
+                "SELL_SIDE",
+                "SELL",
+                "ASK",
+            }:
+                bearish += value
+
+        if bullish > bearish * 1.25:
+            return "HAUSSIER"
+
+        if bearish > bullish * 1.25:
+            return "BAISSIER"
+
+        return "NEUTRAL"
 
     @staticmethod
     def _radar_evidence(
@@ -1773,30 +2363,23 @@ class Moteur2Opportunites:
         direction: str,
     ) -> List[str]:
 
-        direction = _normalise_direction(
-            direction
-        )
-
         result: List[str] = []
 
         for event in radar:
 
-            event_direction = _normalise_direction(
-                event.get("direction")
+            event_direction = (
+                _normalise_direction(
+                    event.get(
+                        "direction"
+                    )
+                )
             )
 
-            if (
-                event_direction != direction
-                and event_direction != "NEUTRAL"
+            if event_direction not in (
+                direction,
+                "NEUTRAL",
             ):
                 continue
-
-            event_type = _upper(
-                event.get(
-                    "event_type"
-                ),
-                "RADAR",
-            )
 
             description = _text(
                 event.get(
@@ -1804,17 +2387,23 @@ class Moteur2Opportunites:
                 )
             )
 
-            if description:
-                result.append(
-                    f"{event_type} : {description}"
+            event_type = _text(
+                event.get(
+                    "event_type"
                 )
-            else:
+            )
+
+            if description:
+
                 result.append(
-                    event_type
+                    description
                 )
 
-            if len(result) >= MAX_EVIDENCE:
-                break
+            elif event_type:
+
+                result.append(
+                    f"Événement Radar : {event_type}."
+                )
 
         return _unique_text(
             result,
@@ -1824,7 +2413,7 @@ class Moteur2Opportunites:
     @staticmethod
     def _radar_timeframe(
         radar: List[Dict[str, Any]],
-        default: str = "M15",
+        default: str,
     ) -> str:
 
         for event in radar:
@@ -1841,299 +2430,227 @@ class Moteur2Opportunites:
         return default
 
     @staticmethod
-    def _best_timeframe(
-        obs: Dict[str, Any],
-    ) -> str:
+    def _matching_items(
+        items: List[Dict[str, Any]],
+        direction: str,
+        *,
+        keys: Sequence[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
 
-        alignment = obs.get(
-            "alignment"
-        )
+        if not items:
+            return []
 
-        if isinstance(
-            alignment,
-            dict,
-        ):
+        if direction == "NEUTRAL":
+            return items[:limit]
 
-            directions = alignment.get(
-                "directions"
-            )
+        matches = []
+        neutral = []
 
-            if isinstance(
-                directions,
-                dict,
-            ):
+        for item in items:
 
-                for timeframe in (
-                    "H4",
-                    "H1",
-                    "M15",
-                ):
+            found_direction = "NEUTRAL"
 
-                    direction = _normalise_direction(
-                        directions.get(
-                            timeframe
+            for key in keys:
+
+                if key in item:
+
+                    found_direction = (
+                        _normalise_direction(
+                            item.get(key)
                         )
                     )
 
-                    if direction != "NEUTRAL":
-                        return timeframe
+                    if found_direction != "NEUTRAL":
+                        break
 
-        return "M15"
+            if found_direction == direction:
+                matches.append(
+                    item
+                )
 
-    # ------------------------------------------------------------------
-    # ZONES / LIQUIDITÉ
-    # ------------------------------------------------------------------
+            elif found_direction == "NEUTRAL":
+                neutral.append(
+                    item
+                )
+
+        return (
+            matches
+            + neutral
+        )[:limit]
 
     @staticmethod
-    def _nearest_zone(
-        zones: List[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
+    def _related_radar(
+        radar: List[Dict[str, Any]],
+        direction: str,
+    ) -> List[Dict[str, Any]]:
 
-        if not zones:
-            return None
+        if direction == "NEUTRAL":
+            return radar[:5]
 
-        def zone_key(
-            zone: Dict[str, Any]
-        ) -> Tuple[float, float]:
+        result = []
 
-            distance = (
-                _float(
-                    zone.get(
-                        "distance"
-                    ),
-                    999999.0,
-                )
-                or 999999.0
-            )
+        for event in radar:
 
-            strength = (
-                _float(
-                    zone.get(
-                        "strength"
-                    ),
-                    0.0,
-                )
-                or 0.0
-            )
-
-            return (
-                distance,
-                -strength,
-            )
-
-        return min(
-            zones,
-            key=zone_key,
-        )
-
-    @staticmethod
-    def _nearest_liquidity(
-        liquidity: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-
-        if not liquidity:
-            return None
-
-        candidates: List[Dict[str, Any]] = []
-
-        for key in (
-            "zones",
-            "levels",
-            "liquidity",
-            "important_levels",
-            "nearest",
-        ):
-
-            value = liquidity.get(
-                key
-            )
-
-            if isinstance(
-                value,
-                list,
-            ):
-
-                candidates.extend(
-                    _dict(item)
-                    for item in value
-                    if _dict(item)
-                )
-
-            elif isinstance(
-                value,
-                dict,
-            ):
-
-                candidates.append(
-                    _dict(value)
-                )
-
-        if candidates:
-            return min(
-                candidates,
-                key=lambda item: (
-                    _float(
-                        item.get(
-                            "distance"
-                        ),
-                        999999.0,
+            event_direction = (
+                _normalise_direction(
+                    event.get(
+                        "direction"
                     )
-                    or 999999.0
-                ),
+                )
             )
 
-        if any(
-            key in liquidity
-            for key in (
-                "price",
-                "level",
-                "direction",
-                "side",
-                "type",
-                "kind",
-            )
-        ):
-            return dict(
-                liquidity
-            )
-
-        return None
-
-    # ------------------------------------------------------------------
-    # DÉDUPLICATION
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _deduplicate(
-        opportunities: List[Opportunity],
-    ) -> List[Opportunity]:
-
-        result: List[Opportunity] = []
-
-        seen = set()
-
-        for opportunity in opportunities:
-
-            key = (
-                opportunity.opportunity_type,
-                opportunity.direction,
-                opportunity.timeframe_focus,
-            )
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-            result.append(
-                opportunity
-            )
+            if event_direction in (
+                direction,
+                "NEUTRAL",
+            ):
+                result.append(
+                    event
+                )
 
         return result
 
     @staticmethod
-    def _ranking_key(
-        opportunity: Opportunity,
-    ) -> Tuple[float, int]:
+    def _best_directional_zone(
+        zones: List[Dict[str, Any]],
+        direction: str,
+    ) -> Optional[Dict[str, Any]]:
 
-        priority = {
-            "CONTINUATION": 8,
-            "IMPULSION": 7,
-            "REACTION_ZONE": 6,
-            "CORRECTION": 5,
-            "EXPANSION": 5,
-            "LIQUIDITY_REACTION": 4,
-            "TRANSITION": 3,
-            "ACTIVE_UNCERTAINTY": 1,
-        }
+        candidates = []
 
-        return (
-            float(
-                opportunity.strength
+        for zone in zones:
+
+            zone_direction = (
+                _normalise_direction(
+                    zone.get(
+                        "direction"
+                    )
+                    or zone.get(
+                        "side"
+                    )
+                )
+            )
+
+            if zone_direction in (
+                direction,
+                "NEUTRAL",
+            ):
+                candidates.append(
+                    zone
+                )
+
+        candidates.sort(
+            key=lambda item: (
+                _bool(
+                    item.get(
+                        "near_current_price"
+                    )
+                ),
+                _float(
+                    item.get(
+                        "total_score"
+                    ),
+                    0.0,
+                )
+                or 0.0,
+                _float(
+                    item.get(
+                        "strength"
+                    ),
+                    0.0,
+                )
+                or 0.0,
             ),
-            priority.get(
-                opportunity.opportunity_type,
-                0,
-            ),
+            reverse=True,
         )
 
-    # ------------------------------------------------------------------
-    # RÉSULTAT
-    # ------------------------------------------------------------------
+        return (
+            candidates[0]
+            if candidates
+            else None
+        )
 
-    def _build_result(
-        self,
-        symbol: str,
-        opportunities: List[Opportunity],
-        observations: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    @staticmethod
+    def _best_liquidity_reference(
+        liquidity: Dict[str, Any],
+        direction: str,
+    ) -> Optional[Dict[str, Any]]:
 
-        return {
-            "symbol": symbol,
-            "timestamp": _now_iso(),
-            "opportunities": [
-                opportunity.to_dict()
-                for opportunity in opportunities
-            ],
-            "count": len(
-                opportunities
-            ),
-            "observations": {
-                "market_state": observations.get(
-                    "market_state"
-                ),
-                "market_regime": observations.get(
-                    "market_regime"
-                ),
-                "bias": observations.get(
-                    "bias"
-                ),
-                "momentum": observations.get(
-                    "momentum"
-                ),
-                "volatility": observations.get(
-                    "volatility"
-                ),
-                "pressure": observations.get(
-                    "pressure"
-                ),
-                "trend_strength": observations.get(
-                    "trend_strength"
-                ),
-                "alignment": observations.get(
-                    "alignment"
-                ),
-            },
-            "metadata": {
-                "engine": self.engine_name,
-                "module": self.module_name,
+        items = (
+            _list(
+                liquidity.get(
+                    "nearby_liquidity"
+                )
+            )
+            + _list(
+                liquidity.get(
+                    "nearby_clusters"
+                )
+            )
+            + _list(
+                liquidity.get(
+                    "sweep_areas"
+                )
+            )
+        )
 
-                "autonomous_generation": True,
+        if not items:
+            return None
 
-                "makes_trade_decision": False,
-                "blocks_trade": False,
+        for item in items:
 
-                "score_is_blocking": False,
-                "rr_is_blocking": False,
-                "risk_is_blocking": False,
+            data = _dict(
+                item
+            )
 
-                "m5_is_blocking": False,
-                "m1_is_blocking": False,
+            item_direction = (
+                _normalise_direction(
+                    data.get(
+                        "direction"
+                    )
+                )
+            )
 
-                "max_opportunities": self.max_opportunities,
+            side = _upper(
+                data.get(
+                    "side"
+                )
+            )
 
-                "decision_owner": (
-                    "moteur2_decision.py"
-                ),
+            if item_direction == direction:
+                return data
 
-                "forced_signal": False,
-            },
-        }
+            if (
+                direction == "HAUSSIER"
+                and side in {
+                    "BUY_SIDE",
+                    "BUY",
+                    "BID",
+                }
+            ):
+                return data
+
+            if (
+                direction == "BAISSIER"
+                and side in {
+                    "SELL_SIDE",
+                    "SELL",
+                    "ASK",
+                }
+            ):
+                return data
+
+        return _dict(
+            items[0]
+        )
 
     # ------------------------------------------------------------------
     # STATUT
     # ------------------------------------------------------------------
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(
+        self,
+    ) -> Dict[str, Any]:
 
         return {
             "engine": self.engine_name,
@@ -2145,31 +2662,61 @@ class Moteur2Opportunites:
             "max_opportunities": (
                 self.max_opportunities
             ),
-            "last_result_count": (
-                self.last_result.get(
-                    "count",
-                    0,
-                )
-                if isinstance(
-                    self.last_result,
-                    dict,
-                )
-                else 0
+            "descriptive_only": True,
+            "blocking": False,
+            "decision_owner": (
+                "moteur2_decision.py"
             ),
+            "risk_owner": (
+                "external_to_opportunity_engine"
+            ),
+            "rr_minimum": None,
         }
 
 
 # ============================================================================
-# ALIAS DE COMPATIBILITÉ
+# API COMPATIBLE SIMPLE
 # ============================================================================
 
-OpportunityEngine = Moteur2Opportunites
-Moteur2Opportunity = Moteur2Opportunites
+def analyser_opportunites(
+    symbol: str,
+    intelligence: Optional[Any] = None,
+    radar_events: Optional[Any] = None,
+    contexte: Optional[Any] = None,
+    zones: Optional[Any] = None,
+    liquidite: Optional[Any] = None,
+    confluences: Optional[Any] = None,
+    scenarios: Optional[Any] = None,
+    setups: Optional[Any] = None,
+    market_data: Optional[Dict[str, Any]] = None,
+    fundamental: Optional[Any] = None,
+) -> Dict[str, Any]:
+
+    moteur = Moteur2Opportunites()
+
+    return moteur.analyser(
+        symbol=symbol,
+        intelligence=intelligence,
+        radar_events=radar_events,
+        contexte=contexte,
+        zones=zones,
+        liquidite=liquidite,
+        confluences=confluences,
+        scenarios=scenarios,
+        setups=setups,
+        market_data=market_data,
+        fundamental=fundamental,
+    )
 
 
 __all__ = [
-    "Moteur2Opportunites",
-    "OpportunityEngine",
-    "Moteur2Opportunity",
+    "ENGINE_NAME",
+    "MODULE_NAME",
+    "SUPPORTED_SYMBOLS",
+    "PRIMARY_TIMEFRAMES",
+    "SECONDARY_TIMEFRAMES",
+    "ALL_TIMEFRAMES",
     "Opportunity",
+    "Moteur2Opportunites",
+    "analyser_opportunites",
 ]
