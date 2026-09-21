@@ -1133,7 +1133,22 @@ class Moteur2:
                 synthetic_setups = []
                 for plan_data in raw_plans:
                     plan_dict = self._to_dict(plan_data)
-                    direction = str(plan_dict.get("direction", "")).upper()
+                    raw_direction = str(plan_dict.get("direction", "")).upper().strip()
+                    direction_map = {
+                        "HAUSSIER": "BUY",
+                        "HAUSSIERE": "BUY",
+                        "HAUSSIÈRE": "BUY",
+                        "BULLISH": "BUY",
+                        "BUY": "BUY",
+                        "LONG": "BUY",
+                        "BAISSIER": "SELL",
+                        "BAISSIERE": "SELL",
+                        "BAISSIÈRE": "SELL",
+                        "BEARISH": "SELL",
+                        "SELL": "SELL",
+                        "SHORT": "SELL",
+                    }
+                    direction = direction_map.get(raw_direction, "")
                     if direction not in {"BUY", "SELL"}:
                         continue
                     synthetic_setups.append({
