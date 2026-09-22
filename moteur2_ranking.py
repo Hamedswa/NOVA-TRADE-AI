@@ -7,6 +7,7 @@ RANKING GLOBAL DES OPPORTUNITÉS
 Rôle
 ----
 Classer les décisions/opportunités déjà produites par Engine 2.
+
 Le ranking intervient APRÈS la décision stratégique.
 
 Il :
@@ -16,6 +17,7 @@ Il :
     - ne change jamais Entry / SL / TP ;
     - ne décide jamais du marché ;
     - sélectionne au maximum 3 opportunités ;
+    - sélectionne au maximum UNE opportunité par symbole ;
     - compare la cohérence et la convergence des opportunités.
 
 IMPORTANT
@@ -82,12 +84,24 @@ def _to_bool(value: Any, default: bool = False) -> bool:
         normalized = value.strip().lower()
 
         if normalized in {
-            "true", "1", "yes", "oui", "ready", "valid", "valide"
+            "true",
+            "1",
+            "yes",
+            "oui",
+            "ready",
+            "valid",
+            "valide",
         }:
             return True
 
         if normalized in {
-            "false", "0", "no", "non", "rejected", "invalid", "invalide"
+            "false",
+            "0",
+            "no",
+            "non",
+            "rejected",
+            "invalid",
+            "invalide",
         }:
             return False
 
@@ -118,26 +132,6 @@ def _normaliser_direction(direction: Any) -> str:
     return value
 
 
-def _extract_nested_dict(value: Any, key: str) -> Dict[str, Any]:
-    nested = _get(value, key, None)
-
-    if isinstance(nested, dict):
-        return nested
-
-    if hasattr(nested, "to_dict"):
-        try:
-            result = nested.to_dict()
-            return result if isinstance(result, dict) else {}
-        except Exception:
-            return {}
-
-    return {}
-
-
-# ============================================================================
-# EXTRACTION
-# ============================================================================
-
 def _extraire_decision(signal: Any) -> str:
     return str(
         _get(
@@ -159,6 +153,10 @@ def _extraire_direction(signal: Any) -> str:
     )
 
 
+# ============================================================================
+# EXTRACTION DES INFORMATIONS
+# ============================================================================
+
 def _extraire_score(signal: Any) -> Optional[float]:
     """
     Score descriptif uniquement.
@@ -166,6 +164,7 @@ def _extraire_score(signal: Any) -> Optional[float]:
     Il est conservé dans la fiche de ranking pour information,
     mais ne sert pas de seuil de rejet.
     """
+
     candidates = (
         "quality_score",
         "score",
@@ -180,6 +179,7 @@ def _extraire_score(signal: Any) -> Optional[float]:
 
         if value is not None:
             number = _to_float(value, -1.0)
+
             if number >= 0:
                 return number
 
@@ -201,7 +201,10 @@ def _extraire_confiance(signal: Any) -> float:
             number = _to_float(value, -1.0)
 
             if number >= 0:
-                return max(0.0, min(100.0, number))
+                return max(
+                    0.0,
+                    min(100.0, number),
+                )
 
     return 0.0
 
@@ -209,8 +212,10 @@ def _extraire_confiance(signal: Any) -> float:
 def _extraire_rr(signal: Any) -> Optional[float]:
     """
     RR descriptif uniquement.
+
     Aucun minimum n'est imposé.
     """
+
     candidates = (
         "rr",
         "risk_reward",
@@ -247,7 +252,10 @@ def _extraire_context_score(signal: Any) -> Optional[float]:
             number = _to_float(value, -1.0)
 
             if number >= 0:
-                return max(0.0, min(100.0, number))
+                return max(
+                    0.0,
+                    min(100.0, number),
+                )
 
     return None
 
@@ -267,7 +275,10 @@ def _extraire_confirmation(signal: Any) -> Optional[float]:
             number = _to_float(value, -1.0)
 
             if number >= 0:
-                return max(0.0, min(100.0, number))
+                return max(
+                    0.0,
+                    min(100.0, number),
+                )
 
     return None
 
@@ -334,6 +345,7 @@ def _est_opportunite_valide(candidate: Any) -> bool:
     Vérification minimale avant classement.
 
     Cette fonction ne juge pas la qualité de la stratégie.
+
     Elle évite seulement de classer :
         - un résultat absent ;
         - WAIT ;
@@ -343,10 +355,15 @@ def _est_opportunite_valide(candidate: Any) -> bool:
 
     Le score, le RR et le risque financier ne sont jamais des veto ici.
     """
+
     if candidate is None:
         return False
 
-    signal = _get(candidate, "signal", candidate)
+    signal = _get(
+        candidate,
+        "signal",
+        candidate,
+    )
 
     if signal is None:
         return False
@@ -361,16 +378,26 @@ def _est_opportunite_valide(candidate: Any) -> bool:
     if decision == "WAIT":
         return False
 
-    # Si une décision existe, elle doit rester cohérente avec la direction.
     if decision in {"BUY", "SELL"} and decision != direction:
         return False
 
-    validation = _get(signal, "validation", None)
+    validation = _get(
+        signal,
+        "validation",
+        None,
+    )
 
     if isinstance(validation, dict):
-        status = str(validation.get("status", "") or "").upper()
+        status = str(
+            validation.get("status", "") or ""
+        ).upper()
 
-        if status in {"REJECTED", "INVALID", "FAILED", "ERROR"}:
+        if status in {
+            "REJECTED",
+            "INVALID",
+            "FAILED",
+            "ERROR",
+        }:
             return False
 
         if validation.get("critical_error") is True:
@@ -385,13 +412,26 @@ def _est_opportunite_valide(candidate: Any) -> bool:
         or ""
     ).upper()
 
-    if validation_status in {"REJECTED", "INVALID", "FAILED", "ERROR"}:
+    if validation_status in {
+        "REJECTED",
+        "INVALID",
+        "FAILED",
+        "ERROR",
+    }:
         return False
 
-    if _get(signal, "critical_error", False) is True:
+    if _get(
+        signal,
+        "critical_error",
+        False,
+    ) is True:
         return False
 
-    explicit_valid = _get(signal, "valid", None)
+    explicit_valid = _get(
+        signal,
+        "valid",
+        None,
+    )
 
     if explicit_valid is not None and not _to_bool(
         explicit_valid,
@@ -433,10 +473,6 @@ def calculer_score_ranking(signal: Any) -> float:
     contradiction = _extraire_contradiction(signal)
     sources = _extraire_sources(signal)
 
-    # ------------------------------------------------------------------
-    # Convergence des preuves
-    # ------------------------------------------------------------------
-
     evidence_total = support + contradiction
 
     if evidence_total > 0:
@@ -446,34 +482,32 @@ def calculer_score_ranking(signal: Any) -> float:
     else:
         convergence = 50.0
 
-    # Nombre de sources informatives : bonus très limité.
-    source_bonus = min(5.0, sources * 0.75)
+    source_bonus = min(
+        5.0,
+        sources * 0.75,
+    )
 
-    # ------------------------------------------------------------------
-    # Valeurs absentes
-    # ------------------------------------------------------------------
+    context_value = (
+        50.0
+        if context is None
+        else context
+    )
 
-    context_value = 50.0 if context is None else context
     confirmation_value = (
         50.0
         if confirmation is None
         else confirmation
     )
-    score_value = 50.0 if score is None else max(
-        0.0,
-        min(100.0, score),
+
+    score_value = (
+        50.0
+        if score is None
+        else max(
+            0.0,
+            min(100.0, score),
+        )
     )
 
-    # ------------------------------------------------------------------
-    # Classement
-    # ------------------------------------------------------------------
-    #
-    # La confiance et la convergence dominent.
-    # Le score et le RR ne peuvent pas dominer le classement.
-    #
-    # RR n'est volontairement PAS utilisé dans la formule.
-    # Le risque financier n'est PAS utilisé.
-    #
     ranking_score = (
         confidence * 0.50
         + convergence * 0.30
@@ -484,7 +518,10 @@ def calculer_score_ranking(signal: Any) -> float:
     )
 
     return round(
-        max(0.0, min(100.0, ranking_score)),
+        max(
+            0.0,
+            min(100.0, ranking_score),
+        ),
         2,
     )
 
@@ -497,6 +534,7 @@ def preparer_opportunite(
     candidate: Any,
     source_symbol: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+
     if candidate is None:
         return None
 
@@ -524,7 +562,12 @@ def preparer_opportunite(
     direction = _extraire_direction(signal)
 
     if not symbol:
-        symbol = _normaliser_symbole(source_symbol)
+        symbol = _normaliser_symbole(
+            source_symbol
+        )
+
+    if not symbol:
+        return None
 
     rr = _extraire_rr(signal)
 
@@ -560,13 +603,19 @@ class Moteur2Ranking:
         self,
         max_signals: int = DEFAULT_MAX_SIGNALS,
     ) -> None:
+
         self.max_signals = max(
             1,
             int(max_signals),
         )
 
-        self.last_candidates: List[Dict[str, Any]] = []
-        self.last_selected: List[Dict[str, Any]] = []
+        self.last_candidates: List[
+            Dict[str, Any]
+        ] = []
+
+        self.last_selected: List[
+            Dict[str, Any]
+        ] = []
 
     # ------------------------------------------------------------------
     # COLLECTE
@@ -576,7 +625,10 @@ class Moteur2Ranking:
         self,
         cycle: Any,
     ) -> List[Dict[str, Any]]:
-        candidates: List[Dict[str, Any]] = []
+
+        candidates: List[
+            Dict[str, Any]
+        ] = []
 
         if cycle is None:
             return candidates
@@ -587,51 +639,89 @@ class Moteur2Ranking:
             [],
         )
 
-        if isinstance(all_signals, (list, tuple)):
+        if isinstance(
+            all_signals,
+            (list, tuple),
+        ):
+
             for item in all_signals:
-                prepared = preparer_opportunite(item)
+
+                prepared = preparer_opportunite(
+                    item
+                )
 
                 if prepared is not None:
-                    candidates.append(prepared)
+                    candidates.append(
+                        prepared
+                    )
 
         if not candidates:
+
             signals_by_symbol = _get(
                 cycle,
                 "signals_by_symbol",
                 {},
             )
 
-            if isinstance(signals_by_symbol, dict):
-                for symbol, signals in signals_by_symbol.items():
+            if isinstance(
+                signals_by_symbol,
+                dict,
+            ):
+
+                for symbol, signals in (
+                    signals_by_symbol.items()
+                ):
+
                     if signals is None:
                         continue
 
-                    if not isinstance(signals, (list, tuple)):
+                    if not isinstance(
+                        signals,
+                        (list, tuple),
+                    ):
                         signals = [signals]
 
                     for signal in signals:
-                        prepared = preparer_opportunite(
-                            signal,
-                            source_symbol=symbol,
+
+                        prepared = (
+                            preparer_opportunite(
+                                signal,
+                                source_symbol=symbol,
+                            )
                         )
 
                         if prepared is not None:
-                            candidates.append(prepared)
+                            candidates.append(
+                                prepared
+                            )
 
-        # Formats alternatifs utiles aux nouvelles couches.
         if not candidates:
+
             opportunities = _get(
                 cycle,
                 "opportunities",
-                _get(cycle, "opportunites", []),
+                _get(
+                    cycle,
+                    "opportunites",
+                    [],
+                ),
             )
 
-            if isinstance(opportunities, (list, tuple)):
+            if isinstance(
+                opportunities,
+                (list, tuple),
+            ):
+
                 for item in opportunities:
-                    prepared = preparer_opportunite(item)
+
+                    prepared = (
+                        preparer_opportunite(item)
+                    )
 
                     if prepared is not None:
-                        candidates.append(prepared)
+                        candidates.append(
+                            prepared
+                        )
 
         return candidates
 
@@ -641,22 +731,43 @@ class Moteur2Ranking:
 
     def dedupliquer(
         self,
-        candidates: Sequence[Dict[str, Any]],
+        candidates: Sequence[
+            Dict[str, Any]
+        ],
     ) -> List[Dict[str, Any]]:
+
         """
         Supprime seulement les doublons évidents.
 
-        Plusieurs opportunités différentes sur le même actif peuvent
-        rester présentes avant le classement.
+        Plusieurs opportunités différentes sur le même actif
+        peuvent encore exister avant le classement.
+
+        La sélection finale se chargera ensuite de ne garder
+        qu'une seule opportunité représentative par symbole.
         """
-        result: List[Dict[str, Any]] = []
+
+        result: List[
+            Dict[str, Any]
+        ] = []
+
         seen = set()
 
         for candidate in candidates:
-            signal = candidate.get("original", {})
 
-            symbol = candidate.get("symbol", "")
-            direction = candidate.get("direction", "")
+            signal = candidate.get(
+                "original",
+                {},
+            )
+
+            symbol = candidate.get(
+                "symbol",
+                "",
+            )
+
+            direction = candidate.get(
+                "direction",
+                "",
+            )
 
             opportunity_id = _get(
                 signal,
@@ -706,13 +817,17 @@ class Moteur2Ranking:
 
     def classer(
         self,
-        candidates: Sequence[Dict[str, Any]],
+        candidates: Sequence[
+            Dict[str, Any]
+        ],
     ) -> List[Dict[str, Any]]:
+
         """
         Classe selon la convergence et la conviction.
 
         RR n'est pas un critère de supériorité automatique.
         """
+
         return sorted(
             candidates,
             key=lambda item: (
@@ -745,21 +860,78 @@ class Moteur2Ranking:
         )
 
     # ------------------------------------------------------------------
-    # TOP 3
+    # SÉLECTION GLOBALE
     # ------------------------------------------------------------------
 
     def selectionner_top(
         self,
-        ranked: Sequence[Dict[str, Any]],
+        ranked: Sequence[
+            Dict[str, Any]
+        ],
     ) -> List[Dict[str, Any]]:
+
         """
         Sélectionne au maximum max_signals.
 
-        Il n'y a jamais de remplissage artificiel.
+        RÈGLE IMPORTANTE :
+
+            UNE SEULE OPPORTUNITÉ PAR SYMBOLE.
+
+        Exemple :
+
+            BTCUSD BUY
+            BTCUSD BUY
+            BTCUSD BUY
+            XAUUSD SELL
+            EURUSD BUY
+
+        devient :
+
+            BTCUSD BUY
+            XAUUSD SELL
+            EURUSD BUY
+
+        puis la limite max_signals est appliquée.
+
+        Le ranking ne change jamais la décision.
+        Il choisit uniquement quelle opportunité déjà décidée
+        représente le mieux chaque symbole.
         """
-        return list(
-            ranked[: self.max_signals]
-        )
+
+        selected: List[
+            Dict[str, Any]
+        ] = []
+
+        selected_symbols = set()
+
+        for candidate in ranked:
+
+            symbol = _normaliser_symbole(
+                candidate.get(
+                    "symbol",
+                    "",
+                )
+            )
+
+            if not symbol:
+                continue
+
+            # ----------------------------------------------------------
+            # Une seule opportunité par paire.
+            # ----------------------------------------------------------
+            if symbol in selected_symbols:
+                continue
+
+            selected.append(candidate)
+            selected_symbols.add(symbol)
+
+            # ----------------------------------------------------------
+            # Maximum global.
+            # ----------------------------------------------------------
+            if len(selected) >= self.max_signals:
+                break
+
+        return selected
 
     # ------------------------------------------------------------------
     # PIPELINE
@@ -769,24 +941,47 @@ class Moteur2Ranking:
         self,
         cycle: Any,
     ) -> Dict[str, Any]:
+
         candidates = self.collecter(cycle)
-        candidates = self.dedupliquer(candidates)
-        ranked = self.classer(candidates)
-        selected = self.selectionner_top(ranked)
+
+        candidates = self.dedupliquer(
+            candidates
+        )
+
+        ranked = self.classer(
+            candidates
+        )
+
+        selected = self.selectionner_top(
+            ranked
+        )
 
         for index, candidate in enumerate(
             selected,
             start=1,
         ):
+
             candidate["global_rank"] = index
 
-        self.last_candidates = list(ranked)
-        self.last_selected = list(selected)
+        self.last_candidates = list(
+            ranked
+        )
+
+        self.last_selected = list(
+            selected
+        )
+
+        selected_symbols = [
+            item.get("symbol")
+            for item in selected
+        ]
 
         logger.info(
-            "RANKING ENGINE 2 : %s candidat(s), %s sélectionné(s).",
+            "RANKING ENGINE 2 : %s candidat(s), "
+            "%s sélectionné(s), symboles=%s.",
             len(ranked),
             len(selected),
+            selected_symbols,
         )
 
         return {
@@ -800,6 +995,8 @@ class Moteur2Ranking:
                 item["original"]
                 for item in selected
             ],
+            "selected_symbols": selected_symbols,
+            "one_signal_per_symbol": True,
             "forced_signal": False,
             "quality_is_blocking": False,
             "score_is_blocking": False,
@@ -814,11 +1011,17 @@ class Moteur2Ranking:
     # ------------------------------------------------------------------
 
     def get_status(self) -> Dict[str, Any]:
+
         return {
             "module": "moteur2_ranking",
             "max_signals": self.max_signals,
-            "last_candidate_count": len(self.last_candidates),
-            "last_selected_count": len(self.last_selected),
+            "last_candidate_count": len(
+                self.last_candidates
+            ),
+            "last_selected_count": len(
+                self.last_selected
+            ),
+            "one_signal_per_symbol": True,
             "forced_signal": False,
             "quality_is_blocking": False,
             "score_is_blocking": False,
@@ -845,13 +1048,19 @@ ranking_engine = Moteur2Ranking(
 def ranker_opportunites(
     cycle: Any,
 ) -> Dict[str, Any]:
-    return ranking_engine.ranker(cycle)
+
+    return ranking_engine.ranker(
+        cycle
+    )
 
 
 def obtenir_top_signaux(
     cycle: Any,
 ) -> List[Any]:
-    result = ranking_engine.ranker(cycle)
+
+    result = ranking_engine.ranker(
+        cycle
+    )
 
     return result.get(
         "signals",
@@ -860,6 +1069,7 @@ def obtenir_top_signaux(
 
 
 def statut_ranking() -> Dict[str, Any]:
+
     return ranking_engine.get_status()
 
 
@@ -868,6 +1078,7 @@ def statut_ranking() -> Dict[str, Any]:
 # ============================================================================
 
 if __name__ == "__main__":
+
     logging.basicConfig(
         level=logging.INFO
     )
@@ -875,18 +1086,18 @@ if __name__ == "__main__":
     exemple = {
         "all_signals": [
             {
-                "symbol": "XAUUSD",
+                "symbol": "BTCUSD",
                 "signal": {
-                    "symbol": "XAUUSD",
+                    "symbol": "BTCUSD",
                     "direction": "BUY",
                     "decision": "BUY",
-                    "decision_confidence": 78,
-                    "quality_score": 20,
-                    "rr": 0.5,
+                    "decision_confidence": 92,
+                    "quality_score": 70,
+                    "rr": 2.5,
                     "evidence": {
-                        "supportive_evidence": 7,
+                        "supportive_evidence": 8,
                         "contradictory_evidence": 1,
-                        "meaningful_sources": 6,
+                        "meaningful_sources": 5,
                     },
                     "valid": True,
                 },
@@ -895,14 +1106,48 @@ if __name__ == "__main__":
                 "symbol": "BTCUSD",
                 "signal": {
                     "symbol": "BTCUSD",
+                    "direction": "BUY",
+                    "decision": "BUY",
+                    "decision_confidence": 88,
+                    "quality_score": 75,
+                    "rr": 3.0,
+                    "evidence": {
+                        "supportive_evidence": 7,
+                        "contradictory_evidence": 2,
+                        "meaningful_sources": 5,
+                    },
+                    "valid": True,
+                },
+            },
+            {
+                "symbol": "BTCUSD",
+                "signal": {
+                    "symbol": "BTCUSD",
+                    "direction": "BUY",
+                    "decision": "BUY",
+                    "decision_confidence": 84,
+                    "quality_score": 80,
+                    "rr": 3.5,
+                    "evidence": {
+                        "supportive_evidence": 6,
+                        "contradictory_evidence": 2,
+                        "meaningful_sources": 4,
+                    },
+                    "valid": True,
+                },
+            },
+            {
+                "symbol": "XAUUSD",
+                "signal": {
+                    "symbol": "XAUUSD",
                     "direction": "SELL",
                     "decision": "SELL",
-                    "decision_confidence": 71,
-                    "quality_score": 74,
-                    "rr": 4.0,
+                    "decision_confidence": 80,
+                    "quality_score": 68,
+                    "rr": 2.0,
                     "evidence": {
-                        "supportive_evidence": 5,
-                        "contradictory_evidence": 3,
+                        "supportive_evidence": 6,
+                        "contradictory_evidence": 2,
                         "meaningful_sources": 4,
                     },
                     "valid": True,
@@ -914,43 +1159,48 @@ if __name__ == "__main__":
                     "symbol": "EURUSD",
                     "direction": "BUY",
                     "decision": "BUY",
-                    "decision_confidence": 65,
-                    "quality_score": 68,
-                    "rr": 1.5,
+                    "decision_confidence": 76,
+                    "quality_score": 65,
+                    "rr": 1.8,
                     "evidence": {
-                        "supportive_evidence": 4,
+                        "supportive_evidence": 5,
                         "contradictory_evidence": 2,
                         "meaningful_sources": 3,
                     },
                     "valid": True,
                 },
             },
-            {
-                "symbol": "GBPUSD",
-                "signal": {
-                    "symbol": "GBPUSD",
-                    "direction": "SELL",
-                    "decision": "WAIT",
-                    "decision_confidence": 90,
-                    "quality_score": 95,
-                    "rr": 5.0,
-                    "valid": True,
-                },
-            },
         ]
     }
 
-    result = ranker_opportunites(exemple)
+    result = ranker_opportunites(
+        exemple
+    )
 
     print()
     print("=" * 70)
     print("NOVA TRADE AI — RANKING TEST")
     print("=" * 70)
-    print("CANDIDATS :", result["candidate_count"])
-    print("SÉLECTIONNÉS :", result["selected_count"])
+
+    print(
+        "CANDIDATS :",
+        result["candidate_count"],
+    )
+
+    print(
+        "SÉLECTIONNÉS :",
+        result["selected_count"],
+    )
+
+    print(
+        "SYMBOLES :",
+        result["selected_symbols"],
+    )
+
     print()
 
     for item in result["top_signals"]:
+
         print(
             item["global_rank"],
             "|",
