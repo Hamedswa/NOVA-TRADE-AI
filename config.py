@@ -118,13 +118,16 @@ TIMEFRAME_ROLE = {
 # RR / RISK PLAN
 # ============================================================
 
-# Règle fondamentale du Moteur 2 :
-# TP1 doit naturellement offrir au minimum 3R.
-MINIMUM_RR = 3.0
-MIN_RR = 3.0
+# Références descriptives du plan technique.
+# IMPORTANT : ces valeurs ne sont PAS des filtres de décision.
+# Le moteur calcule et expose le RR réel ; la décision stratégique
+# appartient exclusivement à moteur2_decision.py.
+RR_REFERENCE = 3.0
+MINIMUM_RR = 0.0  # Compatibilité API : aucun minimum bloquant.
+MIN_RR = 0.0      # Compatibilité API : aucun minimum bloquant.
 
-# Objectifs indicatifs.
-TP1_R = 3.0
+# Objectifs indicatifs, non bloquants.
+TP1_R = RR_REFERENCE
 TP2_R = 4.0
 TP3_R = 5.0
 
@@ -137,15 +140,12 @@ TP3_OPTIONAL = True
 # SCORE DE QUALITÉ
 # ============================================================
 
-# Score de qualité du setup.
-#
-# ATTENTION :
-# Le score ne remplace jamais les conditions obligatoires.
-# Exemple :
-#   score = 95 + RR = 2.8 → REJET
-#   score = 70 + RR = 3.2 → peut continuer
-SIGNAL_THRESHOLD = 60
-MINIMUM_SCORE = 60
+# Référence descriptive du score de qualité.
+# Le score contribue à l'analyse/ranking mais ne constitue pas
+# à lui seul un veto automatique.
+SCORE_REFERENCE = 60
+SIGNAL_THRESHOLD = SCORE_REFERENCE  # Compatibilité API.
+MINIMUM_SCORE = SCORE_REFERENCE     # Compatibilité API.
 
 SCORE_MAX = 100
 
@@ -352,6 +352,36 @@ BE_AUTO_ACTIVATION = False
 
 
 # ============================================================
+# PERSISTANCE / JOURNAL
+# ============================================================
+
+# SQLite est utilisé comme persistance locale du moteur.
+# Aucun serveur de base de données externe n'est requis.
+DATA_DIR = "data"
+SIGNAL_DB_PATH = "data/nova_engine2.sqlite3"
+
+# Conservation des événements : le journal est append-only.
+JOURNAL_ENABLED = True
+
+
+# ============================================================
+# POLITIQUE DE PUBLICATION
+# ============================================================
+
+# Limites de publication : ce sont des plafonds, jamais des quotas à remplir.
+MAX_PUBLISHED_SIGNALS_PER_12H = 3
+MAX_PUBLISHED_SIGNALS_PER_SYMBOL_12H = 1
+PUBLICATION_WINDOW_HOURS = 12
+
+
+# ============================================================
+# BREAK-EVEN / SUIVI
+# ============================================================
+
+BE_TRIGGER_R = 1.0
+
+
+# ============================================================
 # TELEGRAM
 # ============================================================
 
@@ -469,19 +499,19 @@ def validate_configuration() -> None:
     Vérifie les invariants fondamentaux de la configuration.
     """
 
-    if MINIMUM_RR < 3.0:
+    if RR_REFERENCE <= 0:
         raise ValueError(
-            "MINIMUM_RR doit être supérieur ou égal à 3.0."
+            "RR_REFERENCE doit être strictement positif."
         )
 
-    if MIN_RR < 3.0:
+    if SCORE_REFERENCE < 0 or SCORE_REFERENCE > SCORE_MAX:
         raise ValueError(
-            "MIN_RR doit être supérieur ou égal à 3.0."
+            "SCORE_REFERENCE doit être compris entre 0 et SCORE_MAX."
         )
 
-    if TP1_R < MINIMUM_RR:
+    if MINIMUM_RR < 0 or MIN_RR < 0:
         raise ValueError(
-            "TP1_R doit être supérieur ou égal au RR minimum."
+            "Les valeurs de compatibilité RR ne peuvent pas être négatives."
         )
 
     if not SUPPORTED_SYMBOLS:
@@ -584,6 +614,23 @@ def validate_configuration() -> None:
         raise ValueError(
             "EXECUTION_ENABLED doit rester False."
         )
+
+
+class _ConfigProxy:
+    """Compatibilité avec les anciens modules utilisant CONFIG.X.
+
+    La configuration reste définie par des constantes de module.
+    Ce proxy évite de casser les anciens appels pendant la migration.
+    """
+
+    def __getattr__(self, name: str):
+        try:
+            return globals()[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+CONFIG = _ConfigProxy()
 
 
 # Validation au chargement du module.
