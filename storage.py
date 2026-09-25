@@ -251,6 +251,22 @@ class SQLiteStorage:
                 (str(opportunity["opportunity_id"]), str(opportunity["symbol"]), str(opportunity["lifecycle_state"]), first_seen, last_seen, _json(opportunity.get("payload", {}))),
             )
 
+    def list_opportunities(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        query = "SELECT * FROM opportunities"
+        params: tuple = ()
+        if symbol:
+            query += " WHERE symbol = ?"
+            params = (str(symbol),)
+        query += " ORDER BY last_seen_at DESC"
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            results.append(item)
+        return results
+
     def record_health(
         self,
         component: str,
