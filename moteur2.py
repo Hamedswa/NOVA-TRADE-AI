@@ -42,6 +42,9 @@ from moteur2_scenarios import Moteur2Scenarios
 from moteur2_opportunites import Moteur2Opportunites
 from moteur2_plan import Moteur2Plan
 from moteur2_fondamental import Moteur2Fondamental
+from moteur2_regime import Moteur2Regime
+from moteur2_cycle_opportunite import Moteur2CycleOpportunite
+from moteur2_evidence import Moteur2Evidence
 
 
 SYMBOL = "XAUUSD"
@@ -130,6 +133,12 @@ class Moteur2:
         self.fondamental = Moteur2Fondamental(
             supported_symbols=SUPPORTED_SYMBOLS,
         )
+
+        # Nouvelles couches descriptives et de maturation. Elles ne
+        # prennent jamais la décision BUY/SELL/WAIT.
+        self.regime = Moteur2Regime()
+        self.cycle_opportunite = Moteur2CycleOpportunite()
+        self.evidence = Moteur2Evidence()
 
         self.running = False
         self.initialized = False
@@ -588,6 +597,9 @@ class Moteur2:
         scenarios: Any = None,
         fondamental: Any = None,
         technical_plan: Any = None,
+        opportunite_cycle: Any = None,
+        evidence_result: Any = None,
+        regime_result: Any = None,
     ) -> Dict[str, Any]:
 
         confirmation = await self.analyser_confirmation(
@@ -595,6 +607,53 @@ class Moteur2:
             donnees,
             risk_plan,
         )
+
+        # Une opportunité doit exister dans le cycle de maturation avant
+        # qu'un setup puisse accéder à la décision stratégique. Cela évite
+        # le chemin historique direct setup -> BUY/SELL.
+        if opportunite is None:
+            return {
+                "status": "WAITING_OPPORTUNITY",
+                "setup": setup,
+                "risk": risk_plan,
+                "confirmation": confirmation,
+                "decision": None,
+                "signal": None,
+                "reason": "Aucune opportunité Engine 2 associée au setup.",
+            }
+
+        cycle_state = self.cycle_opportunite.observe(
+            opportunite,
+            regime=regime_result,
+            evidence=(
+                self._to_dict(evidence_result).get("evidence", [])
+                if evidence_result is not None else []
+            ),
+            confirmation=confirmation,
+            current_price=self._get(
+                technical_plan, "entry", None
+            ),
+        )
+
+        if cycle_state.get("state") not in {
+            "ACTIONABLE",
+            "TRIGGERED",
+        }:
+            return {
+                "status": "WAITING_MATURITY",
+                "setup": setup,
+                "opportunity": opportunite,
+                "opportunity_cycle": cycle_state,
+                "evidence": evidence_result,
+                "regime": regime_result,
+                "risk": risk_plan,
+                "confirmation": confirmation,
+                "decision": None,
+                "signal": None,
+                "reason": (
+                    "L'opportunité n'est pas encore ACTIONABLE/TRIGGERED."
+                ),
+            }
 
         score_result = await self.calculer_score(
             setup=setup,
@@ -748,6 +807,9 @@ class Moteur2:
                     "score": score_result,
                     "validation": validation,
                     "decision": decision_result,
+                    "opportunity_cycle": cycle_state,
+                    "evidence": evidence_result,
+                    "regime": regime_result,
                     "signal": None,
                 }
 
@@ -760,6 +822,9 @@ class Moteur2:
                 "score": score_result,
                 "validation": validation,
                 "decision": decision_result,
+                "opportunity_cycle": cycle_state,
+                "evidence": evidence_result,
+                "regime": regime_result,
                 "signal": None,
             }
 
@@ -781,6 +846,9 @@ class Moteur2:
                 "score": score_result,
                 "validation": validation,
                 "decision": decision_result,
+                "opportunity_cycle": cycle_state,
+                "evidence": evidence_result,
+                "regime": regime_result,
                 "signal": None,
             }
 
@@ -868,6 +936,9 @@ class Moteur2:
             "score": score_result,
             "validation": validation,
             "decision": decision_result,
+            "opportunity_cycle": cycle_state,
+            "evidence": evidence_result,
+            "regime": regime_result,
             "antispam": antispam,
         }
 
@@ -1023,6 +1094,75 @@ class Moteur2:
                 market_data=market_snapshot,
                 fundamental=fundamental_result,
             )
+
+            # ----------------------------------------------------------
+            # RÉGIME + EVIDENCE + CYCLE DE MATURATION
+            # ----------------------------------------------------------
+            regime_result = self.regime.analyser(
+                market_map=self._to_dict(cartographie),
+                context=self._to_dict(contexte),
+                timeframes=donnees,
+            )
+
+            raw_opportunity_list = []
+            if isinstance(opportunities_result, dict):
+                raw_opportunity_list = list(
+                    opportunities_result.get("opportunities", []) or []
+                )
+
+            evidence_by_id = {}
+            cycle_by_id = {}
+            enriched_opportunities = []
+
+            for opportunity in raw_opportunity_list:
+                evidence_result = self.evidence.analyser(
+                    symbol=self.symbol,
+                    intelligence=intelligence_data,
+                    radar_events=radar_events,
+                    contexte=self._to_dict(contexte),
+                    zones=zones,
+                    liquidite=liquidite,
+                    confluences=confluences,
+                    opportunites=opportunity,
+                    scenarios=scenarios_result,
+                    fundamental=fundamental_result,
+                    confirmation=None,
+                )
+                evidence_data = self._to_dict(evidence_result)
+                opportunity_id = self._get(
+                    opportunity, "opportunity_id", None
+                )
+                cycle_data = self.cycle_opportunite.observe(
+                    opportunity,
+                    regime=regime_result,
+                    evidence=evidence_data.get("evidence", []),
+                    confirmation=None,
+                    current_price=current_price,
+                )
+
+                enriched = dict(self._to_dict(opportunity))
+                enriched["opportunity_cycle"] = cycle_data
+                enriched["cycle_state"] = cycle_data.get("state")
+                enriched["maturity"] = cycle_data.get("maturity", 0.0)
+                enriched["evidence"] = evidence_data
+                enriched["regime"] = regime_result
+                enriched_opportunities.append(enriched)
+
+                if opportunity_id:
+                    evidence_by_id[str(opportunity_id)] = evidence_data
+                    cycle_by_id[str(opportunity_id)] = cycle_data
+
+            if isinstance(opportunities_result, dict):
+                opportunities_result = dict(opportunities_result)
+                opportunities_result["opportunities"] = enriched_opportunities
+                opportunities_result["maturation"] = {
+                    "cycles": cycle_by_id,
+                    "actionable_count": sum(
+                        1 for item in cycle_by_id.values()
+                        if item.get("state") in {"ACTIONABLE", "TRIGGERED"}
+                    ),
+                    "decision_owner": "moteur2_decision.py",
+                }
 
             technical_plans_result = self.plan.analyser(
                 symbol=self.symbol,
@@ -1293,6 +1433,21 @@ class Moteur2:
                         scenarios=scenarios_result,
                         fondamental=fundamental_result,
                         technical_plan=technical_plan_data,
+                        opportunite_cycle=cycle_by_id.get(
+                            str(self._get(
+                                self._match_plan_for_setup(opportunities_result, setup),
+                                "opportunity_id",
+                                "",
+                            ))
+                        ),
+                        evidence_result=evidence_by_id.get(
+                            str(self._get(
+                                self._match_plan_for_setup(opportunities_result, setup),
+                                "opportunity_id",
+                                "",
+                            ))
+                        ),
+                        regime_result=regime_result,
                     )
                 )
 
@@ -1328,6 +1483,9 @@ class Moteur2:
                 "radar": [self._to_dict(item) for item in radar_events],
                 "scenarios": [self._to_dict(item) for item in scenarios_result],
                 "fundamental": fundamental_result,
+                "regime": regime_result,
+                "evidence": evidence_by_id,
+                "opportunity_cycles": cycle_by_id,
                 "opportunities": opportunities_result,
                 "technical_plans": technical_plans_result,
                 "setups": setups,
