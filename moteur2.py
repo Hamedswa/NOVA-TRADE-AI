@@ -43,8 +43,11 @@ from moteur2_opportunites import Moteur2Opportunites
 from moteur2_plan import Moteur2Plan
 from moteur2_fondamental import Moteur2Fondamental
 from moteur2_regime import Moteur2Regime
-from moteur2_cycle_opportunite import Moteur2CycleOpportunite
 from moteur2_evidence import Moteur2Evidence
+from moteur2_cycle_opportunite import Moteur2CycleOpportunite
+from economic_calendar import EconomicCalendar
+from market_hours import market_status
+from storage import get_storage
 
 
 SYMBOL = "XAUUSD"
@@ -133,12 +136,13 @@ class Moteur2:
         self.fondamental = Moteur2Fondamental(
             supported_symbols=SUPPORTED_SYMBOLS,
         )
-
-        # Nouvelles couches descriptives et de maturation. Elles ne
-        # prennent jamais la décision BUY/SELL/WAIT.
+        # Couches d'integration globale : elles observent, maturent et
+        # persistent les opportunites sans posseder la decision BUY/SELL/WAIT.
         self.regime = Moteur2Regime()
-        self.cycle_opportunite = Moteur2CycleOpportunite()
         self.evidence = Moteur2Evidence()
+        self.opportunity_cycle = Moteur2CycleOpportunite()
+        self.economic_calendar = EconomicCalendar()
+        self.storage = get_storage()
 
         self.running = False
         self.initialized = False
@@ -597,9 +601,6 @@ class Moteur2:
         scenarios: Any = None,
         fondamental: Any = None,
         technical_plan: Any = None,
-        opportunite_cycle: Any = None,
-        evidence_result: Any = None,
-        regime_result: Any = None,
     ) -> Dict[str, Any]:
 
         confirmation = await self.analyser_confirmation(
@@ -608,52 +609,20 @@ class Moteur2:
             risk_plan,
         )
 
-        # Une opportunité doit exister dans le cycle de maturation avant
-        # qu'un setup puisse accéder à la décision stratégique. Cela évite
-        # le chemin historique direct setup -> BUY/SELL.
-        if opportunite is None:
-            return {
-                "status": "WAITING_OPPORTUNITY",
-                "setup": setup,
-                "risk": risk_plan,
-                "confirmation": confirmation,
-                "decision": None,
-                "signal": None,
-                "reason": "Aucune opportunité Engine 2 associée au setup.",
-            }
-
-        cycle_state = self.cycle_opportunite.observe(
-            opportunite,
-            regime=regime_result,
-            evidence=(
-                self._to_dict(evidence_result).get("evidence", [])
-                if evidence_result is not None else []
-            ),
-            confirmation=confirmation,
-            current_price=self._get(
-                technical_plan, "entry", None
-            ),
-        )
-
-        if cycle_state.get("state") not in {
-            "ACTIONABLE",
-            "TRIGGERED",
-        }:
-            return {
-                "status": "WAITING_MATURITY",
-                "setup": setup,
-                "opportunity": opportunite,
-                "opportunity_cycle": cycle_state,
-                "evidence": evidence_result,
-                "regime": regime_result,
-                "risk": risk_plan,
-                "confirmation": confirmation,
-                "decision": None,
-                "signal": None,
-                "reason": (
-                    "L'opportunité n'est pas encore ACTIONABLE/TRIGGERED."
-                ),
-            }
+        # Si le setup provient d'une opportunite autonome, la confirmation
+        # re-alimente le cycle de maturation. Une opportunite MATURE peut
+        # donc devenir ACTIONABLE ici, sans que le cycle ne decide BUY/SELL.
+        autonomous_cycle = None
+        if opportunite is not None:
+            try:
+                autonomous_cycle = self.opportunity_cycle.observe(
+                    opportunity=opportunite,
+                    evidence=(self._to_dict(getattr(self, "evidence", None).last_result)
+                              if getattr(self, "evidence", None) is not None else []),
+                    confirmation=confirmation,
+                )
+            except Exception as exc:
+                logger.warning("Cycle opportunite non mis a jour: %s", exc)
 
         score_result = await self.calculer_score(
             setup=setup,
@@ -680,6 +649,23 @@ class Moteur2:
                 False,
             )
         )
+
+        if autonomous_cycle is not None:
+            autonomous_state = str(
+                autonomous_cycle.get("state", "OBSERVED")
+            ).upper()
+            if autonomous_state not in {"ACTIONABLE", "TRIGGERED"}:
+                return {
+                    "status": "OPPORTUNITY_NOT_ACTIONABLE",
+                    "setup": setup,
+                    "risk": risk_plan,
+                    "confirmation": confirmation,
+                    "score": score_result,
+                    "validation": validation,
+                    "opportunity_cycle": autonomous_cycle,
+                    "decision": None,
+                    "signal": None,
+                }
 
         validation_status = str(
             self._get(
@@ -807,9 +793,6 @@ class Moteur2:
                     "score": score_result,
                     "validation": validation,
                     "decision": decision_result,
-                    "opportunity_cycle": cycle_state,
-                    "evidence": evidence_result,
-                    "regime": regime_result,
                     "signal": None,
                 }
 
@@ -822,9 +805,6 @@ class Moteur2:
                 "score": score_result,
                 "validation": validation,
                 "decision": decision_result,
-                "opportunity_cycle": cycle_state,
-                "evidence": evidence_result,
-                "regime": regime_result,
                 "signal": None,
             }
 
@@ -846,9 +826,6 @@ class Moteur2:
                 "score": score_result,
                 "validation": validation,
                 "decision": decision_result,
-                "opportunity_cycle": cycle_state,
-                "evidence": evidence_result,
-                "regime": regime_result,
                 "signal": None,
             }
 
@@ -936,9 +913,6 @@ class Moteur2:
             "score": score_result,
             "validation": validation,
             "decision": decision_result,
-            "opportunity_cycle": cycle_state,
-            "evidence": evidence_result,
-            "regime": regime_result,
             "antispam": antispam,
         }
 
@@ -1071,9 +1045,33 @@ class Moteur2:
                 setups=setups,
             )
 
+            # ----------------------------------------------------------
+            # REGIME + CALENDRIER + FONDAMENTAL
+            # ----------------------------------------------------------
+            regime_result = self.regime.analyser(
+                market_map=self._to_dict(cartographie),
+                contexte=self._to_dict(contexte),
+                symbol=self.symbol,
+            )
+
+            try:
+                economic_events = self.economic_calendar.get_relevant_events(
+                    self.symbol, hours_ahead=24
+                )
+            except Exception as exc:
+                economic_events = []
+                logger.warning(
+                    "Calendrier economique indisponible pour %s: %s",
+                    self.symbol, exc,
+                )
+
             fundamental_result = self.fondamental.analyser(
                 self.symbol,
-                macro_context={},
+                events=economic_events,
+                macro_context={
+                    "market_status": market_status(self.symbol),
+                    "regime": self._to_dict(regime_result),
+                },
                 technical_context={
                     "intelligence": intelligence_data,
                     "contexte": self._to_dict(contexte),
@@ -1096,77 +1094,74 @@ class Moteur2:
             )
 
             # ----------------------------------------------------------
-            # RÉGIME + EVIDENCE + CYCLE DE MATURATION
+            # EVIDENCE + MATURATION
             # ----------------------------------------------------------
-            regime_result = self.regime.analyser(
-                market_map=self._to_dict(cartographie),
-                context=self._to_dict(contexte),
-                timeframes=donnees,
+            evidence_result = self.evidence.analyser(
+                symbol=self.symbol,
+                intelligence=intelligence_data,
+                radar_events=radar_events,
+                contexte=self._to_dict(contexte),
+                zones=self._to_dict(zones),
+                liquidite=self._to_dict(liquidite),
+                confluences=self._to_dict(confluences),
+                opportunites=opportunities_result,
+                scenarios=scenarios_result,
+                fundamental=fundamental_result,
             )
 
-            raw_opportunity_list = []
+            raw_opportunities_for_cycle = []
             if isinstance(opportunities_result, dict):
-                raw_opportunity_list = list(
-                    opportunities_result.get("opportunities", []) or []
+                raw_opportunities_for_cycle = list(
+                    opportunities_result.get("opportunities") or []
                 )
+            elif isinstance(opportunities_result, (list, tuple)):
+                raw_opportunities_for_cycle = list(opportunities_result)
 
-            evidence_by_id = {}
-            cycle_by_id = {}
-            enriched_opportunities = []
+            evidence_data = self._to_dict(evidence_result)
+            evidence_items = evidence_data.get("evidence", [])
+            mature_opportunities = []
+            opportunity_cycles = []
 
-            for opportunity in raw_opportunity_list:
-                evidence_result = self.evidence.analyser(
-                    symbol=self.symbol,
-                    intelligence=intelligence_data,
-                    radar_events=radar_events,
-                    contexte=self._to_dict(contexte),
-                    zones=zones,
-                    liquidite=liquidite,
-                    confluences=confluences,
-                    opportunites=opportunity,
-                    scenarios=scenarios_result,
-                    fundamental=fundamental_result,
-                    confirmation=None,
-                )
-                evidence_data = self._to_dict(evidence_result)
-                opportunity_id = self._get(
-                    opportunity, "opportunity_id", None
-                )
-                cycle_data = self.cycle_opportunite.observe(
-                    opportunity,
+            for opportunity in raw_opportunities_for_cycle:
+                cycle = self.opportunity_cycle.observe(
+                    opportunity=opportunity,
                     regime=regime_result,
-                    evidence=evidence_data.get("evidence", []),
-                    confirmation=None,
+                    evidence=evidence_items,
                     current_price=current_price,
                 )
+                opportunity_cycles.append(cycle)
+                lifecycle_state = str(
+                    cycle.get("state", "OBSERVED")
+                ).upper()
+                enriched = self._to_dict(opportunity).copy()
+                enriched["opportunity_id"] = cycle.get("opportunity_id")
+                enriched["lifecycle_state"] = lifecycle_state
+                enriched["maturity"] = cycle.get("maturity", 0.0)
+                enriched["evidence_count"] = cycle.get("evidence_count", 0)
+                enriched["contradiction_count"] = cycle.get("contradiction_count", 0)
+                enriched["confirmation_count"] = cycle.get("confirmation_count", 0)
+                self.storage.save_opportunity({
+                    "opportunity_id": cycle["opportunity_id"],
+                    "symbol": self.symbol,
+                    "lifecycle_state": lifecycle_state,
+                    "first_seen_at": cycle.get("first_seen_at"),
+                    "last_seen_at": cycle.get("updated_at"),
+                    "payload": enriched,
+                })
+                if lifecycle_state in {"MATURE", "ACTIONABLE", "TRIGGERED"}:
+                    mature_opportunities.append(enriched)
 
-                enriched = dict(self._to_dict(opportunity))
-                enriched["opportunity_cycle"] = cycle_data
-                enriched["cycle_state"] = cycle_data.get("state")
-                enriched["maturity"] = cycle_data.get("maturity", 0.0)
-                enriched["evidence"] = evidence_data
-                enriched["regime"] = regime_result
-                enriched_opportunities.append(enriched)
-
-                if opportunity_id:
-                    evidence_by_id[str(opportunity_id)] = evidence_data
-                    cycle_by_id[str(opportunity_id)] = cycle_data
-
+            # Les opportunites non matures restent visibles et journalisees,
+            # mais ne sont pas transformees en plan executable.
             if isinstance(opportunities_result, dict):
-                opportunities_result = dict(opportunities_result)
-                opportunities_result["opportunities"] = enriched_opportunities
-                opportunities_result["maturation"] = {
-                    "cycles": cycle_by_id,
-                    "actionable_count": sum(
-                        1 for item in cycle_by_id.values()
-                        if item.get("state") in {"ACTIONABLE", "TRIGGERED"}
-                    ),
-                    "decision_owner": "moteur2_decision.py",
-                }
+                opportunities_for_plan = dict(opportunities_result)
+                opportunities_for_plan["opportunities"] = mature_opportunities
+            else:
+                opportunities_for_plan = mature_opportunities
 
             technical_plans_result = self.plan.analyser(
                 symbol=self.symbol,
-                opportunities=opportunities_result,
+                opportunities=opportunities_for_plan,
                 current_price=current_price,
                 market_map=self._to_dict(cartographie),
                 zones=zones,
@@ -1271,7 +1266,17 @@ class Moteur2:
                     else []
                 )
                 synthetic_setups = []
+                actionable_ids = {
+                    str(c.get("opportunity_id"))
+                    for c in opportunity_cycles
+                    if str(c.get("state", "")).upper() in {"MATURE", "ACTIONABLE", "TRIGGERED"}
+                }
                 for plan_data in raw_plans:
+                    plan_opportunity_id = str(
+                        self._to_dict(plan_data).get("opportunity_id") or ""
+                    )
+                    if plan_opportunity_id not in actionable_ids:
+                        continue
                     plan_dict = self._to_dict(plan_data)
                     raw_direction = str(plan_dict.get("direction", "")).upper().strip()
                     direction_map = {
@@ -1332,7 +1337,11 @@ class Moteur2:
                     "intelligence": intelligence_data,
                     "radar": [self._to_dict(item) for item in radar_events],
                     "scenarios": [self._to_dict(item) for item in scenarios_result],
+                    "regime": regime_result,
+                    "evidence": evidence_result,
+                    "opportunity_cycles": opportunity_cycles,
                     "fundamental": fundamental_result,
+                    "market_status": market_status(self.symbol),
                     "opportunities": opportunities_result,
                     "technical_plans": technical_plans_result,
                     "setups": [],
@@ -1433,21 +1442,6 @@ class Moteur2:
                         scenarios=scenarios_result,
                         fondamental=fundamental_result,
                         technical_plan=technical_plan_data,
-                        opportunite_cycle=cycle_by_id.get(
-                            str(self._get(
-                                self._match_plan_for_setup(opportunities_result, setup),
-                                "opportunity_id",
-                                "",
-                            ))
-                        ),
-                        evidence_result=evidence_by_id.get(
-                            str(self._get(
-                                self._match_plan_for_setup(opportunities_result, setup),
-                                "opportunity_id",
-                                "",
-                            ))
-                        ),
-                        regime_result=regime_result,
                     )
                 )
 
@@ -1482,10 +1476,11 @@ class Moteur2:
                 "intelligence": intelligence_data,
                 "radar": [self._to_dict(item) for item in radar_events],
                 "scenarios": [self._to_dict(item) for item in scenarios_result],
-                "fundamental": fundamental_result,
                 "regime": regime_result,
-                "evidence": evidence_by_id,
-                "opportunity_cycles": cycle_by_id,
+                "evidence": evidence_result,
+                "opportunity_cycles": opportunity_cycles,
+                "fundamental": fundamental_result,
+                "market_status": market_status(self.symbol),
                 "opportunities": opportunities_result,
                 "technical_plans": technical_plans_result,
                 "setups": setups,
@@ -1684,6 +1679,7 @@ class Moteur2Global:
                  analysis_interval_seconds: int = 900) -> None:
         from moteur2_multi_actifs import Moteur2MultiActifs
         from moteur2_ranking import Moteur2Ranking
+        from signals.publication_policy import PublicationPolicy
 
         if symbols is None:
             symbols = list(SUPPORTED_SYMBOLS)
@@ -1709,6 +1705,7 @@ class Moteur2Global:
             parallel=self.parallel,
         )
         self.ranking = Moteur2Ranking(max_signals=self.max_signals)
+        self.publication_policy = PublicationPolicy()
         self.initialized = False
         self.running = False
         self.last_cycle: Optional[Dict[str, Any]] = None
@@ -1759,8 +1756,25 @@ class Moteur2Global:
                 cycle = await self.multi_actifs.analyser_tous()
                 self.last_cycle = cycle
                 ranking = self.ranking.ranker(cycle)
+                # Ranking choisit les meilleurs candidats deja decides.
+                # La politique ci-dessous ajoute uniquement le plafond
+                # persistant de publication 3/12h et 1/pair/12h.
+                selected = []
+                publication_checks = []
+                for candidate in ranking.get('signals', []):
+                    check = self.publication_policy.can_publish(candidate)
+                    publication_checks.append(check)
+                    if check.get('allowed'):
+                        selected.append(candidate)
+                    if len(selected) >= self.max_signals:
+                        break
+                ranking = dict(ranking)
+                ranking['signals'] = selected
+                ranking['top_signals'] = selected
+                ranking['selected_count'] = len(selected)
+                ranking['publication_policy'] = publication_checks
                 self.last_ranking = ranking
-                signals = ranking.get('signals', [])
+                signals = selected
                 return {
                     'status': 'SIGNALS_AVAILABLE' if signals else 'NO_GLOBAL_SIGNAL',
                     'engine': ENGINE_NAME,
